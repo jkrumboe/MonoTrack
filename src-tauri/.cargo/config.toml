@@ -1,0 +1,4 @@
+# If your system has WDAC/AppLocker policies that block cargo build scripts,
+# uncomment the line below and set it to a directory that is allowed to execute:
+# [build]
+# target-dir = "C:\\Users\\YOUR_USERNAME\\.cargo\\target-tennis-3d"
