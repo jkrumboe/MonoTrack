@@ -29,6 +29,7 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
     controls: OrbitControls;
     courtGroup: THREE.Group;
   } | null>(null);
+  const lastRenderSizeRef = useRef({ w: 0, h: 0, aspect: 0 });
 
   useEffect(() => {
     overlayModeRef.current = overlay;
@@ -89,7 +90,11 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
       const w = container.clientWidth;
       const h = container.clientHeight;
       if (w > 0 && h > 0) {
-        renderer.setSize(w, h, false);
+        if (lastRenderSizeRef.current.w !== w || lastRenderSizeRef.current.h !== h) {
+          renderer.setSize(w, h, false);
+          lastRenderSizeRef.current.w = w;
+          lastRenderSizeRef.current.h = h;
+        }
         renderer.setScissorTest(false);
         renderer.setViewport(0, 0, w, h);
         renderer.clear();
@@ -111,14 +116,21 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
             offsetYTop = 0;
           }
           const offsetYGl = h - offsetYTop - renderH;
-          camera.aspect = videoAspect;
-          camera.updateProjectionMatrix();
+          if (lastRenderSizeRef.current.aspect !== videoAspect) {
+            camera.aspect = videoAspect;
+            camera.updateProjectionMatrix();
+            lastRenderSizeRef.current.aspect = videoAspect;
+          }
           renderer.setScissorTest(true);
           renderer.setViewport(offsetX, offsetYGl, renderW, renderH);
           renderer.setScissor(offsetX, offsetYGl, renderW, renderH);
         } else {
-          camera.aspect = w / h;
-          camera.updateProjectionMatrix();
+          const nextAspect = w / h;
+          if (lastRenderSizeRef.current.aspect !== nextAspect) {
+            camera.aspect = nextAspect;
+            camera.updateProjectionMatrix();
+            lastRenderSizeRef.current.aspect = nextAspect;
+          }
         }
       }
 
@@ -132,7 +144,11 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
     const onResize = () => {
       const w = container.clientWidth;
       const h = container.clientHeight;
-      renderer.setSize(w, h);
+      if (w > 0 && h > 0) {
+        renderer.setSize(w, h);
+        lastRenderSizeRef.current.w = w;
+        lastRenderSizeRef.current.h = h;
+      }
     };
     window.addEventListener("resize", onResize);
 

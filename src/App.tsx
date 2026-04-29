@@ -83,6 +83,7 @@ function App() {
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const playIntervalRef = useRef<number | null>(null);
   const prevCalibrationRef = useRef<CalibrationResult | null>(null);
+  const lastCalibratedCourtFrameRef = useRef<number | null>(null);
 
   /** Smooth a new calibration against the previous one to prevent 3D camera jumps. */
   const smoothCalibration = useCallback((newCal: CalibrationResult): CalibrationResult => {
@@ -159,6 +160,20 @@ function App() {
     return best.keypoints ?? null;
   }, [courtData]);
 
+  /** Get the nearest court-data sample at or before the current frame. */
+  const currentCourtEntry = useMemo(() => {
+    if (courtData.length === 0) return null;
+    let best = courtData[0];
+    for (const entry of courtData) {
+      if (entry.frame <= currentFrame) {
+        best = entry;
+      } else {
+        break;
+      }
+    }
+    return best;
+  }, [courtData, currentFrame]);
+
   const currentKeypoints = (() => {
     if (manualCalibrationLocked && calibration && videoSize.width > 0 && videoSize.height > 0) {
       return projectKeypointsFromCalibration(calibration, videoSize);
@@ -219,6 +234,7 @@ function App() {
       const doCalibrate = () => {
         if (!cancelled) {
           prevCalibrationRef.current = null;
+          lastCalibratedCourtFrameRef.current = null;
           updateCalibrationForFrame(0);
         }
       };
@@ -240,15 +256,19 @@ function App() {
     };
   }, [courtData, status, isRealVideo, updateCalibrationForFrame, manualCalibrationLocked]);
 
-  // Update calibration whenever currentFrame changes (precomputed lookup)
+  // Update calibration only when we cross into a new court-data sample frame.
+  // This avoids running the expensive camera solver on every playback frame.
   useEffect(() => {
-    if (courtData.length === 0 || !isRealVideo || manualCalibrationLocked) return;
-    updateCalibrationForFrame(currentFrame);
-  }, [currentFrame, courtData, isRealVideo, updateCalibrationForFrame, manualCalibrationLocked]);
+    if (!isRealVideo || manualCalibrationLocked || !currentCourtEntry) return;
+    if (lastCalibratedCourtFrameRef.current === currentCourtEntry.frame) return;
+    lastCalibratedCourtFrameRef.current = currentCourtEntry.frame;
+    updateCalibrationForFrame(currentCourtEntry.frame);
+  }, [currentCourtEntry, isRealVideo, manualCalibrationLocked, updateCalibrationForFrame]);
 
   // Reset calibration when video changes
   useEffect(() => {
     prevCalibrationRef.current = null;
+    lastCalibratedCourtFrameRef.current = null;
     setCalibration(null);
     setManualCalibrationLocked(false);
     setCalibrationViewTransform({ zoom: 1, panX: 0, panY: 0 });
