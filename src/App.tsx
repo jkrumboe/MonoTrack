@@ -1,10 +1,13 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
+import * as THREE from "three";
 import { useAnalysis } from "./hooks/useAnalysis";
 import SkeletonViewer from "./components/SkeletonViewer";
 import VideoPlayer from "./components/VideoPlayer";
-import CourtCalibration, { type CalibrationResult, solveCameraIterative } from "./components/CourtCalibration";
+import { type CalibrationResult, solveCameraIterative } from "./utils/cameraSolver";
+import CourtKeypointOverlay from "./components/CourtKeypointOverlay";
+import CourtCalibration from "./components/CourtCalibration";
+import CourtMapView from "./components/CourtMapView";
 import ProgressBar from "./components/ProgressBar";
 import StatsDisplay from "./components/StatsDisplay";
 import PlaybackControls from "./components/PlaybackControls";
@@ -12,49 +15,42 @@ import "./App.css";
 
 type ViewMode = "side-by-side" | "overlay";
 
+const COURT_KEYPOINTS_3D: [number, number, number][] = [
+  [-4.5, 0, -9.0], // far-left corner
+  [ 4.5, 0, -9.0], // far-right corner
+  [-4.5, 0,  9.0], // near-left corner
+  [ 4.5, 0,  9.0], // near-right corner
+  [-4.5, 0, -3.0], // far attack left
+  [ 4.5, 0, -3.0], // far attack right
+  [-4.5, 0,  3.0], // near attack left
+  [ 4.5, 0,  3.0], // near attack right
+  [-4.5, 0,  0.0], // net left
+  [ 4.5, 0,  0.0], // net right
+];
+
 /**
  * Convert video-frame-normalized corners [0,1] to container NDC [-1,1],
  * accounting for object-fit:contain letterboxing.
  */
-function videoToNDC(
-  corners: { x: number; y: number }[],
-  video: HTMLVideoElement,
-  container?: HTMLDivElement | null,
-): { x: number; y: number }[] {
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  // If no container, use video's native dimensions (no letterboxing)
-  const cw = container ? container.clientWidth : vw;
-  const ch = container ? container.clientHeight : vh;
-
-  if (!vw || !vh || !cw || !ch) {
-    // Fallback: assume no letterboxing
-    return corners.map(p => ({ x: p.x * 2 - 1, y: -(p.y * 2 - 1) }));
-  }
+function projectKeypointsFromCalibration(
+  calibration: CalibrationResult,
+  videoSize: { width: number; height: number },
+): (number[] | null)[] {
+  const vw = videoSize.width;
+  const vh = videoSize.height;
+  if (!vw || !vh) return COURT_KEYPOINTS_3D.map(() => null);
 
   const videoAR = vw / vh;
-  const containerAR = cw / ch;
+  const cam = new THREE.PerspectiveCamera(calibration.fov, videoAR, 0.1, 500);
+  cam.position.set(...calibration.position);
+  cam.lookAt(new THREE.Vector3(...calibration.lookAt));
+  cam.updateMatrixWorld();
+  cam.updateProjectionMatrix();
 
-  let renderW: number, renderH: number, offsetX: number, offsetY: number;
-  if (videoAR > containerAR) {
-    renderW = cw;
-    renderH = cw / videoAR;
-    offsetX = 0;
-    offsetY = (ch - renderH) / 2;
-  } else {
-    renderH = ch;
-    renderW = ch * videoAR;
-    offsetX = (cw - renderW) / 2;
-    offsetY = 0;
-  }
-
-  return corners.map(p => {
-    const px = offsetX + p.x * renderW;
-    const py = offsetY + p.y * renderH;
-    return {
-      x: (px / cw) * 2 - 1,
-      y: -((py / ch) * 2 - 1),
-    };
+  return COURT_KEYPOINTS_3D.map(([x, y, z]) => {
+    const v = new THREE.Vector3(x, y, z).project(cam);
+    // NDC [-1,1] from videoAR camera → video-frame normalized [0,1]
+    return [(v.x + 1) / 2, (1 - v.y) / 2];
   });
 }
 
@@ -65,6 +61,7 @@ function App() {
     progressMessage,
     frames,
     result,
+    courtData,
     error,
     startAnalysis,
     stopAnalysis,
@@ -75,152 +72,163 @@ function App() {
   const [videoPath, setVideoPath] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("side-by-side");
   const [_videoDuration, setVideoDuration] = useState<number | null>(null);
+  const [videoSize, setVideoSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [calibration, setCalibration] = useState<CalibrationResult | null>(null);
-  const [isCalibrating, setIsCalibrating] = useState(false);
-  const [isAdjusting, setIsAdjusting] = useState(false);
-  const [detectedCorners, setDetectedCorners] = useState<{ x: number; y: number }[] | null>(null);
-  const overlayRef = useRef<HTMLDivElement>(null);
+  const [manualCalibrationLocked, setManualCalibrationLocked] = useState(false);
+  const [showCalibration, setShowCalibration] = useState(false);
+  const [calibrationViewTransform, setCalibrationViewTransform] = useState({ zoom: 1, panX: 0, panY: 0 });
+  const [overlayEl, setOverlayEl] = useState<HTMLDivElement | null>(null);
+  const [splitVideoEl, setSplitVideoEl] = useState<HTMLDivElement | null>(null);
+  const [splitVideoSize, setSplitVideoSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const videoElRef = useRef<HTMLVideoElement | null>(null);
-  const autoCalibrated = useRef(false);
   const playIntervalRef = useRef<number | null>(null);
-  const runAutoCalibrationRef = useRef<() => Promise<boolean>>(async () => false);
+  const prevCalibrationRef = useRef<CalibrationResult | null>(null);
+
+  /** Smooth a new calibration against the previous one to prevent 3D camera jumps. */
+  const smoothCalibration = useCallback((newCal: CalibrationResult): CalibrationResult => {
+    const prev = prevCalibrationRef.current;
+    if (!prev) {
+      prevCalibrationRef.current = newCal;
+      return newCal;
+    }
+    const a = 0.35; // blend factor toward new value
+    const lerp = (p: number, n: number) => p + a * (n - p);
+    const smoothed: CalibrationResult = {
+      position: [
+        lerp(prev.position[0], newCal.position[0]),
+        lerp(prev.position[1], newCal.position[1]),
+        lerp(prev.position[2], newCal.position[2]),
+      ],
+      lookAt: [
+        lerp(prev.lookAt[0], newCal.lookAt[0]),
+        lerp(prev.lookAt[1], newCal.lookAt[1]),
+        lerp(prev.lookAt[2], newCal.lookAt[2]),
+      ],
+      fov: lerp(prev.fov, newCal.fov),
+    };
+    prevCalibrationRef.current = smoothed;
+    return smoothed;
+  }, []);
+
   const isRealVideo = videoPath !== "" && videoPath !== "demo.mp4";
+  const videoAspect = useMemo(() => {
+    if (!videoSize.width || !videoSize.height) return undefined;
+    return videoSize.width / videoSize.height;
+  }, [videoSize]);
 
-  // Auto-calibrate when we have a video (works in any view mode)
-  const runAutoCalibration = useCallback(async () => {
-    if (!videoPath || !isRealVideo) return false;
-    const video = videoElRef.current;
-    const container = overlayRef.current; // may be null in side-by-side mode
-    if (!video || video.readyState < 2) return false;
+  useEffect(() => {
+    if (!splitVideoEl) {
+      setSplitVideoSize({ width: 0, height: 0 });
+      return;
+    }
+    const update = () => {
+      setSplitVideoSize({ width: splitVideoEl.clientWidth, height: splitVideoEl.clientHeight });
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(splitVideoEl);
+    return () => ro.disconnect();
+  }, [splitVideoEl]);
 
-    let corners = detectedCorners;
-
-    if (!corners) {
-      try {
-        const result = await invoke<{
-          action: string;
-          corners?: number[][];
-          message?: string;
-        }>("detect_court", {
-          videoPath,
-          frameTime: video.currentTime > 0 ? video.currentTime : 1.0,
-        });
-
-        if (result.action === "court_detected" && result.corners) {
-          corners = result.corners.map(([x, y]: number[]) => ({ x, y }));
-          setDetectedCorners(corners);
-        }
-      } catch (e) {
-        console.warn("[auto-cal] Detection failed:", e);
-        return false;
+  /** Look up the nearest precomputed court corners for a given frame index. */
+  const getCornersForFrame = useCallback((frameIdx: number): number[][] | null => {
+    if (courtData.length === 0) return null;
+    // Find the closest court data entry at or before this frame
+    let best = courtData[0];
+    for (const entry of courtData) {
+      if (entry.frame <= frameIdx) {
+        best = entry;
+      } else {
+        break; // courtData is sorted by frame
       }
     }
+    return best.corners;
+  }, [courtData]);
 
-    if (!corners) return false;
-
-    const ndcPoints = videoToNDC(corners, video, container);
-    const aspectRatio = container
-      ? container.clientWidth / container.clientHeight
-      : video.videoWidth / video.videoHeight;
-    const cal = solveCameraIterative(ndcPoints, aspectRatio);
-    if (cal) {
-      console.log("[auto-cal] Success:", cal);
-      setCalibration(cal);
-      return true;
+  /** Look up the nearest precomputed court keypoints for a given frame index. */
+  const getKeypointsForFrame = useCallback((frameIdx: number): (number[] | null)[] | null => {
+    if (courtData.length === 0) return null;
+    let best = courtData[0];
+    for (const entry of courtData) {
+      if (entry.frame <= frameIdx) {
+        best = entry;
+      } else {
+        break;
+      }
     }
-    return false;
-  }, [videoPath, isRealVideo, detectedCorners]);
+    return best.keypoints ?? null;
+  }, [courtData]);
 
-  // Keep ref always pointing to latest runAutoCalibration
-  useEffect(() => {
-    runAutoCalibrationRef.current = runAutoCalibration;
-  }, [runAutoCalibration]);
+  const currentKeypoints = (() => {
+    if (manualCalibrationLocked && calibration && videoSize.width > 0 && videoSize.height > 0) {
+      return projectKeypointsFromCalibration(calibration, videoSize);
+    }
+    return getKeypointsForFrame(currentFrame);
+  })();
+
+  /** Compute calibration from precomputed court corners for the current frame. */
+  const updateCalibrationForFrame = useCallback((frameIdx: number) => {
+    if (manualCalibrationLocked) return;
+    const video = videoElRef.current;
+    if (!video || video.readyState < 2) return;
+
+    const corners = getCornersForFrame(frameIdx);
+    if (!corners) return;
+
+    const cornerObjs = corners.map(([x, y]: number[]) => ({ x, y }));
+    // Court detection returns video-frame-normalised [0,1]; convert to video-frame NDC.
+    const ndcPoints = cornerObjs.map(p => ({ x: p.x * 2 - 1, y: -(p.y * 2 - 1) }));
+    if (!video.videoWidth || !video.videoHeight) return;
+    const aspectRatio = video.videoWidth / video.videoHeight;
+    const { result: cal } = solveCameraIterative(ndcPoints, aspectRatio);
+    if (cal) {
+      setCalibration(smoothCalibration(cal));
+    }
+  }, [getCornersForFrame, smoothCalibration, manualCalibrationLocked]);
 
   // Store a reference to the video element when it mounts
   const handleVideoElement = useCallback((el: HTMLVideoElement | null) => {
     videoElRef.current = el;
-    if (!el || autoCalibrated.current) return;
-
-    const tryNow = async () => {
-      if (!autoCalibrated.current && await runAutoCalibrationRef.current()) {
-        autoCalibrated.current = true;
-      }
-    };
-
-    if (el.readyState >= 2) {
-      // Video already has data — calibrate now
-      setTimeout(tryNow, 50);
-    } else {
-      // Wait for the video to become ready
-      const onReady = () => {
-        el.removeEventListener("canplay", onReady);
-        setTimeout(tryNow, 50);
-      };
-      el.addEventListener("canplay", onReady);
+    if (!el) {
+      setVideoSize({ width: 0, height: 0 });
+      return;
     }
+    setVideoSize({ width: el.videoWidth, height: el.videoHeight });
   }, []);
 
-  // Try auto-calibration when video frame is ready
   const handleCanPlay = useCallback(() => {
-    if (!autoCalibrated.current) {
-      setTimeout(async () => {
-        if (await runAutoCalibrationRef.current()) {
-          autoCalibrated.current = true;
-        }
-      }, 50);
+    if (manualCalibrationLocked) return;
+    // Calibrate from precomputed data if available
+    if (courtData.length > 0) {
+      updateCalibrationForFrame(currentFrame);
     }
-  }, []);
+  }, [courtData, currentFrame, updateCalibrationForFrame, manualCalibrationLocked]);
 
-  // Auto-calibrate as soon as pre-detected corners arrive (any view mode)
+  // When courtData arrives (analysis complete) or video becomes ready, calibrate for frame 0
   useEffect(() => {
-    if (!detectedCorners || autoCalibrated.current) return;
-    // Need video ready (container is optional — may not exist in side-by-side)
-    const video = videoElRef.current;
-    const container = overlayRef.current;
-    if (!video || video.readyState < 2) return;
+    if (courtData.length === 0 || status !== "complete" || !isRealVideo || manualCalibrationLocked) return;
 
-    const ndcPoints = videoToNDC(detectedCorners, video, container);
-    const aspectRatio = container
-      ? container.clientWidth / container.clientHeight
-      : video.videoWidth / video.videoHeight;
-    const cal = solveCameraIterative(ndcPoints, aspectRatio);
-    if (cal) {
-      console.log("[auto-cal] Calibrated from pre-detected corners");
-      setCalibration(cal);
-      autoCalibrated.current = true;
-    }
-  }, [detectedCorners]);
-
-  // Auto-calibrate when results are ready — wait for video element to be truly ready
-  useEffect(() => {
-    if (autoCalibrated.current || status !== "complete" || !isRealVideo) return;
-
-    const tryCalibrate = async () => {
-      if (autoCalibrated.current) return;
-      if (await runAutoCalibrationRef.current()) {
-        autoCalibrated.current = true;
-      }
-    };
-
-    // The video element may not be mounted yet (React just rendered).
-    // Poll briefly for the element, then attach a canplay listener.
     let cancelled = false;
     const pollId = window.setInterval(() => {
       if (cancelled) return;
       const video = videoElRef.current;
-      if (!video) return; // element not mounted yet, keep polling
+      if (!video) return;
 
-      // Element found — stop polling
       window.clearInterval(pollId);
 
+      const doCalibrate = () => {
+        if (!cancelled) {
+          prevCalibrationRef.current = null;
+          updateCalibrationForFrame(0);
+        }
+      };
+
       if (video.readyState >= 2) {
-        // Video already has data — calibrate now
-        tryCalibrate();
+        doCalibrate();
       } else {
-        // Wait for the video to load enough data
         const onReady = () => {
           video.removeEventListener("canplay", onReady);
-          if (!cancelled) tryCalibrate();
+          doCalibrate();
         };
         video.addEventListener("canplay", onReady);
       }
@@ -230,77 +238,27 @@ function App() {
       cancelled = true;
       window.clearInterval(pollId);
     };
-  }, [status, isRealVideo]);
+  }, [courtData, status, isRealVideo, updateCalibrationForFrame, manualCalibrationLocked]);
 
-  // Continuous tracking: re-run detection periodically during playback to keep 3D aligned
+  // Update calibration whenever currentFrame changes (precomputed lookup)
   useEffect(() => {
-    if (!isRealVideo) return;
-    const TRACK_INTERVAL_MS = 5000; // re-detect every 5 seconds
+    if (courtData.length === 0 || !isRealVideo || manualCalibrationLocked) return;
+    updateCalibrationForFrame(currentFrame);
+  }, [currentFrame, courtData, isRealVideo, updateCalibrationForFrame, manualCalibrationLocked]);
 
-    const intervalId = window.setInterval(async () => {
-      const video = videoElRef.current;
-      if (!video || video.paused || video.readyState < 2) return;
-
-      try {
-        const result = await invoke<{
-          action: string;
-          corners?: number[][];
-          message?: string;
-        }>("detect_court", {
-          videoPath,
-          frameTime: video.currentTime,
-        });
-
-        if (result.action === "court_detected" && result.corners) {
-          const corners = result.corners.map(([x, y]: number[]) => ({ x, y }));
-          const container = overlayRef.current;
-          const ndcPoints = videoToNDC(corners, video, container);
-          const aspectRatio = container
-            ? container.clientWidth / container.clientHeight
-            : video.videoWidth / video.videoHeight;
-          const cal = solveCameraIterative(ndcPoints, aspectRatio);
-          if (cal) {
-            setCalibration(cal);
-          }
-        }
-      } catch (e) {
-        // keep last good calibration
-      }
-    }, TRACK_INTERVAL_MS);
-
-    return () => window.clearInterval(intervalId);
-  }, [viewMode, videoPath, isRealVideo]);
-
-  // Reset autoCalibrated flag when video changes
+  // Reset calibration when video changes
   useEffect(() => {
-    autoCalibrated.current = false;
+    prevCalibrationRef.current = null;
     setCalibration(null);
-    setDetectedCorners(null);
+    setManualCalibrationLocked(false);
+    setCalibrationViewTransform({ zoom: 1, panX: 0, panY: 0 });
   }, [videoPath]);
 
-  // Pre-detect court corners as soon as a video is selected
   useEffect(() => {
-    if (!videoPath || !isRealVideo) return;
-    let cancelled = false;
-
-    const timer = setTimeout(async () => {
-      try {
-        const res = await invoke<{ action: string; corners?: number[][] }>(
-          "detect_court",
-          { videoPath, frameTime: 1.0 }
-        );
-        if (!cancelled && res.action === "court_detected" && res.corners) {
-          const corners = res.corners.map(([x, y]: number[]) => ({ x, y }));
-          setDetectedCorners(corners);
-          console.log("[early-detect] Court corners ready");
-        }
-      } catch {
-        // Non-critical — detection will retry when overlay mode is entered
-      }
-    }, 500);
-
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [videoPath, isRealVideo]);
+    if (!showCalibration) {
+      setCalibrationViewTransform({ zoom: 1, panX: 0, panY: 0 });
+    }
+  }, [showCalibration]);
 
   const handleSelectVideo = useCallback(async () => {
     const selected = await open({
@@ -310,8 +268,6 @@ function App() {
 
     if (selected) {
       setVideoPath(selected as string);
-      // Analysis will start after video metadata is loaded (see handleMetadataLoaded)
-      // For now, start immediately — Python will try to detect metadata itself
       startAnalysis(selected as string);
     }
   }, [startAnalysis]);
@@ -324,6 +280,10 @@ function App() {
   // Video reports its duration when metadata loads
   const handleMetadataLoaded = useCallback((duration: number) => {
     setVideoDuration(duration);
+    const video = videoElRef.current;
+    if (video) {
+      setVideoSize({ width: video.videoWidth, height: video.videoHeight });
+    }
   }, []);
 
   // Video reports its currentTime during playback — sync 3D frame to it
@@ -378,7 +338,7 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Tennis 3D Analyzer</h1>
+        <h1>Volleyball 3D Analyzer</h1>
         <div className="header-actions">
           {status === "idle" && (
             <>
@@ -406,10 +366,10 @@ function App() {
       <main className="app-main">
         {status === "idle" && (
           <div className="welcome">
-            <div className="welcome-icon">🎾</div>
-            <h2>Welcome to Tennis 3D Analyzer</h2>
+            <div className="welcome-icon">�</div>
+            <h2>Welcome to Volleyball 3D Analyzer</h2>
             <p>
-              Open a tennis match video to analyze player poses, ball
+              Open a volleyball match video to analyze player poses, ball
               trajectory, and match statistics.
             </p>
             <p className="hint">
@@ -450,25 +410,15 @@ function App() {
                 >
                   Overlay
                 </button>
-                {viewMode === "overlay" && !isCalibrating && !isAdjusting && (
-                  <>
-                    {calibration && (
-                      <button
-                        className="view-btn"
-                        onClick={() => { setIsCalibrating(false); setIsAdjusting(true); }}
-                      >
-                        Adjust Corners
-                      </button>
-                    )}
-                    <button
-                      className="view-btn"
-                      onClick={() => { setIsAdjusting(false); setIsCalibrating(true); }}
-                    >
-                      {calibration ? "Re-align Court" : "Align Court"}
-                    </button>
-                  </>
+                {isRealVideo && (status === "complete") && (
+                  <button
+                    className={`view-btn ${showCalibration ? "active" : ""}`}
+                    onClick={() => setShowCalibration((v) => !v)}
+                  >
+                    {showCalibration ? "Close Calibration" : "Align Court"}
+                  </button>
                 )}
-                {viewMode === "side-by-side" && isRealVideo && calibration && (
+                {viewMode === "side-by-side" && isRealVideo && calibration && !showCalibration && (
                   <span className="view-btn disabled" style={{ opacity: 0.6, cursor: "default" }}>
                     Court Aligned ✓
                   </span>
@@ -477,26 +427,61 @@ function App() {
 
               {viewMode === "side-by-side" && (
                 <div className="split-view">
-                  <div className="split-pane">
-                    <VideoPlayer
-                      videoPath={videoPath}
-                      currentFrame={currentFrame}
-                      fps={result.fps}
-                      isPlaying={isPlaying}
-                      onTimeUpdate={handleVideoTimeUpdate}
-                      onMetadataLoaded={handleMetadataLoaded}
-                      onVideoElement={handleVideoElement}
-                      onCanPlay={handleCanPlay}
-                    />
+                  <div className="split-pane" ref={setSplitVideoEl}>
+                    <div
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        transformOrigin: "0 0",
+                        transform: showCalibration
+                          ? `translate(${calibrationViewTransform.panX}px, ${calibrationViewTransform.panY}px) scale(${calibrationViewTransform.zoom})`
+                          : undefined,
+                      }}
+                    >
+                      <VideoPlayer
+                        videoPath={videoPath}
+                        currentFrame={currentFrame}
+                        fps={result.fps}
+                        isPlaying={isPlaying}
+                        onTimeUpdate={handleVideoTimeUpdate}
+                        onMetadataLoaded={handleMetadataLoaded}
+                        onVideoElement={handleVideoElement}
+                        onCanPlay={handleCanPlay}
+                      />
+                    </div>
+                    {currentKeypoints && !showCalibration && (
+                      <CourtKeypointOverlay
+                        keypoints={currentKeypoints}
+                        videoEl={videoElRef.current}
+                        containerEl={splitVideoEl}
+                      />
+                    )}
+                    {showCalibration && splitVideoSize.width > 0 && splitVideoSize.height > 0 && (
+                      <CourtCalibration
+                        width={splitVideoSize.width}
+                        height={splitVideoSize.height}
+                        videoPath={videoPath}
+                        adjustMode={!!calibration}
+                        initialCalibration={calibration ?? undefined}
+                        onViewTransformChange={setCalibrationViewTransform}
+                        onCalibrated={(cal) => {
+                          setCalibration(cal);
+                          prevCalibrationRef.current = cal;
+                          setManualCalibrationLocked(true);
+                          setShowCalibration(false);
+                        }}
+                        onCancel={() => setShowCalibration(false)}
+                      />
+                    )}
                   </div>
                   <div className="split-pane">
-                    <SkeletonViewer frames={frames} currentFrame={currentFrame} calibration={calibration} />
+                    <SkeletonViewer calibration={calibration} courtData={courtData} isRealVideo={isRealVideo} />
                   </div>
                 </div>
               )}
 
               {viewMode === "overlay" && (
-                <div className="overlay-view" ref={overlayRef}>
+                <div className="overlay-view" ref={setOverlayEl}>
                   <div className="overlay-video">
                     <VideoPlayer
                       videoPath={videoPath}
@@ -509,39 +494,23 @@ function App() {
                       onCanPlay={handleCanPlay}
                     />
                   </div>
-                  <div className="overlay-3d" style={(isCalibrating || isAdjusting) ? { display: "none" } : undefined}>
+                  <div className="overlay-3d">
                     <SkeletonViewer
-                      frames={frames}
-                      currentFrame={currentFrame}
                       overlay
                       calibration={calibration}
+                      courtData={courtData}
+                      isRealVideo={isRealVideo}
+                      overlayVideoAspect={videoAspect}
                     />
                   </div>
-                  {isCalibrating && (
-                    <CourtCalibration
-                      width={overlayRef.current?.clientWidth ?? 800}
-                      height={overlayRef.current?.clientHeight ?? 600}
-                      videoPath={videoPath}
-                      onCalibrated={(result) => {
-                        setCalibration(result);
-                        setIsCalibrating(false);
-                      }}
-                      onCancel={() => setIsCalibrating(false)}
-                    />
-                  )}
-                  {isAdjusting && calibration && (
-                    <CourtCalibration
-                      width={overlayRef.current?.clientWidth ?? 800}
-                      height={overlayRef.current?.clientHeight ?? 600}
-                      videoPath={videoPath}
-                      adjustMode
-                      initialCalibration={calibration}
-                      onCalibrated={(result) => {
-                        setCalibration(result);
-                        setIsAdjusting(false);
-                      }}
-                      onCancel={() => setIsAdjusting(false)}
-                    />
+                  {currentKeypoints && (
+                    <div className="overlay-lines">
+                      <CourtKeypointOverlay
+                        keypoints={currentKeypoints}
+                        videoEl={videoElRef.current}
+                        containerEl={overlayEl}
+                      />
+                    </div>
                   )}
                 </div>
               )}
@@ -556,6 +525,12 @@ function App() {
             </div>
             <div className="sidebar">
               <StatsDisplay result={result} />
+              <CourtMapView
+                frames={frames}
+                currentFrame={currentFrame}
+                courtData={courtData}
+                isRealVideo={isRealVideo}
+              />
             </div>
           </div>
         )}

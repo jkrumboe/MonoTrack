@@ -6,6 +6,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 struct AnalyzerProcess(Mutex<Option<Child>>);
 
+/// Persistent court detector process — keeps model loaded in memory.
+struct CourtDetectorProcess {
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<Option<std::process::ChildStdin>>,
+    stdout: Mutex<Option<BufReader<std::process::ChildStdout>>>,
+}
+
 /// Find the Python interpreter. Tries "python" then "python3".
 fn find_python() -> String {
     for cmd in &["python", "python3"] {
@@ -162,61 +169,116 @@ async fn start_analysis(
 #[tauri::command]
 async fn detect_court(
     app: AppHandle,
+    state: State<'_, CourtDetectorProcess>,
     video_path: String,
     frame_time: f64,
 ) -> Result<Value, String> {
-    let python = find_python();
-    let script = analyzer_script_path(&app);
+    // Ensure the persistent Python process is running
+    {
+        let has_process = state.child.lock().map(|g| g.is_some()).unwrap_or(false);
+        if !has_process {
+            let python = find_python();
+            let script = analyzer_script_path(&app);
 
-    let mut child = Command::new(&python)
-        .arg(&script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start Python: {}. Python: {}, Script: {}", e, python, script))?;
+            let mut child = Command::new(&python)
+                .arg(&script)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("Failed to start Python: {}. Python: {}, Script: {}", e, python, script))?;
 
-    let mut stdin = child.stdin.take().ok_or("Failed to get stdin")?;
-    let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
+            let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
+            let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
+            let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
 
-    // Send detect_court command then quit
+            // Log stderr in background
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        eprintln!("[CourtDetector stderr] {}", line);
+                    }
+                }
+            });
+
+            // Wait for "ready" message
+            let mut reader = BufReader::new(stdout);
+            let mut ready_line = String::new();
+            let _ = reader.read_line(&mut ready_line);
+
+            if let Ok(mut guard) = state.child.lock() { *guard = Some(child); }
+            if let Ok(mut guard) = state.stdin.lock() { *guard = Some(stdin); }
+            if let Ok(mut guard) = state.stdout.lock() { *guard = Some(reader); }
+        }
+    }
+
+    // Send detect_court request
     let request = serde_json::json!({
         "action": "detect_court",
         "video_path": video_path,
         "frame_time": frame_time
     });
-    stdin
-        .write_all(format!("{}\n", request).as_bytes())
-        .map_err(|e| format!("Write error: {}", e))?;
-    stdin
-        .write_all(b"{\"action\":\"quit\"}\n")
-        .map_err(|e| format!("Write error: {}", e))?;
-    drop(stdin);
 
-    // Read stdout for the response
-    let reader = BufReader::new(stdout);
-    let mut result: Option<Value> = None;
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Read error: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(json) = serde_json::from_str::<Value>(&line) {
-            let action = json.get("action").and_then(|a| a.as_str()).unwrap_or("");
-            match action {
-                "court_detected" | "court_failed" | "error" => {
-                    result = Some(json);
-                    break;
-                }
-                _ => {} // skip "ready" etc.
-            }
+    {
+        let mut stdin_guard = state.stdin.lock().map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref mut stdin) = *stdin_guard {
+            stdin
+                .write_all(format!("{}\n", request).as_bytes())
+                .map_err(|e| {
+                    // Process died — clear state so next call restarts it
+                    drop(stdin_guard);
+                    if let Ok(mut g) = state.child.lock() { *g = None; }
+                    if let Ok(mut g) = state.stdin.lock() { *g = None; }
+                    if let Ok(mut g) = state.stdout.lock() { *g = None; }
+                    format!("Write error (process may have died): {}", e)
+                })?;
+        } else {
+            return Err("No stdin available".to_string());
         }
     }
 
-    let _ = child.wait();
-
-    result.ok_or_else(|| "No response from court detection".to_string())
+    // Read response
+    {
+        let mut stdout_guard = state.stdout.lock().map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref mut reader) = *stdout_guard {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        // EOF — process died, clear state
+                        drop(stdout_guard);
+                        if let Ok(mut g) = state.child.lock() { *g = None; }
+                        if let Ok(mut g) = state.stdin.lock() { *g = None; }
+                        if let Ok(mut g) = state.stdout.lock() { *g = None; }
+                        return Err("Court detector process ended unexpectedly".to_string());
+                    }
+                    Ok(_) => {
+                        let line = line.trim().to_string();
+                        if line.is_empty() { continue; }
+                        if let Ok(json) = serde_json::from_str::<Value>(&line) {
+                            let action = json.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                            match action {
+                                "court_detected" | "court_failed" | "error" => {
+                                    return Ok(json);
+                                }
+                                _ => continue, // skip "ready" etc.
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        drop(stdout_guard);
+                        if let Ok(mut g) = state.child.lock() { *g = None; }
+                        if let Ok(mut g) = state.stdin.lock() { *g = None; }
+                        if let Ok(mut g) = state.stdout.lock() { *g = None; }
+                        return Err(format!("Read error: {}", e));
+                    }
+                }
+            }
+        } else {
+            return Err("No stdout available".to_string());
+        }
+    }
 }
 
 #[tauri::command]
@@ -237,6 +299,11 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AnalyzerProcess(Mutex::new(None)))
+        .manage(CourtDetectorProcess {
+            child: Mutex::new(None),
+            stdin: Mutex::new(None),
+            stdout: Mutex::new(None),
+        })
         .invoke_handler(tauri::generate_handler![start_analysis, stop_analysis, detect_court])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

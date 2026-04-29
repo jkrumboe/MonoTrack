@@ -1,5 +1,5 @@
 /**
- * Auto-detect tennis court corners from a video frame using Hough line transform.
+ * Auto-detect volleyball court corners from a video frame using Hough line transform.
  * Returns step-by-step debug images showing the entire process.
  */
 
@@ -535,9 +535,9 @@ export function detectCourtCornersDebug(
   // ─── Step 5: Court model fitting ───
   // Instead of heuristically guessing which lines are baselines, try ALL
   // combinations of (2 baselines + 2 sidelines) and score each candidate
-  // by how well the full tennis court model (service lines, center line,
-  // singles sidelines) aligns with detected edge pixels. The combination
-  // whose projected internal lines best match the edges wins.
+  // by how well the volleyball court model (attack lines) aligns with
+  // detected edge pixels. The combination whose projected internal lines
+  // best match the edges wins.
 
   const yAtCenter = (line: HoughLine) =>
     (line.rho - (w / 2) * Math.cos(line.theta)) / Math.sin(line.theta);
@@ -545,18 +545,15 @@ export function detectCourtCornersDebug(
   const xAtMid = (line: HoughLine) =>
     (line.rho - midY * Math.sin(line.theta)) / Math.cos(line.theta);
 
-  // Tennis doubles court model (normalized [0,1]×[0,1])
+  // Volleyball court model (normalised [0,1]×[0,1])
   // y: 0=far baseline (top), 1=near baseline (bottom)
-  // x: 0=left doubles sideline, 1=right doubles sideline
+  // x: 0=left sideline, 1=right sideline
+  const ATTACK_NORM = 3.0 / 18.0;  // attack line distance from net ≈ 0.1667
   const courtH = [
-    { y: 6.40 / 23.77,            x0: 0, x1: 1 },     // far service line
-    { y: 1 - 6.40 / 23.77,        x0: 0, x1: 1 },     // near service line
+    { y: 0.5 - ATTACK_NORM, x0: 0, x1: 1 },  // far attack line
+    { y: 0.5 + ATTACK_NORM, x0: 0, x1: 1 },  // near attack line
   ];
-  const courtV = [
-    { x: 1.37 / 10.97,            y0: 0, y1: 1 },     // left singles sideline
-    { x: 0.5,                      y0: 6.40 / 23.77, y1: 1 - 6.40 / 23.77 }, // center service line
-    { x: 1 - 1.37 / 10.97,        y0: 0, y1: 1 },     // right singles sideline
-  ];
+  const courtV: { x: number; y0: number; y1: number }[] = [];
 
   // Build edge proximity map — dilate edge pixels by ±proxR for fast hit testing
   const proxR = 4;
@@ -597,7 +594,7 @@ export function detectCourtCornersDebug(
       }
     }
 
-    // Score internal vertical lines (singles sidelines, center service line)
+    // Score internal vertical lines (none for volleyball — courtV is empty)
     for (const vline of courtV) {
       for (let my = vline.y0; my <= vline.y1; my += step) {
         const p = projectPt(H, vline.x, my);

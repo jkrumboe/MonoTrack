@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tennis match video analyzer sidecar process.
+Volleyball match video analyzer sidecar process.
 
 Communicates with the Tauri shell via stdin/stdout as JSON messages.
 Each line of stdout is a JSON object.
@@ -33,32 +33,188 @@ except ImportError:
 
 try:
     import mediapipe as mp
+    from mediapipe.tasks.python import vision as mp_vision, BaseOptions as MpBaseOptions
     HAS_MEDIAPIPE = True
 except ImportError:
     HAS_MEDIAPIPE = False
 
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 
-# ─── Tennis Court Model (ITF Standard) ──────────────────────────────────
-COURT_LENGTH = 23.77           # baseline to baseline (m)
-COURT_WIDTH = 10.97            # doubles sideline to sideline (m)
-SINGLES_WIDTH = 8.23           # singles width (m)
-NET_Y = COURT_LENGTH / 2      # net position: 11.885m
-SERVICE_DIST = 6.40            # service line distance from net (m)
-ALLEY = (COURT_WIDTH - SINGLES_WIDTH) / 2  # 1.37m
+# Lazy-loaded CNN court detector (persists across calls within one process)
+_court_detector = None
+# Temporal smoothing state for court corners
+_prev_corners = None
+_smoothing_alpha = 0.4  # EMA weight for new detection (0=ignore new, 1=no smoothing)
+# Cached video capture to avoid re-opening the same file
+_cached_cap = None
+_cached_cap_path = None
+# Last successfully reprojected court keypoints (reused between detections)
+_last_court_keypoints = None
 
-# Internal court lines for model scoring: [(start_xy, end_xy), ...]
+def _get_court_detector():
+    """CNN court detector is disabled — the trained model is tennis-specific and not used for volleyball.
+    Volleyball court detection uses the Hough-based pipeline only.
+    """
+    return None
+
+
+# ─── Volleyball Court Model (FIVB Standard) ─────────────────────────────
+COURT_LENGTH = 18.0            # full court length baseline-to-baseline (m)
+COURT_WIDTH = 9.0              # court width sideline-to-sideline (m)
+NET_Y = COURT_LENGTH / 2      # net centre: 9.0 m
+ATTACK_DIST = 3.0              # attack line distance from net (m)
+NET_HEIGHT = 2.43              # standard men's net height (m)
+
+# Internal court lines for Hough-based homography scoring.
+# Including baselines improves scoring so the algorithm prefers the full court
+# over attack-line-only hypotheses.
 COURT_MODEL_LINES = [
-    # Far service line
-    ((ALLEY, NET_Y - SERVICE_DIST), (COURT_WIDTH - ALLEY, NET_Y - SERVICE_DIST)),
-    # Near service line
-    ((ALLEY, NET_Y + SERVICE_DIST), (COURT_WIDTH - ALLEY, NET_Y + SERVICE_DIST)),
-    # Center service line
-    ((COURT_WIDTH / 2, NET_Y - SERVICE_DIST), (COURT_WIDTH / 2, NET_Y + SERVICE_DIST)),
-    # Left singles sideline
-    ((ALLEY, 0), (ALLEY, COURT_LENGTH)),
-    # Right singles sideline
-    ((COURT_WIDTH - ALLEY, 0), (COURT_WIDTH - ALLEY, COURT_LENGTH)),
+    # Outer boundaries
+    ((0, 0), (COURT_WIDTH, 0)),                                # far baseline
+    ((0, COURT_LENGTH), (COURT_WIDTH, COURT_LENGTH)),          # near baseline
+    # Attack lines (3 m from net)
+    ((0, NET_Y - ATTACK_DIST), (COURT_WIDTH, NET_Y - ATTACK_DIST)),
+    ((0, NET_Y + ATTACK_DIST), (COURT_WIDTH, NET_Y + ATTACK_DIST)),
+    # Sidelines
+    ((0, 0), (0, COURT_LENGTH)),
+    ((COURT_WIDTH, 0), (COURT_WIDTH, COURT_LENGTH)),
+    # Centre line under net
+    ((0, NET_Y), (COURT_WIDTH, NET_Y)),
 ]
+
+# 10 court keypoints in physical court coordinates (meters).
+# Origin: far-left corner; x = rightward, y = toward near baseline.
+COURT_KPS_PHYSICAL = [
+    [0, 0],                                    # 0: far-left corner
+    [COURT_WIDTH, 0],                          # 1: far-right corner
+    [0, COURT_LENGTH],                         # 2: near-left corner
+    [COURT_WIDTH, COURT_LENGTH],               # 3: near-right corner
+    [0, NET_Y - ATTACK_DIST],                  # 4: far attack line left
+    [COURT_WIDTH, NET_Y - ATTACK_DIST],        # 5: far attack line right
+    [0, NET_Y + ATTACK_DIST],                  # 6: near attack line left
+    [COURT_WIDTH, NET_Y + ATTACK_DIST],        # 7: near attack line right
+    [0, NET_Y],                                # 8: net left
+    [COURT_WIDTH, NET_Y],                      # 9: net right
+]
+
+# 4 court corners in the order returned by corner detection:
+# far-left, far-right, near-right, near-left.
+_CORNERS_PHYSICAL = [
+    [0, 0],
+    [COURT_WIDTH, 0],
+    [COURT_WIDTH, COURT_LENGTH],
+    [0, COURT_LENGTH],
+]
+
+
+def _reproject_keypoints_from_corners(corners_norm, img_h, img_w):
+    """Reproject all 8 court keypoints from 4 smoothed corners via homography.
+
+    corners_norm: list of 4 [x_norm, y_norm] in order [far-left, far-right,
+                  near-right, near-left] (normalized to [0,1]).
+    Returns list of 8 [x_norm, y_norm] or None on failure.
+    """
+    src_pts = np.array(_CORNERS_PHYSICAL, dtype=np.float32)
+    dst_pts = np.array(
+        [[c[0] * img_w, c[1] * img_h] for c in corners_norm],
+        dtype=np.float32,
+    )
+    H, _ = cv2.findHomography(src_pts, dst_pts)
+    if H is None:
+        return None
+    kps_phys = np.array(COURT_KPS_PHYSICAL, dtype=np.float32).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(kps_phys, H).reshape(-1, 2)
+    return [[round(float(p[0]) / img_w, 6), round(float(p[1]) / img_h, 6)] for p in projected]
+
+
+def _get_player_img_pos(pose_lms):
+    """Extract normalised [0,1] 2-D image position from a pose landmark list.
+
+    pose_lms: list of [x, y, z] where x,y are MediaPipe-normalised image coords.
+    Returns [x, y] or None.
+    """
+    if not pose_lms or len(pose_lms) < 25:
+        return None
+    # Prefer average ankle position (landmarks 27, 28)
+    if len(pose_lms) > 28:
+        ax = (pose_lms[27][0] + pose_lms[28][0]) / 2
+        ay = (pose_lms[27][1] + pose_lms[28][1]) / 2
+        if 0.0 <= ax <= 1.0 and 0.0 <= ay <= 1.0:
+            return [round(ax, 4), round(ay, 4)]
+    # Fall back to hip midpoint (landmarks 23, 24)
+    ax = (pose_lms[23][0] + pose_lms[24][0]) / 2
+    ay = (pose_lms[23][1] + pose_lms[24][1]) / 2
+    if 0.0 <= ax <= 1.0 and 0.0 <= ay <= 1.0:
+        return [round(ax, 4), round(ay, 4)]
+    return None
+
+
+def _is_in_court_quad(px_norm, py_norm, corners_norm, img_w, img_h, margin_norm=0.12):
+    """Return True if the normalised image point is inside or near the court quad.
+
+    corners_norm: 4×2 list [[x,y], ...] normalised [0,1],
+                  order: far-left, far-right, near-right, near-left.
+    margin_norm:  extra tolerance as a fraction of min(img_w, img_h).
+    """
+    pts = np.array([[c[0] * img_w, c[1] * img_h] for c in corners_norm], dtype=np.float32)
+    test_pt = (float(px_norm * img_w), float(py_norm * img_h))
+    dist = cv2.pointPolygonTest(pts.reshape(-1, 1, 2), test_pt, measureDist=True)
+    margin_px = margin_norm * min(img_w, img_h)
+    return float(dist) >= -margin_px
+
+
+def _assign_players_from_court(results, corners_norm, img_w, img_h):
+    """Filter MediaPipe results to poses whose feet are inside the court quad.
+
+    Players are sorted by ankle image-y so the nearest-camera player
+    (highest y in image) becomes P1 and the far-baseline player (lowest y)
+    becomes P2.  This excludes ball boys, line judges, and spectators.
+
+    Returns (pose_p1, world_p1, pose_p2, world_p2) — any value may be None
+    if fewer than the expected number of in-court players are detected.
+    """
+    if not results or not results.pose_landmarks:
+        return None, None, None, None
+
+    candidates = []
+    for i, lms in enumerate(results.pose_landmarks):
+        n = len(lms)
+        # Use ankle midpoint as the ground-contact reference point
+        if n > 28:
+            ax = (lms[27].x + lms[28].x) / 2
+            ay = (lms[27].y + lms[28].y) / 2
+        elif n > 24:
+            ax = (lms[23].x + lms[24].x) / 2
+            ay = (lms[23].y + lms[24].y) / 2
+        else:
+            continue
+
+        if not _is_in_court_quad(ax, ay, corners_norm, img_w, img_h):
+            continue
+
+        wlms = None
+        if results.pose_world_landmarks and i < len(results.pose_world_landmarks):
+            wlms = results.pose_world_landmarks[i]
+        candidates.append({'ay': ay, 'lms': lms, 'wlms': wlms})
+
+    # Highest image-y = near baseline = P1; lowest = far baseline = P2
+    candidates.sort(key=lambda c: c['ay'], reverse=True)
+
+    def _extract(c):
+        if c is None:
+            return None, None
+        pose = [[round(lm.x, 4), round(lm.y, 4), round(lm.z, 4)] for lm in c['lms']]
+        world = ([[round(lm.x, 4), round(lm.y, 4), round(lm.z, 4)] for lm in c['wlms']]
+                 if c['wlms'] else None)
+        return pose, world
+
+    p1_pose, p1_world = _extract(candidates[0] if len(candidates) > 0 else None)
+    p2_pose, p2_world = _extract(candidates[1] if len(candidates) > 1 else None)
+    return p1_pose, p1_world, p2_pose, p2_world
 
 
 def send(obj: dict):
@@ -80,8 +236,9 @@ def _detect_court_surface(hsv):
     """Detect court surface via HSV color segmentation. Returns dilated binary mask."""
     masks = {
         'green': cv2.inRange(hsv, (30, 25, 40), (85, 255, 255)),
-        'blue': cv2.inRange(hsv, (90, 30, 40), (130, 255, 255)),
-        'clay': cv2.inRange(hsv, (5, 50, 80), (25, 255, 255)),
+        'teal':  cv2.inRange(hsv, (78, 35, 50), (100, 255, 255)),   # FIVB teal/cyan courts
+        'blue':  cv2.inRange(hsv, (95, 30, 40), (130, 255, 255)),
+        'clay':  cv2.inRange(hsv, (5, 50, 80), (25, 255, 255)),
     }
     mask = max(masks.values(), key=cv2.countNonZero)
 
@@ -242,7 +399,7 @@ def _score_hypothesis(corners, white_mask, img_h, img_w):
             np.array([[[sx, sy]]], dtype=np.float32), H)[0][0]
         p2 = cv2.perspectiveTransform(
             np.array([[[ex, ey]]], dtype=np.float32), H)[0][0]
-        for t in np.linspace(0, 1, 30):
+        for t in np.linspace(0, 1, 12):
             px = int(p1[0] + t * (p2[0] - p1[0]))
             py = int(p1[1] + t * (p2[1] - p1[1]))
             if 0 <= px < img_w and 0 <= py < img_h:
@@ -257,10 +414,12 @@ def _score_hypothesis(corners, white_mask, img_h, img_w):
 
     hit_rate = hits / total
     area = cv2.contourArea(img_pts)
-    # Strongly prefer larger quads — full court is typically 30-50% of frame
+    # Uncapped area weight: larger quads score strictly higher than smaller ones.
+    # This prevents attack-zone hypotheses (covering ~40% of frame) from beating
+    # the full-court hypothesis (~60% of frame) even when hit_rate is similar.
     area_ratio = area / (img_h * img_w)
-    area_weight = min(1.0, area_ratio / 0.30)
-    return hit_rate * (area_weight ** 2)
+    area_weight = (area_ratio / 0.35) ** 2  # no cap
+    return hit_rate * area_weight
 
 
 def _find_best_court(h_lines, v_lines, white_mask, img_h, img_w):
@@ -270,16 +429,21 @@ def _find_best_court(h_lines, v_lines, white_mask, img_h, img_w):
     def seg_len(l):
         return math.sqrt((l[2] - l[0])**2 + (l[3] - l[1])**2)
 
-    h_top = sorted(h_lines, key=seg_len, reverse=True)[:10]
-    v_top = sorted(v_lines, key=seg_len, reverse=True)[:10]
+    h_top = sorted(h_lines, key=seg_len, reverse=True)[:7]
+    v_top = sorted(v_lines, key=seg_len, reverse=True)[:7]
     best_score, best_corners = 0, None
 
     for h1, h2 in combinations(h_top, 2):
         y1 = (h1[1] + h1[3]) / 2
         y2 = (h2[1] + h2[3]) / 2
-        if abs(y1 - y2) < img_h * 0.30:
+        if abs(y1 - y2) < img_h * 0.35:
             continue
         top, bot = (h1, h2) if y1 < y2 else (h2, h1)
+
+        # In broadcast view the far (top) baseline is in the upper ~35% of
+        # the frame. Reject any "top" line below that — it's an attack line.
+        if (top[1] + top[3]) / 2 > img_h * 0.38:
+            continue
 
         for v1, v2 in combinations(v_top, 2):
             tl = _line_intersection(top, v1)
@@ -296,9 +460,20 @@ def _find_best_court(h_lines, v_lines, white_mask, img_h, img_w):
 
             corners = [tl, tr, br, bl]
 
-            margin = max(img_w, img_h) * 0.15
-            if any(c[0] < -margin or c[0] > img_w + margin or
-                   c[1] < -margin or c[1] > img_h + margin for c in corners):
+            # Allow corners off-screen, especially the near (bottom) baseline
+            # which is frequently cut off in broadcast views.
+            margin_x = img_w * 0.20
+            margin_top = img_h * 0.15
+            margin_bot = img_h * 0.55
+            skip = False
+            for c in corners:
+                if c[0] < -margin_x or c[0] > img_w + margin_x:
+                    skip = True; break
+                if c[1] < -margin_top:
+                    skip = True; break
+                if c[1] > img_h + margin_bot:
+                    skip = True; break
+            if skip:
                 continue
 
             contour = np.array(corners, dtype=np.float32)
@@ -421,7 +596,7 @@ def _draw_model_overlay(img, corners):
 
 def detect_court_corners_debug(frame):
     """
-    Detect tennis court corners with full debug output.
+    Detect volleyball court corners with full debug output.
     Returns (corners_normalized, debug_steps, log_lines).
     corners_normalized: [[x, y], ...] in [0,1] or None.
     debug_steps: [{"label": str, "info": str, "image": base64_str}, ...]
@@ -538,21 +713,28 @@ def detect_court_corners_debug(frame):
 
     # Step 7: Best court model
     corners, score = _find_best_court(h_lines, v_lines, white_mask, img_h, img_w)
-    log.append(f"Best court score: {score:.4f}")
+    log.append(f"Best Hough court score: {score:.4f}")
+    method = "hough"
 
     if corners is None or score < 0.1:
-        log.append(f"FAIL: No valid court found (score={score:.4f} < 0.1)")
-        steps.append({"label": "7. Selected Court", "info": "No valid court", "image": _img_to_base64(frame)})
-        return None, steps, log
+        log.append(f"Hough failed (score={score:.4f}) — trying mask convex hull fallback...")
+        corners = _detect_court_from_mask(court_mask, img_h, img_w)
+        method = "mask"
+        if corners is not None:
+            log.append("Mask convex hull succeeded")
+        else:
+            log.append("FAIL: Both Hough and mask methods found no court")
+            steps.append({"label": "7. Selected Court", "info": "No valid court", "image": _img_to_base64(frame)})
+            return None, steps, log
 
     corner_labels = ["TL(far-L)", "TR(far-R)", "BR(near-R)", "BL(near-L)"]
     corners_vis = _draw_corners_on(frame, corners, corner_labels)
     # Draw quadrilateral
-    pts = np.array(corners, dtype=np.int32).reshape((-1, 1, 2))
+    pts = np.array([[int(c[0]), int(c[1])] for c in corners], dtype=np.int32).reshape((-1, 1, 2))
     cv2.polylines(corners_vis, [pts], True, (0, 255, 255), 2)
     steps.append({
-        "label": "7. Raw Line Intersections",
-        "info": f"score={score:.4f}",
+        "label": f"7. Raw Corners ({method})",
+        "info": f"method={method}, score={score:.4f}",
         "image": _img_to_base64(corners_vis),
     })
 
@@ -591,13 +773,164 @@ def detect_court_corners_debug(frame):
     return normalized, steps, log
 
 
+def _smooth_corners(new_corners):
+    """Apply EMA smoothing to detected corners for temporal stability."""
+    global _prev_corners
+    if _prev_corners is None:
+        _prev_corners = new_corners
+        return new_corners
+
+    smoothed = []
+    for (nx, ny), (px, py) in zip(new_corners, _prev_corners):
+        sx = _smoothing_alpha * nx + (1 - _smoothing_alpha) * px
+        sy = _smoothing_alpha * ny + (1 - _smoothing_alpha) * py
+        smoothed.append([round(sx, 6), round(sy, 6)])
+    _prev_corners = smoothed
+    return smoothed
+
+
+def _detect_court_from_mask(court_mask, img_h, img_w):
+    """Estimate court corners from the convex hull of the court surface mask.
+
+    Works even when the far baseline is obscured by the net/players, because
+    the teal/green court colour is still visible behind the net.
+
+    Returns 4 corners [[x,y], ...] in pixel coords (far-L, far-R, near-R, near-L)
+    or None on failure.
+    """
+    cnts, _ = cv2.findContours(court_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    cnt = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < img_h * img_w * 0.08:
+        return None
+
+    hull = cv2.convexHull(cnt).reshape(-1, 2).astype(np.float32)
+
+    # Select 4 extreme corners using coordinate sums/differences
+    tl = hull[np.argmin(hull[:, 0] + hull[:, 1])].tolist()   # min x+y  → far-left
+    tr = hull[np.argmax(hull[:, 0] - hull[:, 1])].tolist()   # max x-y  → far-right
+    br = hull[np.argmax(hull[:, 0] + hull[:, 1])].tolist()   # max x+y  → near-right
+    bl = hull[np.argmin(hull[:, 0] - hull[:, 1])].tolist()   # min x-y  → near-left
+
+    corners = [tl, tr, br, bl]
+
+    # Validate: minimum area and perspective (top edge narrower than bottom)
+    pts = np.array(corners, dtype=np.float32)
+    if cv2.contourArea(pts) < img_h * img_w * 0.08:
+        return None
+    top_w = math.sqrt((tr[0] - tl[0]) ** 2 + (tr[1] - tl[1]) ** 2)
+    bot_w = math.sqrt((br[0] - bl[0]) ** 2 + (br[1] - bl[1]) ** 2)
+    if top_w > bot_w * 1.20:   # top edge must not be wider than bottom
+        return None
+
+    return corners
+
+
+def _detect_court_hough_fast(frame):
+    """Court detection: Hough first, falls back to surface-mask convex hull.
+
+    The Hough path requires the far baseline to be detected as a line
+    (it must be in the upper 48% of the frame). If that fails the mask
+    convex-hull approach is used — it works as long as the teal/green
+    court surface is cleanly segmented.
+
+    Returns corners_normalized [[x,y]×4] in [0,1] (far-L, far-R, near-R,
+    near-L) or None.
+    """
+    img_h, img_w = frame.shape[:2]
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    court_mask = _detect_court_surface(hsv)
+    if cv2.countNonZero(court_mask) < img_h * img_w * 0.05:
+        return None
+
+    white_mask = _detect_white_lines(hsv, court_mask)
+    corners = None
+
+    # --- Attempt 1: Hough line detection ---
+    if cv2.countNonZero(white_mask) >= 100:
+        lines = cv2.HoughLinesP(
+            white_mask, rho=1, theta=np.pi / 180,
+            threshold=50,
+            minLineLength=int(min(img_w, img_h) * 0.04),
+            maxLineGap=int(min(img_w, img_h) * 0.03),
+        )
+        if lines is not None and len(lines) >= 4:
+            segments = [l[0].tolist() for l in lines]
+            merged = _merge_segments(
+                segments, angle_thresh=8,
+                dist_thresh=max(img_w, img_h) * 0.02,
+                gap_thresh=max(img_w, img_h) * 0.05,
+            )
+            if len(merged) >= 4:
+                h_lines, v_lines = _classify_lines(merged)
+                if len(h_lines) >= 2 and len(v_lines) >= 2:
+                    c, score = _find_best_court(h_lines, v_lines, white_mask, img_h, img_w)
+                    if c is not None and score >= 0.08:
+                        corners = c
+
+    # --- Attempt 2: court surface mask convex hull ---
+    if corners is None:
+        corners = _detect_court_from_mask(court_mask, img_h, img_w)
+
+    if corners is None:
+        return None
+
+    corners = _refine_corners(corners, white_mask, img_h, img_w)
+    corners = _smooth_corners(corners)
+    return [[round(c[0] / img_w, 6), round(c[1] / img_h, 6)] for c in corners]
+
+
+def _detect_court_cnn(frame):
+    """Try CNN-based court detection. Returns (corners_normalized, log) or (None, log)."""
+    log = []
+    detector = _get_court_detector()
+    if detector is None:
+        log.append("CNN detector not available (torch not installed or model missing)")
+        return None, log
+
+    t0 = time.time()
+    try:
+        keypoints, corners = detector.detect(frame, use_homography=True)
+        elapsed = (time.time() - t0) * 1000
+
+        n_detected = sum(1 for p in keypoints if p[0] is not None)
+        log.append(f"CNN detected {n_detected}/14 keypoints in {elapsed:.0f}ms")
+
+        if corners is not None:
+            corners = _smooth_corners(corners)
+            log.append(f"CNN court corners (smoothed): {corners}")
+            return corners, log
+        else:
+            log.append("CNN: not enough keypoints for court corners")
+            return None, log
+    except Exception as e:
+        log.append(f"CNN detection error: {e}")
+        return None, log
+
+
+def _get_video_capture(video_path):
+    """Get a cached VideoCapture for the given path, or create a new one."""
+    global _cached_cap, _cached_cap_path
+    if _cached_cap is not None and _cached_cap_path == video_path and _cached_cap.isOpened():
+        return _cached_cap
+    if _cached_cap is not None:
+        _cached_cap.release()
+    _cached_cap = cv2.VideoCapture(video_path)
+    _cached_cap_path = video_path
+    return _cached_cap
+
+
 def handle_detect_court(video_path, frame_time=0.0):
-    """Handle detect_court action: read a frame and run court detection with debug."""
+    """Handle detect_court action: read a frame and run court detection."""
     if not os.path.isfile(video_path):
         send({"action": "error", "message": f"File not found: {video_path}"})
         return
 
-    cap = cv2.VideoCapture(video_path)
+    t_total = time.time()
+
+    cap = _get_video_capture(video_path)
     if not cap.isOpened():
         send({"action": "error", "message": f"Cannot open video: {video_path}"})
         return
@@ -607,16 +940,57 @@ def handle_detect_court(video_path, frame_time=0.0):
     if frame_number > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
 
+    t_seek = time.time()
     ret, frame = cap.read()
-    cap.release()
 
     if not ret:
         send({"action": "error", "message": f"Cannot read frame at time {frame_time:.2f}s"})
         return
 
-    corners, steps, log = detect_court_corners_debug(frame)
+    t_read = time.time()
+    read_ms = (t_read - t_seek) * 1000
+
+    # Try CNN-based detection first (much more robust)
+    corners, cnn_log = _detect_court_cnn(frame)
+    t_detect = time.time()
+    detect_ms = (t_detect - t_read) * 1000
+    total_ms = (t_detect - t_total) * 1000
+
     if corners is not None:
-        send({"action": "court_detected", "corners": corners, "steps": steps, "log": log})
+        send({
+            "action": "court_detected",
+            "corners": corners,
+            "steps": [],
+            "log": cnn_log,
+            "method": "cnn",
+            "timing": {
+                "read_ms": round(read_ms, 1),
+                "detect_ms": round(detect_ms, 1),
+                "total_ms": round(total_ms, 1),
+            },
+        })
+        return
+
+    # Fall back to Hough-based detection
+    corners, steps, log = detect_court_corners_debug(frame)
+    t_hough = time.time()
+    hough_ms = (t_hough - t_detect) * 1000
+    total_ms = (t_hough - t_total) * 1000
+
+    log = cnn_log + ["Falling back to Hough-based detection..."] + log
+    if corners is not None:
+        send({
+            "action": "court_detected",
+            "corners": corners,
+            "steps": steps,
+            "log": log,
+            "method": "hough",
+            "timing": {
+                "read_ms": round(read_ms, 1),
+                "detect_ms": round(hough_ms, 1),
+                "total_ms": round(total_ms, 1),
+            },
+        })
     else:
         send({"action": "court_failed", "steps": steps, "log": log,
               "message": "Court detection failed - see debug steps"})
@@ -777,23 +1151,23 @@ def generate_dummy_pose(frame_idx: int, court_x: float, court_z: float):
 
 
 def generate_dummy_ball(frame_idx: int, total_frames: int):
-    """Generate a ball that rallies back and forth across the net (z=0)."""
-    # Ball takes ~40 frames to cross the court, then comes back
-    rally_period = 80
+    """Generate a volleyball that rallies back and forth over the net (z=0)."""
+    # Volleyball rallies are faster; ~50 frames to cross the court
+    rally_period = 50
     t_in_rally = (frame_idx % rally_period) / rally_period
     going_forward = (frame_idx // rally_period) % 2 == 0
 
     if going_forward:
-        z = -10.0 + t_in_rally * 20.0   # near baseline to far baseline
+        z = -8.0 + t_in_rally * 16.0   # near baseline to far baseline
     else:
-        z = 10.0 - t_in_rally * 20.0
+        z = 8.0 - t_in_rally * 16.0
 
-    x = math.sin(frame_idx * 0.08) * 3.0  # lateral drift
-    # Parabolic arc peaking at the net (z≈0)
-    z_norm = abs(z) / 10.0  # 0 at net, 1 at baseline
-    y = max(0.05, 2.5 * (1.0 - z_norm * z_norm))  # peaks at ~2.5m over net
+    x = math.sin(frame_idx * 0.1) * 2.5  # lateral drift (narrower court)
+    # Higher arc for volleyball — peaks at ~4m over the net
+    z_norm = abs(z) / 8.0  # 0 at net, 1 at baseline
+    y = max(0.1, 4.0 * (1.0 - z_norm * z_norm))
 
-    detected = (frame_idx % 5) != 0  # ~80% detection rate
+    detected = (frame_idx % 4) != 0  # ~75% detection rate
     return {
         "x": round(x, 4),
         "y": round(y, 4),
@@ -803,60 +1177,84 @@ def generate_dummy_ball(frame_idx: int, total_frames: int):
 
 def analyze_video_dummy(video_path: str, total_frames: int = 150, fps: float = 30.0):
     """
-    Dummy analysis that generates fake frame data.
-    Uses real frame count/FPS if provided, otherwise defaults.
+    Dummy analysis that generates fake frame data focused on court display.
+    Pose and ball are disabled; only frame/timestamp/progress events are sent.
     """
     send_progress(0, f"Starting analysis ({total_frames} frames at {fps:.1f} FPS)...")
 
-    total_shots = 0
-    ball_speeds = []
-
     for i in range(total_frames):
         timestamp = round(i / fps, 4)
-
-        # Players positioned on opposite baselines
-        # Player 1: near baseline (z ≈ -9), Player 2: far baseline (z ≈ +9)
-        pose_p1 = generate_dummy_pose(i, court_x=0.0, court_z=-9.0)
-        pose_p2 = generate_dummy_pose(i, court_x=0.0, court_z=9.0)
-        ball, ball_detected = generate_dummy_ball(i, total_frames)
-
-        if ball_detected and i > 0:
-            total_shots += 1
-            ball_speeds.append(80 + math.sin(i * 0.1) * 40)
 
         send({
             "action": "frame",
             "frame": i,
             "timestamp": timestamp,
-            "pose_player1": pose_p1,
-            "pose_player2": pose_p2,
-            "ball": ball,
-            "ball_detected": ball_detected,
         })
 
-        # Report progress at ~1% intervals
         percent = int((i + 1) / total_frames * 100)
         prev_percent = int(i / total_frames * 100)
         if percent > prev_percent:
             send_progress(percent, f"Processed frame {i+1}/{total_frames}")
 
-    avg_speed = round(sum(ball_speeds) / max(len(ball_speeds), 1), 1)
-
     send({
         "action": "complete",
         "total_frames": total_frames,
         "fps": fps,
-        "score": {"player1": 0, "player2": 0},
-        "stats": {
-            "avg_ball_speed": avg_speed,
-            "total_shots": total_shots,
-        },
+        "score": {"team1": 0, "team2": 0},
+        "stats": {},
     })
+
+
+def _assign_teams_from_court(results, corners_norm, img_w, img_h):
+    """Filter detected poses to the court quad and split by team.
+
+    Players whose ankles fall on the near half (y_norm >= 0.5) belong to
+    team 1; those on the far half (y_norm < 0.5) to team 2.
+
+    Returns (team1, team2) where each is a list of dicts:
+      { 'ay': float, 'ax': float, 'pose': [...], 'world': [...] | None }
+    Sorted so the most confident detection (deepest into the frame from
+    that side's perspective) comes first.
+    """
+    if not results or not results.pose_landmarks:
+        return [], []
+
+    team1, team2 = [], []
+    for i, lms in enumerate(results.pose_landmarks):
+        n = len(lms)
+        if n > 28:
+            ax = (lms[27].x + lms[28].x) / 2
+            ay = (lms[27].y + lms[28].y) / 2
+        elif n > 24:
+            ax = (lms[23].x + lms[24].x) / 2
+            ay = (lms[23].y + lms[24].y) / 2
+        else:
+            continue
+
+        if not _is_in_court_quad(ax, ay, corners_norm, img_w, img_h):
+            continue
+
+        wlms = None
+        if results.pose_world_landmarks and i < len(results.pose_world_landmarks):
+            wlms = results.pose_world_landmarks[i]
+
+        pose = [[round(lm.x, 4), round(lm.y, 4), round(lm.z, 4)] for lm in lms]
+        world = [[round(lm.x, 4), round(lm.y, 4), round(lm.z, 4)] for lm in wlms] if wlms else None
+        entry = {'ay': ay, 'ax': ax, 'pose': pose, 'world': world}
+        if ay >= 0.5:  # near side → team 1
+            team1.append(entry)
+        else:          # far side  → team 2
+            team2.append(entry)
+
+    # Sort so the "deepest" player on each side comes first
+    team1.sort(key=lambda c: c['ay'], reverse=True)
+    team2.sort(key=lambda c: c['ay'])
+    return team1, team2
 
 
 def analyze_video_cv(video_path: str):
     """
-    Real CV analysis using OpenCV + MediaPipe.
+    Real CV analysis using OpenCV — court detection only.
     Falls back to dummy if video can't be opened.
     """
     cap = cv2.VideoCapture(video_path)
@@ -869,20 +1267,16 @@ def analyze_video_cv(video_path: str):
 
     send_progress(0, f"Analyzing {total_frames} frames at {fps:.1f} FPS...")
 
-    # Initialize MediaPipe Pose if available
-    pose_detector = None
-    if HAS_MEDIAPIPE:
-        mp_pose = mp.solutions.pose
-        pose_detector = mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+    # --- Court detection: run once per second of video ---
+    court_interval = max(int(fps), 1)  # detect every ~1s of video
+    court_detector = _get_court_detector()
+    court_data = []  # list of {frame, timestamp, corners}
+    global _prev_corners
+    _prev_corners = None  # reset smoothing state for fresh analysis
+    global _last_court_keypoints
+    _last_court_keypoints = None
 
     frame_idx = 0
-    total_shots = 0
-    ball_speeds = []
 
     while True:
         ret, frame = cap.read()
@@ -890,39 +1284,43 @@ def analyze_video_cv(video_path: str):
             break
 
         timestamp = round(frame_idx / fps, 4)
+        img_h, img_w = frame.shape[:2]
 
-        # Pose estimation
-        if pose_detector is not None:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose_detector.process(rgb)
-            if results.pose_landmarks:
-                pose_p1 = [
-                    [round(lm.x, 4), round(lm.y, 4), round(lm.z, 4)]
-                    for lm in results.pose_landmarks.landmark
-                ]
-            else:
-                pose_p1 = generate_dummy_pose(frame_idx, court_x=0.0, court_z=-9.0)
-            # Second player would need separate detection/tracking
-            pose_p2 = generate_dummy_pose(frame_idx, court_x=0.0, court_z=9.0)
-        else:
-            pose_p1 = generate_dummy_pose(frame_idx, court_x=0.0, court_z=-9.0)
-            pose_p2 = generate_dummy_pose(frame_idx, court_x=0.0, court_z=9.0)
+        # Court detection runs first so corners are available for calibration
+        frame_court_corners = None
+        frame_court_keypoints = None
+        if frame_idx % court_interval == 0:
+            try:
+                corners = _detect_court_hough_fast(frame)
+                if corners is not None:
+                    frame_court_corners = corners
+                    kps_reproj = _reproject_keypoints_from_corners(corners, img_h, img_w)
+                    if kps_reproj is not None:
+                        frame_court_keypoints = kps_reproj
+                        _last_court_keypoints = kps_reproj
+                    court_data.append({
+                        "frame": frame_idx,
+                        "timestamp": timestamp,
+                        "corners": corners,
+                        "keypoints": kps_reproj,
+                    })
+            except Exception as e:
+                print(f"[court] Frame {frame_idx} detection error: {e}", file=sys.stderr)
 
-        # Ball tracking (placeholder — TrackNet integration goes here)
-        ball, ball_detected = generate_dummy_ball(frame_idx, total_frames)
-        if ball_detected:
-            total_shots += 1
-            ball_speeds.append(80 + math.sin(frame_idx * 0.1) * 40)
+        # Pose estimation — disabled, focus on court detection only
 
-        send({
+        # Ball tracking — disabled, focus on court detection only
+
+        frame_msg = {
             "action": "frame",
             "frame": frame_idx,
             "timestamp": timestamp,
-            "pose_player1": pose_p1,
-            "pose_player2": pose_p2,
-            "ball": ball,
-            "ball_detected": ball_detected,
-        })
+        }
+        if frame_court_corners is not None:
+            frame_msg["court_corners"] = frame_court_corners
+        if frame_court_keypoints is not None:
+            frame_msg["court_keypoints"] = frame_court_keypoints
+        send(frame_msg)
 
         percent = int((frame_idx + 1) / max(total_frames, 1) * 100)
         if percent % 10 == 0 and frame_idx > 0:
@@ -931,34 +1329,24 @@ def analyze_video_cv(video_path: str):
         frame_idx += 1
 
     cap.release()
-    if pose_detector:
-        pose_detector.close()
-
-    avg_speed = round(sum(ball_speeds) / max(len(ball_speeds), 1), 1)
 
     send({
         "action": "complete",
         "total_frames": frame_idx,
         "fps": fps,
-        "score": {"player1": 0, "player2": 0},
-        "stats": {
-            "avg_ball_speed": avg_speed,
-            "total_shots": total_shots,
-        },
+        "court_data": court_data,
+        "score": {"team1": 0, "team2": 0},
+        "stats": {},
     })
 
 
 def analyze_video(video_path: str, duration_hint: float = 0.0):
     """Route to real CV or dummy analysis based on available libraries."""
     if not os.path.isfile(video_path):
-        # For demo mode, allow non-existent paths
-        if HAS_CV2:
-            send_error(f"File not found: {video_path}")
-            return
-        else:
-            send_progress(0, "Demo mode: CV libraries not installed, generating sample data")
-            analyze_video_dummy(video_path)
-            return
+        # Non-existent path = demo mode (generates synthetic data)
+        send_progress(0, "Demo mode: generating sample data...")
+        analyze_video_dummy(video_path)
+        return
 
     if HAS_CV2:
         analyze_video_cv(video_path)
