@@ -146,13 +146,22 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
   // Toggle overlay mode: transparent background + lock/unlock orbit controls
   useEffect(() => {
     if (!sceneRef.current) return;
-    const { scene, controls } = sceneRef.current;
+    const { scene, controls, courtGroup } = sceneRef.current;
     if (overlay) {
       scene.background = null;
       controls.enabled = false;
     } else {
       scene.background = new THREE.Color(0x1a1a2e);
       controls.enabled = true;
+    }
+
+    // Make the court floor more transparent for video overlays.
+    const surface = courtGroup.getObjectByName("court-surface") as THREE.Mesh | undefined;
+    if (surface && surface.material instanceof THREE.MeshStandardMaterial) {
+      surface.material.transparent = overlay;
+      surface.material.opacity = overlay ? 0.28 : 1.0;
+      surface.material.depthWrite = !overlay;
+      surface.material.needsUpdate = true;
     }
   }, [overlay]);
 
@@ -208,6 +217,7 @@ function createCourt(): THREE.Group {
   const surfaceGeometry = new THREE.PlaneGeometry(COURT_WIDTH, COURT_LENGTH);
   const surfaceMaterial = new THREE.MeshStandardMaterial({ color: 0x1a3d6e, side: THREE.DoubleSide });
   const surface = new THREE.Mesh(surfaceGeometry, surfaceMaterial);
+  surface.name = "court-surface";
   surface.rotation.x = -Math.PI / 2;
   surface.position.y = -0.01;
   group.add(surface);
@@ -227,17 +237,58 @@ function createCourt(): THREE.Group {
   addLine(group, lineMaterial, -halfW, 0, -ATTACK_DIST, halfW, 0, -ATTACK_DIST);  // far
   addLine(group, lineMaterial, -halfW, 0,  ATTACK_DIST, halfW, 0,  ATTACK_DIST);  // near
 
-  // Net mesh
-  const netGeometry = new THREE.PlaneGeometry(COURT_WIDTH, NET_HEIGHT);
-  const netMaterial = new THREE.MeshStandardMaterial({
-    color: 0xcccccc,
+  // Suspended volleyball-style net and poles.
+  const netDrop = 1.0;
+  const netTopY = NET_HEIGHT;
+  const netBottomY = NET_HEIGHT - netDrop;
+  const netCenterY = (netTopY + netBottomY) / 2;
+
+  const netPanelGeometry = new THREE.PlaneGeometry(COURT_WIDTH, netDrop);
+  const netPanelMaterial = new THREE.MeshStandardMaterial({
+    color: 0xd9d9d9,
     transparent: true,
-    opacity: 0.35,
+    opacity: 0.12,
     side: THREE.DoubleSide,
   });
-  const net = new THREE.Mesh(netGeometry, netMaterial);
-  net.position.set(0, NET_HEIGHT / 2, 0);
-  group.add(net);
+  const netPanel = new THREE.Mesh(netPanelGeometry, netPanelMaterial);
+  netPanel.position.set(0, netCenterY, 0);
+  group.add(netPanel);
+
+  const tapeMaterial = new THREE.MeshStandardMaterial({ color: 0xf5f5f5 });
+  const topTape = new THREE.Mesh(new THREE.BoxGeometry(COURT_WIDTH + 0.16, 0.055, 0.04), tapeMaterial);
+  topTape.position.set(0, netTopY, 0);
+  group.add(topTape);
+
+  const bottomTape = new THREE.Mesh(new THREE.BoxGeometry(COURT_WIDTH + 0.05, 0.03, 0.03), tapeMaterial);
+  bottomTape.position.set(0, netBottomY, 0);
+  group.add(bottomTape);
+
+  const gridPoints: THREE.Vector3[] = [];
+  const cellW = 0.22;
+  const cellH = 0.16;
+
+  for (let x = -halfW; x <= halfW + 1e-6; x += cellW) {
+    gridPoints.push(new THREE.Vector3(x, netBottomY, 0), new THREE.Vector3(x, netTopY, 0));
+  }
+  for (let y = netBottomY; y <= netTopY + 1e-6; y += cellH) {
+    gridPoints.push(new THREE.Vector3(-halfW, y, 0), new THREE.Vector3(halfW, y, 0));
+  }
+
+  const netGridGeometry = new THREE.BufferGeometry().setFromPoints(gridPoints);
+  const netGridMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.45 });
+  const netGrid = new THREE.LineSegments(netGridGeometry, netGridMaterial);
+  group.add(netGrid);
+
+  const poleHeight = NET_HEIGHT + 0.5;
+  const poleRadius = 0.05;
+  const poleMaterial = new THREE.MeshStandardMaterial({ color: 0x2c3e50, metalness: 0.25, roughness: 0.55 });
+  const leftPole = new THREE.Mesh(new THREE.CylinderGeometry(poleRadius, poleRadius, poleHeight, 16), poleMaterial);
+  leftPole.position.set(-(halfW + 0.18), poleHeight / 2, 0);
+  group.add(leftPole);
+
+  const rightPole = new THREE.Mesh(new THREE.CylinderGeometry(poleRadius, poleRadius, poleHeight, 16), poleMaterial);
+  rightPole.position.set(halfW + 0.18, poleHeight / 2, 0);
+  group.add(rightPole);
 
   return group;
 }
