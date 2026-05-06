@@ -79,6 +79,7 @@ function App() {
   const [videoSize, setVideoSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [calibration, setCalibration] = useState<CalibrationResult | null>(null);
   const [manualCalibrationLocked, setManualCalibrationLocked] = useState(false);
+  const [resetViewTrigger, setResetViewTrigger] = useState(0);
   const [showCalibration, setShowCalibration] = useState(false);
   const [calibrationViewTransform, setCalibrationViewTransform] = useState({ zoom: 1, panX: 0, panY: 0 });
   const [overlayEl, setOverlayEl] = useState<HTMLDivElement | null>(null);
@@ -517,7 +518,15 @@ function App() {
                       videoAspect={videoAspect}
                       courtData={courtData}
                       isRealVideo={isRealVideo}
+                      resetViewTrigger={resetViewTrigger}
                     />
+                    <button
+                      className="reset-view-btn"
+                      title="Reset to video-aligned view"
+                      onClick={() => setResetViewTrigger((v) => v + 1)}
+                    >
+                      ⟳ Reset View
+                    </button>
                   </div>
                 </div>
               )}

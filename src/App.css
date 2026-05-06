@@ -354,6 +354,27 @@ body {
   border-right: 1px solid var(--border);
 }
 
+.reset-view-btn {
+  position: absolute;
+  bottom: 12px;
+  right: 12px;
+  padding: 5px 12px;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: var(--radius);
+  color: #ccc;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  z-index: 10;
+}
+
+.reset-view-btn:hover {
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
 /* === Overlay View === */
 .overlay-view {
   flex: 1;

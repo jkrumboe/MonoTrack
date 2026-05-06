@@ -31,6 +31,7 @@ interface SkeletonViewerProps {
   courtData?: CourtDataEntry[];
   isRealVideo?: boolean;
   overlayVideoAspect?: number;
+  resetViewTrigger?: number;
 }
 
 export default function SkeletonViewer({
@@ -41,6 +42,7 @@ export default function SkeletonViewer({
   videoAspect,
   courtData,
   overlayVideoAspect,
+  resetViewTrigger,
 }: SkeletonViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayModeRef = useRef(overlay);
@@ -282,6 +284,27 @@ export default function SkeletonViewer({
       controls.enableDamping = true;
     }
   }, [calibration, overlay, overlayVideoAspect]);
+
+  // Reset camera to calibrated (or default) view when resetViewTrigger changes
+  useEffect(() => {
+    if (resetViewTrigger === undefined || resetViewTrigger === 0) return;
+    if (!sceneRef.current) return;
+    const { camera, controls } = sceneRef.current;
+    if (calibration) {
+      camera.position.set(...calibration.position);
+      camera.fov = calibration.fov;
+      camera.updateProjectionMatrix();
+      controls.target.set(...calibration.lookAt);
+    } else {
+      camera.position.set(0, 15, 20);
+      camera.fov = 60;
+      camera.updateProjectionMatrix();
+      controls.target.set(0, 1, 0);
+    }
+    controls.enableDamping = false;
+    controls.update();
+    controls.enableDamping = true;
+  }, [resetViewTrigger]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const ballTrajectory = useMemo(() => {
     if (!calibration || !frames || frames.length === 0) return [];
