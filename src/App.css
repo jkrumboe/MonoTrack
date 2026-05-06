@@ -197,6 +197,37 @@ body {
   overflow-y: auto;
   border-left: 1px solid var(--border);
   background: var(--bg-secondary);
+  display: flex;
+  flex-direction: column;
+}
+
+/* === Sidebar Tabs === */
+.sidebar-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.sidebar-tab {
+  flex: 1;
+  padding: 8px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  background: transparent;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.sidebar-tab:hover {
+  color: #ccc;
+}
+
+.sidebar-tab.active {
+  color: var(--accent-blue);
+  border-bottom-color: var(--accent-blue);
 }
 
 /* === Playback Controls === */
@@ -511,6 +542,68 @@ body {
 
 .pipeline-tab.active {
   background: rgba(79, 195, 247, 0.2);
+}
+
+/* === Ball Debug Panel === */
+.ball-debug-panel {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ball-debug-status {
+  font-size: 13px;
+  font-weight: 700;
+  font-family: monospace;
+  letter-spacing: 0.04em;
+}
+.ball-debug-status--detected { color: #4caf50; }
+.ball-debug-status--interp   { color: #aaa; }
+.ball-debug-status--missing  { color: #f44336; }
+
+.ball-debug-canvas {
+  width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: block;
+  background: #000;
+}
+
+.ball-debug-pos {
+  font-size: 11px;
+  font-family: monospace;
+  color: var(--text-secondary);
+}
+
+.ball-debug-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  font-family: monospace;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.det-detected { color: #4caf50; }
+.det-interp   { color: #aaa; }
+.det-missing  { color: #f44336; }
+.det-conf     { color: var(--accent-blue); }
+
+.ball-method {
+  font-family: monospace;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.08);
+  color: #aaa;
+}
+.ball-method--bbox-bottom-ray { color: #00e5ff; background: rgba(0,229,255,0.12); }
+.ball-method--homography-ray  { color: #69f0ae; background: rgba(105,240,174,0.12); }
+.ball-method--bbox-depth      { color: #ffb300; background: rgba(255,179,0,0.12); }
+.ball-method--ground-intersection { color: #ff7043; background: rgba(255,112,67,0.12); }
   border-color: #4fc3f7;
   color: #4fc3f7;
   font-weight: bold;
@@ -568,3 +661,104 @@ body {
   color: #fff;
 }
 
+/* === App Header Nav === */
+.app-header-left {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.app-nav {
+  display: flex;
+  gap: 4px;
+}
+
+.app-nav-btn {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-size: 13px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.app-nav-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.app-nav-btn--active {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+  background: rgba(79, 195, 247, 0.08);
+}
+
+/* === Depth Filter Panel === */
+.depth-filter-view {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+.depth-filter-canvas {
+  width: 100%;
+  display: block;
+  border-radius: 4px;
+  background: #000;
+}
+
+.depth-legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: monospace;
+}
+
+.depth-legend-bar {
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(to right, #5599ff, #00cc88, #ffaa00, #ff4400);
+  border: 1px solid rgba(255,255,255,0.15);
+}
+
+.depth-legend-far  { color: #5599ff; }
+.depth-legend-near { color: #ff4400; }
+
+.depth-filter-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.depth-filter-controls label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.depth-filter-controls input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent-blue);
+}
+
+.depth-val {
+  font-family: monospace;
+  color: var(--text-primary);
+  min-width: 3.5em;
+  text-align: right;
+}
+
+.depth-filter-hint {
+  font-size: 10px;
+  color: #666;
+  margin: 0;
+  line-height: 1.5;
+}

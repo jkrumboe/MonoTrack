@@ -46,6 +46,8 @@ except ImportError:
 
 # Lazy-loaded CNN court detector (persists across calls within one process)
 _court_detector = None
+# Lazy-loaded YOLOv8 model for sports ball detection
+_yolo_model = None
 # Temporal smoothing state for court corners
 _prev_corners = None
 _smoothing_alpha = 0.4  # EMA weight for new detection (0=ignore new, 1=no smoothing)
@@ -60,6 +62,154 @@ def _get_court_detector():
     Volleyball court detection uses the Hough-based pipeline only.
     """
     return None
+
+
+def _get_yolo_model():
+    """Lazy-load YOLOv8 model for sports ball detection. Returns model or None."""
+    global _yolo_model
+    if _yolo_model is not None:
+        return _yolo_model
+    try:
+        from ultralytics import YOLO
+
+        # Prefer explicit, normalized absolute candidates first.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root_model = os.path.abspath(os.path.join(script_dir, os.pardir, "yolov8m.pt"))
+        cwd_model = os.path.abspath("yolov8m.pt")
+        candidates = [project_root_model, cwd_model, "yolov8m.pt"]
+
+        model_path = None
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                model_path = candidate
+                break
+
+        print(f"[yolo] Script dir: {script_dir}", file=sys.stderr)
+        print(f"[yolo] Model candidates: {candidates}", file=sys.stderr)
+        if model_path is None:
+            print("[yolo] yolov8m.pt not found — ball detection disabled", file=sys.stderr)
+            return None
+
+        print(f"[yolo] Loading model from {model_path}...", file=sys.stderr)
+        _yolo_model = YOLO(model_path)
+        print(f"[yolo] Loaded model from {model_path}", file=sys.stderr)
+        return _yolo_model
+    except Exception as e:
+        print(f"[yolo] Failed to load YOLO model: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return None
+
+
+# COCO class index for "sports ball" (includes volleyball)
+_SPORTS_BALL_CLASS = 32
+
+
+def _detect_ball_yolo(frame, model, conf_thresh=0.20):
+    """Detect sports ball in a frame using YOLOv8.
+
+    Returns [cx_norm, cy_norm, conf, x1_norm, y1_norm, x2_norm, y2_norm]
+    (all normalised 0–1) or None if no ball found.
+    If multiple balls are detected the highest-confidence one is returned.
+    """
+    try:
+        results = model.predict(frame, classes=[_SPORTS_BALL_CLASS], conf=conf_thresh,
+                                verbose=False, imgsz=640)
+        if not results or not results[0].boxes or len(results[0].boxes) == 0:
+            return None
+        boxes = results[0].boxes
+        best_idx = int(boxes.conf.argmax())
+        x1, y1, x2, y2 = boxes.xyxy[best_idx].tolist()
+        conf = float(boxes.conf[best_idx])
+        h, w = frame.shape[:2]
+        cx = (x1 + x2) / 2.0 / w
+        cy = (y1 + y2) / 2.0 / h
+        return [round(cx, 6), round(cy, 6), round(conf, 4),
+                round(x1 / w, 6), round(y1 / h, 6), round(x2 / w, 6), round(y2 / h, 6)]
+    except Exception as e:
+        print(f"[yolo-predict] Exception: {e}", file=sys.stderr)
+        raise
+
+
+def _interpolate_ball_path(raw_detections):
+    """Fill in ball positions for frames where YOLO missed a detection.
+
+    Uses cubic spline interpolation (scipy) when ≥4 anchors are available,
+    otherwise falls back to linear interpolation between consecutive detections.
+    Gaps larger than MAX_GAP frames are left empty (ball likely out of frame
+    or mid-rally break).
+
+    raw_detections: dict {frame_idx: [cx_norm, cy_norm, conf]}
+
+    Returns dict {frame_idx: {'pos': [cx, cy], 'conf': float, 'interpolated': bool}}
+    """
+    MAX_GAP = 60  # ~2 s at 30 fps — don't interpolate across a rally break
+
+    if not raw_detections:
+        return {}
+
+    result = {}
+    frames_with_ball = sorted(raw_detections.keys())
+
+    # Seed result with real detections
+    for f, det in raw_detections.items():
+        result[f] = {'pos': [det[0], det[1]], 'conf': det[2],
+                     'bbox': [det[3], det[4], det[5], det[6]] if len(det) >= 7 else None,
+                     'interpolated': False}
+
+    # Build spline over all detected frames if scipy is available
+    spline_done = False
+    if len(frames_with_ball) >= 4:
+        try:
+            from scipy.interpolate import CubicSpline
+            fi = [float(f) for f in frames_with_ball]
+            xs = [raw_detections[f][0] for f in frames_with_ball]
+            ys = [raw_detections[f][1] for f in frames_with_ball]
+            cs_x = CubicSpline(fi, xs, extrapolate=False)
+            cs_y = CubicSpline(fi, ys, extrapolate=False)
+
+            for i in range(len(frames_with_ball) - 1):
+                f_start = frames_with_ball[i]
+                f_end = frames_with_ball[i + 1]
+                gap = f_end - f_start
+                if gap <= 1 or gap > MAX_GAP:
+                    continue
+                for f in range(f_start + 1, f_end):
+                    cx = float(cs_x(f))
+                    cy = float(cs_y(f))
+                    result[f] = {
+                        'pos': [round(max(0.0, min(1.0, cx)), 6),
+                                round(max(0.0, min(1.0, cy)), 6)],
+                        'conf': 0.0,
+                        'bbox': None,
+                        'interpolated': True,
+                    }
+            spline_done = True
+        except Exception:
+            pass
+
+    if not spline_done:
+        # Linear interpolation between consecutive anchor frames
+        for i in range(len(frames_with_ball) - 1):
+            f_start = frames_with_ball[i]
+            f_end = frames_with_ball[i + 1]
+            gap = f_end - f_start
+            if gap <= 1 or gap > MAX_GAP:
+                continue
+            p_s = raw_detections[f_start]
+            p_e = raw_detections[f_end]
+            for f in range(f_start + 1, f_end):
+                t = (f - f_start) / gap
+                cx = p_s[0] + t * (p_e[0] - p_s[0])
+                cy = p_s[1] + t * (p_e[1] - p_s[1])
+                result[f] = {
+                    'pos': [round(cx, 6), round(cy, 6)],
+                    'conf': 0.0,
+                    'bbox': None,
+                    'interpolated': True,
+                }
+
+    return result
 
 
 # ─── Volleyball Court Model (FIVB Standard) ─────────────────────────────
@@ -1252,6 +1402,7 @@ def _assign_teams_from_court(results, corners_norm, img_w, img_h):
     return team1, team2
 
 
+
 def analyze_video_cv(video_path: str):
     """
     Real CV analysis using OpenCV — court detection only.
@@ -1264,18 +1415,29 @@ def analyze_video_cv(video_path: str):
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     send_progress(0, f"Analyzing {total_frames} frames at {fps:.1f} FPS...")
 
-    # --- Court detection: run once per second of video ---
-    court_interval = max(int(fps), 1)  # detect every ~1s of video
-    court_detector = _get_court_detector()
-    court_data = []  # list of {frame, timestamp, corners}
-    global _prev_corners
-    _prev_corners = None  # reset smoothing state for fresh analysis
-    global _last_court_keypoints
+    court_interval = max(int(fps), 1)
+    global _prev_corners, _last_court_keypoints
+    _prev_corners = None
     _last_court_keypoints = None
 
+    # Load YOLO model once (optional — ball detection gracefully disabled if unavailable)
+    yolo_model = _get_yolo_model()
+    ball_raw = {}   # frame_idx -> [cx_norm, cy_norm, conf, x1_norm, y1_norm, x2_norm, y2_norm]
+    
+    if yolo_model is None:
+        print("[yolo] No model available — skipping ball detection", file=sys.stderr)
+    else:
+        print("[yolo] Model loaded, starting frame processing", file=sys.stderr)
+
+    # ── Pass 1: court + ball detection ────────────────────────────────────────────
+    all_frame_data = []   # per-frame lightweight dicts (no raw pixels kept)
+    court_data = []
+    court_detected_once = False  # stop re-running court detection after first success
     frame_idx = 0
 
     while True:
@@ -1284,17 +1446,17 @@ def analyze_video_cv(video_path: str):
             break
 
         timestamp = round(frame_idx / fps, 4)
-        img_h, img_w = frame.shape[:2]
+        fh, fw = frame.shape[:2]
 
-        # Court detection runs first so corners are available for calibration
         frame_court_corners = None
         frame_court_keypoints = None
-        if frame_idx % court_interval == 0:
+        if not court_detected_once:
             try:
                 corners = _detect_court_hough_fast(frame)
                 if corners is not None:
                     frame_court_corners = corners
-                    kps_reproj = _reproject_keypoints_from_corners(corners, img_h, img_w)
+                    court_detected_once = True
+                    kps_reproj = _reproject_keypoints_from_corners(corners, fh, fw)
                     if kps_reproj is not None:
                         frame_court_keypoints = kps_reproj
                         _last_court_keypoints = kps_reproj
@@ -1304,31 +1466,78 @@ def analyze_video_cv(video_path: str):
                         "corners": corners,
                         "keypoints": kps_reproj,
                     })
+                    print(f"[court] Detected at frame {frame_idx}, stopping re-detection", file=sys.stderr)
             except Exception as e:
-                print(f"[court] Frame {frame_idx} detection error: {e}", file=sys.stderr)
+                print(f"[court] Frame {frame_idx} error: {e}", file=sys.stderr)
 
-        # Pose estimation — disabled, focus on court detection only
+        # ── Ball detection (every frame) ─────────────────────────────────
+        if yolo_model is not None:
+            try:
+                det = _detect_ball_yolo(frame, yolo_model)
+                if det is not None:
+                    ball_raw[frame_idx] = det
+                    if frame_idx < 3 or frame_idx % 50 == 0:
+                        print(f"[yolo] Frame {frame_idx}: detected ball at {det[0]:.3f}, {det[1]:.3f} conf={det[2]:.3f}", file=sys.stderr)
+            except Exception as e:
+                print(f"[yolo] Frame {frame_idx} error: {e}", file=sys.stderr)
+                if frame_idx < 5:
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
 
-        # Ball tracking — disabled, focus on court detection only
-
-        frame_msg = {
-            "action": "frame",
-            "frame": frame_idx,
-            "timestamp": timestamp,
-        }
-        if frame_court_corners is not None:
-            frame_msg["court_corners"] = frame_court_corners
-        if frame_court_keypoints is not None:
-            frame_msg["court_keypoints"] = frame_court_keypoints
-        send(frame_msg)
+        all_frame_data.append({
+            'frame': frame_idx,
+            'timestamp': timestamp,
+            'corners': frame_court_corners,
+            'keypoints': frame_court_keypoints,
+        })
 
         percent = int((frame_idx + 1) / max(total_frames, 1) * 100)
-        if percent % 10 == 0 and frame_idx > 0:
-            send_progress(percent, f"Processed frame {frame_idx+1}/{total_frames}")
-
+        if percent % 5 == 0 and frame_idx > 0:
+            send_progress(
+                min(percent // 2, 48),
+                f"Detecting: frame {frame_idx + 1}/{total_frames}"
+            )
         frame_idx += 1
 
     cap.release()
+
+    # ── Interpolate ball trajectory for frames with no detection ──────────
+    ball_path = _interpolate_ball_path(ball_raw)
+    n_ball_detected = len(ball_raw)
+    n_ball_total = len(ball_path)
+    print(f"[yolo] Ball: {n_ball_detected} raw detections, "
+          f"{n_ball_total - n_ball_detected} interpolated, "
+          f"{n_ball_total} total", file=sys.stderr)
+
+    # ── Emit all frame events ──────────────────────────────────────────────
+    send_progress(70, "Sending results...")
+    n_frames = len(all_frame_data)
+    for fd in all_frame_data:
+        fi = fd['frame']
+        frame_msg = {
+            "action": "frame",
+            "frame": fi,
+            "timestamp": fd['timestamp'],
+        }
+        if fd['corners'] is not None:
+            frame_msg["court_corners"] = fd['corners']
+        if fd['keypoints'] is not None:
+            frame_msg["court_keypoints"] = fd['keypoints']
+
+        # Ball position (detected or interpolated)
+        bd = ball_path.get(fi)
+        if bd is not None:
+            frame_msg["ball_img_pos"] = bd['pos']
+            frame_msg["ball_interpolated"] = bd['interpolated']
+            frame_msg["ball_conf"] = bd['conf']
+            if bd['bbox'] is not None:
+                frame_msg["ball_bbox"] = bd['bbox']
+
+        send(frame_msg)
+
+        if fi % 200 == 0 and fi > 0:
+            pct = 70 + int(fi / max(n_frames, 1) * 28)
+            send_progress(pct, f"Sending frame {fi + 1}/{n_frames}")
 
     send({
         "action": "complete",
@@ -1369,6 +1578,15 @@ def analyze_video(video_path: str, duration_hint: float = 0.0):
 
 def main():
     """Main loop: read JSON requests from stdin, dispatch actions."""
+    # Startup diagnostics — helps debug venv/package issues when running from Tauri
+    print(f"[analyzer] Python: {sys.executable}", file=sys.stderr)
+    print(f"[analyzer] CWD: {os.getcwd()}", file=sys.stderr)
+    try:
+        import ultralytics
+        print(f"[analyzer] ultralytics {ultralytics.__version__} OK", file=sys.stderr)
+    except ImportError:
+        print("[analyzer] ultralytics NOT available — ball detection disabled", file=sys.stderr)
+
     send({"action": "ready"})
 
     for line in sys.stdin:

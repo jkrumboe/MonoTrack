@@ -230,6 +230,59 @@ export default function CourtMapView({
             </g>
           );
         })()}
+
+        {/* Ball trail on court map */}
+        {(() => {
+          const ballTrailStart = Math.max(0, frameIdx - TRAIL_FRAMES);
+          const ballTrailPts: { pos: [number, number]; interpolated: boolean }[] = [];
+          for (let i = ballTrailStart; i < frameIdx; i++) {
+            const f = frames[i];
+            if (!f?.ball_img_pos) continue;
+          const ballPos = f.ball_img_pos;
+            if (!ballPos) continue;
+            const bpos = H ? (() => {
+              const [cx, cy] = applyHomography(H, ballPos[0], ballPos[1]);
+              if (cx >= -0.15 && cx <= 1.15 && cy >= -0.15 && cy <= 1.15) return [cx, cy] as [number, number];
+              return null;
+            })() : null;
+            if (bpos) ballTrailPts.push({ pos: bpos, interpolated: !!f.ball_interpolated });
+          }
+          return ballTrailPts.map(({ pos, interpolated }, i) => {
+            const [sx, sy] = toSvg(pos[0], pos[1]);
+            const alpha = ((i + 1) / ballTrailPts.length) * 0.7;
+            return (
+              <circle
+                key={i}
+                cx={sx} cy={sy}
+                r={3 + (i / ballTrailPts.length) * 3}
+                fill={interpolated ? "#aaa" : "#ffe082"}
+                opacity={alpha}
+              />
+            );
+          });
+        })()}
+
+        {/* Ball current position */}
+        {frame?.ball_img_pos && (() => {
+          const ballImgPos = frame.ball_img_pos;
+          if (!ballImgPos) return null;
+          const ballCourtPos = H ? (() => {
+            const [cx, cy] = applyHomography(H, ballImgPos[0], ballImgPos[1]);
+            if (cx >= -0.15 && cx <= 1.15 && cy >= -0.15 && cy <= 1.15) return [cx, cy] as [number, number];
+            return null;
+          })() : null;
+          if (!ballCourtPos) return null;
+          const [sx, sy] = toSvg(ballCourtPos[0], ballCourtPos[1]);
+          const isInterp = !!frame.ball_interpolated;
+          return (
+            <g>
+              <circle cx={sx} cy={sy} r={8} fill={isInterp ? "#ccc" : "#ffe082"}
+                stroke={isInterp ? "#888" : "#ffb300"} strokeWidth={1.5}
+                strokeDasharray={isInterp ? "3 2" : undefined} opacity={0.9} />
+              <text x={sx} y={sy + 3} textAnchor="middle" fontSize={7} fontWeight="bold" fill="#333">B</text>
+            </g>
+          );
+        })()}
       </svg>
       <div className="court-map-legend">
         <span className="legend-p1">Team 1</span>

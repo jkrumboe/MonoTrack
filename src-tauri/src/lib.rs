@@ -13,8 +13,31 @@ struct CourtDetectorProcess {
     stdout: Mutex<Option<BufReader<std::process::ChildStdout>>>,
 }
 
-/// Find the Python interpreter. Tries "python" then "python3".
+/// Find the Python interpreter. Prefers a local .venv over the system Python
+/// so that packages like ultralytics installed in the venv are available.
 fn find_python() -> String {
+    // Derive project root from CARGO_MANIFEST_DIR (src-tauri/) → go up one level
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let project_root = std::path::Path::new(manifest_dir).join("..");
+
+    // Candidate venv executables (Windows first, then Unix-style)
+    let venv_candidates = [
+        project_root.join(".venv/Scripts/python.exe"),
+        project_root.join(".venv/bin/python"),
+        project_root.join("venv/Scripts/python.exe"),
+        project_root.join("venv/bin/python"),
+    ];
+
+    for candidate in &venv_candidates {
+        if let Ok(canonical) = candidate.canonicalize() {
+            if canonical.exists() {
+                eprintln!("[find_python] Using venv Python: {}", canonical.display());
+                return canonical.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // Fall back to system Python
     for cmd in &["python", "python3"] {
         if Command::new(cmd)
             .arg("--version")
@@ -23,6 +46,7 @@ fn find_python() -> String {
             .status()
             .is_ok()
         {
+            eprintln!("[find_python] Using system Python: {}", cmd);
             return cmd.to_string();
         }
     }
@@ -35,7 +59,7 @@ fn analyzer_script_path(app: &AppHandle) -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dev_path = std::path::Path::new(manifest_dir).join("../python/analyzer.py");
     if dev_path.exists() {
-        return dev_path.canonicalize().unwrap_or(dev_path).to_string_lossy().to_string();
+        return dev_path.to_string_lossy().to_string();
     }
 
     // In bundled mode, check the resource directory

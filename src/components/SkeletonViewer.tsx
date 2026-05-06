@@ -1,7 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { CourtDataEntry } from "../hooks/useAnalysis";
+import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
+import { estimateBallWorldPosition } from "../utils/ballReconstruction";
 import type { CalibrationResult } from "../utils/cameraSolver";
 
 // FIVB volleyball court dimensions (metres)
@@ -9,16 +10,38 @@ const COURT_LENGTH = 18.0;
 const COURT_WIDTH  = 9.0;
 const NET_HEIGHT   = 2.43;
 const ATTACK_DIST  = 3.0;
+const COURT_HALF_L = COURT_LENGTH / 2;
+const COURT_HALF_W = COURT_WIDTH / 2;
+
+function inRenderableCourtVolume(x: number, y: number, z: number): boolean {
+  return (
+    Math.abs(x) <= COURT_HALF_W + 2 &&
+    Math.abs(z) <= COURT_HALF_L + 4 &&
+    y >= 0 &&
+    y <= 8
+  );
+}
 
 interface SkeletonViewerProps {
   overlay?: boolean;
   calibration?: CalibrationResult | null;
+  frames?: FrameData[];
+  currentFrame?: number;
+  videoAspect?: number;
   courtData?: CourtDataEntry[];
   isRealVideo?: boolean;
   overlayVideoAspect?: number;
 }
 
-export default function SkeletonViewer({ overlay = false, calibration, overlayVideoAspect }: SkeletonViewerProps) {
+export default function SkeletonViewer({
+  overlay = false,
+  calibration,
+  frames,
+  currentFrame = 0,
+  videoAspect,
+  courtData,
+  overlayVideoAspect,
+}: SkeletonViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayModeRef = useRef(overlay);
   const overlayAspectRef = useRef<number | undefined>(overlayVideoAspect);
@@ -28,6 +51,10 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
     renderer: THREE.WebGLRenderer;
     controls: OrbitControls;
     courtGroup: THREE.Group;
+    ballMesh: THREE.Mesh;
+    ballShadow: THREE.Mesh;
+    ballStem: THREE.Line;
+    ballTrail: THREE.Line;
   } | null>(null);
   const lastRenderSizeRef = useRef({ w: 0, h: 0, aspect: 0 });
 
@@ -79,8 +106,45 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
     const courtGroup = createCourt();
     scene.add(courtGroup);
 
+    // Ball visualisation (3D reconstructed position)
+    const ballMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.16, 24, 24),
+      new THREE.MeshStandardMaterial({
+        color: 0xffc107,
+        emissive: 0x332200,
+        emissiveIntensity: 0.55,
+        roughness: 0.35,
+        metalness: 0.08,
+      }),
+    );
+    ballMesh.visible = false;
+    scene.add(ballMesh);
+
+    const ballShadow = new THREE.Mesh(
+      new THREE.CircleGeometry(0.13, 24),
+      new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.28, depthWrite: false }),
+    );
+    ballShadow.rotation.x = -Math.PI / 2;
+    ballShadow.position.y = 0.005;
+    ballShadow.visible = false;
+    scene.add(ballShadow);
+
+    const ballStem = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+      new THREE.LineBasicMaterial({ color: 0xffe082, transparent: true, opacity: 0.7 }),
+    );
+    ballStem.visible = false;
+    scene.add(ballStem);
+
+    const ballTrail = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([]),
+      new THREE.LineBasicMaterial({ color: 0xffca28, transparent: true, opacity: 0.65 }),
+    );
+    scene.add(ballTrail);
+
     sceneRef.current = {
       scene, camera, renderer, controls, courtGroup,
+      ballMesh, ballShadow, ballStem, ballTrail,
     };
 
     // Animation loop
@@ -218,6 +282,75 @@ export default function SkeletonViewer({ overlay = false, calibration, overlayVi
       controls.enableDamping = true;
     }
   }, [calibration, overlay, overlayVideoAspect]);
+
+  const ballTrajectory = useMemo(() => {
+    if (!calibration || !frames || frames.length === 0) return [];
+    const idx = Math.min(Math.max(0, currentFrame), frames.length - 1);
+    const aspect = (videoAspect && videoAspect > 0)
+      ? videoAspect
+      : (overlayVideoAspect && overlayVideoAspect > 0)
+        ? overlayVideoAspect
+        : 16 / 9;
+    const start = Math.max(0, idx - 36);
+    const nearestCorners = (frameIdx: number): number[][] | undefined => {
+      if (!courtData || courtData.length === 0) return undefined;
+      let best = courtData[0];
+      for (const entry of courtData) {
+        if (entry.frame <= frameIdx) best = entry;
+        else break;
+      }
+      return best.corners;
+    };
+    const pts: Array<{ frame: number; x: number; y: number; z: number; gx: number; gz: number }> = [];
+    for (let i = start; i <= idx; i++) {
+      const estimate = estimateBallWorldPosition(frames[i], calibration, aspect, nearestCorners(i));
+      if (!estimate) continue;
+      if (!inRenderableCourtVolume(estimate.position[0], estimate.position[1], estimate.position[2])) continue;
+      pts.push({
+        frame: i,
+        x: estimate.position[0],
+        y: estimate.position[1],
+        z: estimate.position[2],
+        gx: estimate.ground[0],
+        gz: estimate.ground[2],
+      });
+    }
+    return pts;
+  }, [calibration, frames, currentFrame, videoAspect, overlayVideoAspect, courtData]);
+
+  useEffect(() => {
+    const sceneState = sceneRef.current;
+    if (!sceneState) return;
+    const { ballMesh, ballShadow, ballStem, ballTrail } = sceneState;
+
+    if (ballTrajectory.length === 0) {
+      ballMesh.visible = false;
+      ballShadow.visible = false;
+      ballStem.visible = false;
+      ballTrail.geometry.setFromPoints([]);
+      return;
+    }
+
+    const cur = ballTrajectory[ballTrajectory.length - 1];
+    ballMesh.visible = true;
+    ballMesh.position.set(cur.x, cur.y, cur.z);
+
+    ballShadow.visible = true;
+    ballShadow.position.set(cur.gx, 0.005, cur.gz);
+
+    ballStem.visible = true;
+    ballStem.geometry.setFromPoints([
+      new THREE.Vector3(cur.gx, 0.01, cur.gz),
+      new THREE.Vector3(cur.x, cur.y, cur.z),
+    ]);
+
+    if (ballTrajectory.length > 1) {
+      const points = ballTrajectory.map((p) => new THREE.Vector3(p.x, p.y, p.z));
+      ballTrail.geometry.setFromPoints(points);
+    } else {
+      ballTrail.geometry.setFromPoints([]);
+    }
+  }, [ballTrajectory]);
 
   return <div ref={containerRef} style={{ width: "100%", height: "100%", minHeight: 400 }} />;
 }

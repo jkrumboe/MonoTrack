@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import type { FrameData } from "../hooks/useAnalysis";
 
 const TRAIL_LENGTH = 60; // frames to trail
+const BALL_TRAIL_LENGTH = 30; // shorter trail for ball
 
 const PLAYER_COLORS = {
   p1: { fill: "#4fc3f7", stroke: "#0288d1" },
@@ -100,6 +101,7 @@ export default function PlayerTrackingOverlay({
 
     const frameIdx = Math.min(currentFrame, frames.length - 1);
     const trailStart = Math.max(0, frameIdx - TRAIL_LENGTH);
+    const ballTrailStart = Math.max(0, frameIdx - BALL_TRAIL_LENGTH);
 
     // Collect trail positions for each player
     const trail1: [number, number][] = [];
@@ -110,12 +112,59 @@ export default function PlayerTrackingOverlay({
       if (f.player2_img_pos) trail2.push(f.player2_img_pos);
     }
 
+    // Collect ball trail (only real detections for trail, include interpolated in path)
+    const ballTrail: { pos: [number, number]; interpolated: boolean }[] = [];
+    for (let i = ballTrailStart; i < frameIdx; i++) {
+      const f = frames[i];
+      if (f.ball_img_pos) {
+        ballTrail.push({ pos: f.ball_img_pos, interpolated: !!f.ball_interpolated });
+      }
+    }
+
     const frame = frames[frameIdx];
     if (frame.player1_img_pos) {
       drawPlayer(frame.player1_img_pos, trail1, PLAYER_COLORS.p1, "P1");
     }
     if (frame.player2_img_pos) {
       drawPlayer(frame.player2_img_pos, trail2, PLAYER_COLORS.p2, "P2");
+    }
+
+    // Draw ball
+    if (frame.ball_img_pos) {
+      const [bx, by] = toPixel(frame.ball_img_pos);
+      const isInterpolated = !!frame.ball_interpolated;
+
+      // Ball trail
+      for (let i = 0; i < ballTrail.length; i++) {
+        const alpha = ((i + 1) / ballTrail.length) * 0.7;
+        const radius = 3 + (i / ballTrail.length) * 4;
+        const [tx, ty] = toPixel(ballTrail[i].pos);
+        ctx.beginPath();
+        ctx.arc(tx, ty, radius, 0, Math.PI * 2);
+        const trailColor = ballTrail[i].interpolated ? "#aaa" : "#ffe082";
+        ctx.fillStyle = `${trailColor}${Math.round(alpha * 255).toString(16).padStart(2, "0")}`;
+        ctx.fill();
+      }
+
+      // Ball marker
+      ctx.beginPath();
+      ctx.arc(bx, by, 11, 0, Math.PI * 2);
+      ctx.strokeStyle = isInterpolated ? "#aaaaaa" : "#ffb300";
+      ctx.lineWidth = isInterpolated ? 1.5 : 2.5;
+      if (isInterpolated) ctx.setLineDash([4, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.beginPath();
+      ctx.arc(bx, by, 7, 0, Math.PI * 2);
+      ctx.fillStyle = isInterpolated ? "#cccccc" : "#ffe082";
+      ctx.fill();
+
+      // Label
+      ctx.font = "bold 9px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#000";
+      ctx.fillText("⚽", bx, by + 3);
     }
   }, [frames, currentFrame, videoEl, containerEl]);
 

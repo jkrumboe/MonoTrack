@@ -11,6 +11,9 @@ import CourtMapView from "./components/CourtMapView";
 import ProgressBar from "./components/ProgressBar";
 import StatsDisplay from "./components/StatsDisplay";
 import PlaybackControls from "./components/PlaybackControls";
+import PlayerTrackingOverlay from "./components/PlayerTrackingOverlay";
+import BallDebugView from "./components/BallDebugView";
+import DepthFilterView from "./components/DepthFilterView";
 import "./App.css";
 
 type ViewMode = "side-by-side" | "overlay";
@@ -71,6 +74,7 @@ function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [videoPath, setVideoPath] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>("side-by-side");
+  const [sidebarTab, setSidebarTab] = useState<"stats" | "court" | "ball-debug" | "depth">("stats");
   const [_videoDuration, setVideoDuration] = useState<number | null>(null);
   const [videoSize, setVideoSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [calibration, setCalibration] = useState<CalibrationResult | null>(null);
@@ -358,7 +362,10 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Volleyball 3D Analyzer</h1>
+        <div className="app-header-left">
+          <h1>Volleyball 3D Analyzer</h1>
+
+        </div>
         <div className="header-actions">
           {status === "idle" && (
             <>
@@ -476,6 +483,14 @@ function App() {
                         containerEl={splitVideoEl}
                       />
                     )}
+                    {!showCalibration && frames.length > 0 && (
+                      <PlayerTrackingOverlay
+                        frames={frames}
+                        currentFrame={currentFrame}
+                        videoEl={videoElRef.current}
+                        containerEl={splitVideoEl}
+                      />
+                    )}
                     {showCalibration && splitVideoSize.width > 0 && splitVideoSize.height > 0 && (
                       <CourtCalibration
                         width={splitVideoSize.width}
@@ -495,7 +510,14 @@ function App() {
                     )}
                   </div>
                   <div className="split-pane">
-                    <SkeletonViewer calibration={calibration} courtData={courtData} isRealVideo={isRealVideo} />
+                    <SkeletonViewer
+                      calibration={calibration}
+                      frames={frames}
+                      currentFrame={currentFrame}
+                      videoAspect={videoAspect}
+                      courtData={courtData}
+                      isRealVideo={isRealVideo}
+                    />
                   </div>
                 </div>
               )}
@@ -518,6 +540,9 @@ function App() {
                     <SkeletonViewer
                       overlay
                       calibration={calibration}
+                      frames={frames}
+                      currentFrame={currentFrame}
+                      videoAspect={videoAspect}
                       courtData={courtData}
                       isRealVideo={isRealVideo}
                       overlayVideoAspect={videoAspect}
@@ -532,6 +557,14 @@ function App() {
                       />
                     </div>
                   )}
+                  {frames.length > 0 && (
+                    <PlayerTrackingOverlay
+                      frames={frames}
+                      currentFrame={currentFrame}
+                      videoEl={videoElRef.current}
+                      containerEl={overlayEl}
+                    />
+                  )}
                 </div>
               )}
 
@@ -544,13 +577,53 @@ function App() {
               />
             </div>
             <div className="sidebar">
-              <StatsDisplay result={result} />
-              <CourtMapView
-                frames={frames}
-                currentFrame={currentFrame}
-                courtData={courtData}
-                isRealVideo={isRealVideo}
-              />
+              <div className="sidebar-tabs">
+                <button
+                  className={`sidebar-tab ${sidebarTab === "stats" ? "active" : ""}`}
+                  onClick={() => setSidebarTab("stats")}
+                >Stats</button>
+                <button
+                  className={`sidebar-tab ${sidebarTab === "court" ? "active" : ""}`}
+                  onClick={() => setSidebarTab("court")}
+                >Court Map</button>
+                <button
+                  className={`sidebar-tab ${sidebarTab === "ball-debug" ? "active" : ""}`}
+                  onClick={() => setSidebarTab("ball-debug")}
+                >Ball Debug</button>
+                <button
+                  className={`sidebar-tab ${sidebarTab === "depth" ? "active" : ""}`}
+                  onClick={() => setSidebarTab("depth")}
+                >Depth</button>
+              </div>
+
+              {sidebarTab === "stats" && <StatsDisplay result={result} />}
+              {sidebarTab === "court" && (
+                <CourtMapView
+                  frames={frames}
+                  currentFrame={currentFrame}
+                  courtData={courtData}
+                  isRealVideo={isRealVideo}
+                />
+              )}
+              {sidebarTab === "ball-debug" && (
+                <BallDebugView
+                  frames={frames}
+                  currentFrame={currentFrame}
+                  videoEl={videoElRef.current}
+                  calibration={calibration}
+                  courtData={courtData}
+                  videoAspect={videoAspect}
+                />
+              )}
+              {sidebarTab === "depth" && (
+                <DepthFilterView
+                  videoEl={videoElRef.current}
+                  calibration={calibration}
+                  courtData={courtData}
+                  currentFrame={currentFrame}
+                  videoAspect={videoAspect}
+                />
+              )}
             </div>
           </div>
         )}

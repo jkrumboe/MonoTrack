@@ -2,12 +2,6 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
-export interface BallData {
-  x: number;
-  y: number;
-  z: number;
-}
-
 export interface FrameData {
   action: "frame";
   frame: number;
@@ -16,14 +10,20 @@ export interface FrameData {
   pose_player2?: [number, number, number][];
   pose_player1_world?: [number, number, number][];
   pose_player2_world?: [number, number, number][];
-  ball?: BallData;
-  ball_detected?: boolean;
   court_corners?: number[][];
   court_keypoints?: (number[] | null)[];
   player1_img_pos?: [number, number];
   player2_img_pos?: [number, number];
   team1_img_positions?: [number, number][];
   team2_img_positions?: [number, number][];
+  /** Normalised [0,1] image-space ball centre from YOLO (or interpolated). */
+  ball_img_pos?: [number, number];
+  /** True when the position was filled in by trajectory interpolation. */
+  ball_interpolated?: boolean;
+  /** YOLO detection confidence (0 when interpolated). */
+  ball_conf?: number;
+  /** Normalised [x1,y1,x2,y2] bounding box from YOLO (absent when interpolated). */
+  ball_bbox?: [number, number, number, number];
 }
 
 export interface CourtDataEntry {
