@@ -14,6 +14,12 @@ dist-ssr
 notebooks/data
 runs/
 
+# Model files (too large for GitHub)
+*.pt
+*.pth
+*.onnx
+*.task
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
