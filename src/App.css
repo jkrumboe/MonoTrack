@@ -783,3 +783,75 @@ body {
   margin: 0;
   line-height: 1.5;
 }
+
+.trajectory-export {
+  padding: 8px;
+}
+
+/* ── Physics solver failure warning ─────────────────────────────────────── */
+.physics-failed-warning {
+  margin: 8px 10px;
+  padding: 8px 10px;
+  background: #3a1a1a;
+  border: 1px solid #c0392b;
+  border-radius: 4px;
+  color: #e74c3c;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ── Ball solver controls panel ─────────────────────────────────────────── */
+.ball-solver-controls {
+  padding: 8px 10px;
+  background: #1a1f2e;
+  border-bottom: 1px solid #2a3050;
+  font-size: 12px;
+  color: #c8d0e0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ball-solver-controls .control-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ball-solver-controls label {
+  white-space: nowrap;
+  color: #a0b0cc;
+}
+
+.ball-solver-controls select,
+.ball-solver-controls input[type="range"] {
+  flex: 1;
+  min-width: 80px;
+}
+
+.ball-solver-controls .fov-row {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.ball-solver-controls .fov-presets {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.ball-solver-controls .fov-presets button {
+  padding: 2px 6px;
+  font-size: 11px;
+  border-radius: 3px;
+  border: 1px solid #3a4060;
+  background: #252a3a;
+  color: #c8d0e0;
+  cursor: pointer;
+}
+
+.ball-solver-controls .fov-presets button:hover {
+  background: #3a4268;
+}

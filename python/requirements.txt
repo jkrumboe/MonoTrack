@@ -7,3 +7,7 @@ gdown>=4.7.0
 # YOLO ball detector (tutorial: https://www.youtube.com/watch?v=L23oIHZE14w)
 ultralytics>=8.0.0
 pandas>=2.0.0
+# Monocular depth estimation (Depth Anything V2)
+transformers>=4.38.0
+pillow>=10.0.0
+scipy>=1.11.0

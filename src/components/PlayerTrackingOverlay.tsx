@@ -79,8 +79,10 @@ export default function PlayerTrackingOverlay({
         ctx.fill();
       }
 
-      // Draw current position marker
+      // Draw current position marker (semi-transparent so ball is visible beneath)
       const [px, py] = toPixel(pos);
+      ctx.save();
+      ctx.globalAlpha = 0.45;
       // Outer ring
       ctx.beginPath();
       ctx.arc(px, py, 13, 0, Math.PI * 2);
@@ -92,6 +94,7 @@ export default function PlayerTrackingOverlay({
       ctx.arc(px, py, 9, 0, Math.PI * 2);
       ctx.fillStyle = colors.fill;
       ctx.fill();
+      ctx.restore();
       // Label
       ctx.font = "bold 11px sans-serif";
       ctx.textAlign = "center";
@@ -160,11 +163,7 @@ export default function PlayerTrackingOverlay({
       ctx.fillStyle = isInterpolated ? "#cccccc" : "#ffe082";
       ctx.fill();
 
-      // Label
-      ctx.font = "bold 9px sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillStyle = "#000";
-      ctx.fillText("⚽", bx, by + 3);
+
     }
   }, [frames, currentFrame, videoEl, containerEl]);
 

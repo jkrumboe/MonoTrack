@@ -2,6 +2,7 @@ import { useEffect, useRef, useMemo } from "react";
 import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
 import type { CalibrationResult } from "../utils/cameraSolver";
 import { estimateBallWorldPosition } from "../utils/ballReconstruction";
+import type { BallFrameDebug } from "../utils/ballReconstruction";
 
 interface BallDebugViewProps {
   frames: FrameData[];
@@ -10,6 +11,8 @@ interface BallDebugViewProps {
   calibration?: CalibrationResult | null;
   courtData?: CourtDataEntry[];
   videoAspect?: number;
+  /** Per-frame debug records from the ball reconstruction solver. */
+  ball3dDebug?: BallFrameDebug[];
 }
 
 const HISTORY = 300; // how many frames back to summarise
@@ -21,6 +24,7 @@ export default function BallDebugView({
   calibration,
   courtData,
   videoAspect,
+  ball3dDebug,
 }: Readonly<BallDebugViewProps>) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -47,6 +51,9 @@ export default function BallDebugView({
     // Scale from video pixels → canvas pixels
     const scaleX = CW / vw;
     const scaleY = CH / vh;
+
+    // Look up the solver debug record for this frame
+    const dbg = ball3dDebug?.find((d) => d.frame === currentFrame) ?? null;
 
     if (frame.ball_bbox) {
       const [nx1, ny1, nx2, ny2] = frame.ball_bbox;
@@ -95,6 +102,32 @@ export default function BallDebugView({
       ctx.strokeStyle = "#fff";
       ctx.lineWidth = 1;
       ctx.stroke();
+
+      // Depth diagnostics overlay (bottom-left of canvas)
+      if (dbg) {
+        const lines: string[] = [];
+        lines.push(`f=${currentFrame}  acc=${dbg.accepted ? "✓" : "✗"}`);
+        if (dbg.bboxWidthPx != null && dbg.bboxHeightPx != null) {
+          lines.push(`bbox ${dbg.bboxWidthPx.toFixed(1)}×${dbg.bboxHeightPx.toFixed(1)} px`);
+        }
+        if (dbg.fy > 0) lines.push(`fy=${dbg.fy.toFixed(0)}  fovY=${dbg.fovY.toFixed(1)}°`);
+        if (dbg.zFromHeight != null) lines.push(`zH=${dbg.zFromHeight.toFixed(1)} m`);
+        if (dbg.zFromWidth  != null) lines.push(`zW=${dbg.zFromWidth.toFixed(1)} m`);
+        if (dbg.zFromMinSide != null) lines.push(`zMin=${dbg.zFromMinSide.toFixed(1)} m`);
+        if (dbg.zUsed != null) lines.push(`zUsed=${dbg.zUsed.toFixed(1)} m`);
+        if (dbg.rejectedReason) lines.push(`⚠ ${dbg.rejectedReason}`);
+
+        const lh = 14; // line height px
+        const pad = 4;
+        const blockH = lines.length * lh + pad * 2;
+        ctx.fillStyle = "rgba(0,0,0,0.65)";
+        ctx.fillRect(0, CH - blockH, 200, blockH);
+        ctx.font = "10px monospace";
+        ctx.fillStyle = "#0ff";
+        lines.forEach((ln, i) => {
+          ctx.fillText(ln, pad, CH - blockH + pad + (i + 1) * lh - 2);
+        });
+      }
     } else if (frame.ball_img_pos) {
       // Interpolated — draw crosshair only
       const [ncx, ncy] = frame.ball_img_pos;
@@ -128,7 +161,7 @@ export default function BallDebugView({
       ctx.fillStyle = "#f44";
       ctx.fillText("no detection", 8, 20);
     }
-  }, [frames, currentFrame, videoEl]);
+  }, [frames, currentFrame, videoEl, ball3dDebug]);
 
   // ── Stats over the last HISTORY frames ──────────────────────────────
   const stats = useMemo(() => {
@@ -166,6 +199,19 @@ export default function BallDebugView({
       : undefined);
     if (!aspect) return null;
 
+    // Prefer the physics-solver fitted position from debug records (avoids misleading
+    // ground-intersection fallback values that appear when the arc solver is active).
+    const debugRec = (ball3dDebug ?? []).find((d) => d.frame === currentFrame);
+    if (debugRec?.fittedPosition) {
+      const [fx, fy, fz] = debugRec.fittedPosition;
+      return {
+        method: "physics-reprojection" as const,
+        position: [fx, fy, fz] as [number, number, number],
+        ground:   [fx, 0, fz] as [number, number, number],
+        height:   fy,
+      };
+    }
+
     let nearestCorners: number[][] | undefined;
     if (courtData && courtData.length > 0) {
       let best = courtData[0];
@@ -176,8 +222,10 @@ export default function BallDebugView({
       nearestCorners = best.corners;
     }
 
-    return estimateBallWorldPosition(cur, calibration, aspect, nearestCorners);
-  }, [cur, calibration, courtData, currentFrame, videoAspect, videoEl]);
+    // Cap at bbox-depth only — prevents ground-intersection fallback that can
+    // produce z=-80m values when the ball ray points near the horizon.
+    return estimateBallWorldPosition(cur, calibration, aspect, nearestCorners, { forceMethod: "bbox-depth" });
+  }, [cur, calibration, courtData, currentFrame, videoAspect, videoEl, ball3dDebug]);
 
   useEffect(() => {
     if (!cur) return;

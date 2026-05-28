@@ -44,10 +44,18 @@ try:
 except ImportError:
     HAS_TORCH = False
 
+try:
+    from transformers import pipeline as hf_pipeline
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+
 # Lazy-loaded CNN court detector (persists across calls within one process)
 _court_detector = None
 # Lazy-loaded YOLOv8 model for sports ball detection
 _yolo_model = None
+# Lazy-loaded Depth Anything V2 depth estimation pipeline
+_depth_model = None
 # Temporal smoothing state for court corners
 _prev_corners = None
 _smoothing_alpha = 0.4  # EMA weight for new detection (0=ignore new, 1=no smoothing)
@@ -62,6 +70,34 @@ def _get_court_detector():
     Volleyball court detection uses the Hough-based pipeline only.
     """
     return None
+
+
+def _get_depth_model():
+    """Lazy-load Depth Anything V2 Small model for monocular depth estimation.
+
+    Returns a HuggingFace depth-estimation pipeline, or None if transformers/torch
+    are not installed.  The model is downloaded on first call (~100 MB, cached by HF).
+    Uses GPU if available, otherwise CPU.
+    """
+    global _depth_model
+    if _depth_model is not None:
+        return _depth_model
+    if not HAS_TRANSFORMERS or not HAS_TORCH:
+        print("[depth] transformers or torch not available — depth estimation disabled", file=sys.stderr)
+        return None
+    try:
+        device = 0 if (HAS_TORCH and torch.cuda.is_available()) else -1
+        print(f"[depth] Loading Depth-Anything-V2-Small on {'GPU' if device == 0 else 'CPU'}...", file=sys.stderr)
+        _depth_model = hf_pipeline(
+            task="depth-estimation",
+            model="depth-anything/Depth-Anything-V2-Small-hf",
+            device=device,
+        )
+        print("[depth] Depth model loaded", file=sys.stderr)
+        return _depth_model
+    except Exception as e:
+        print(f"[depth] Failed to load depth model: {e}", file=sys.stderr)
+        return None
 
 
 def _get_yolo_model():
@@ -103,6 +139,76 @@ def _get_yolo_model():
 
 # COCO class index for "sports ball" (includes volleyball)
 _SPORTS_BALL_CLASS = 32
+
+
+def _estimate_depth_at_ball(frame_bgr, cx_norm: float, cy_norm: float) -> float | None:
+    """Run Depth Anything V2 on a single frame and return the relative depth at (cx_norm, cy_norm).
+
+    The returned value is a *relative* depth (larger = farther from camera) normalised
+    to [0, 1] within the frame.  It is scale-ambiguous; callers should align it to
+    metric distance using a known reference (e.g. detected court corners).
+
+    Returns None if the depth model is unavailable or inference fails.
+    """
+    try:
+        from PIL import Image as PILImage
+        depth_pipe = _get_depth_model()
+        if depth_pipe is None:
+            return None
+
+        # Convert BGR → RGB PIL image
+        rgb = frame_bgr[:, :, ::-1]
+        img_h, img_w = rgb.shape[:2]
+        pil_img = PILImage.fromarray(rgb)
+
+        result = depth_pipe(pil_img)
+        depth_map = np.array(result["depth"], dtype=np.float32)  # shape (H, W)
+
+        # Normalise to [0, 1]
+        d_min, d_max = depth_map.min(), depth_map.max()
+        if d_max - d_min < 1e-5:
+            return None
+        depth_norm = (depth_map - d_min) / (d_max - d_min)
+
+        # Sample with bilinear interpolation at ball centre
+        px = cx_norm * (img_w - 1)
+        py = cy_norm * (img_h - 1)
+        x0, y0 = int(px), int(py)
+        x1, y1 = min(x0 + 1, img_w - 1), min(y0 + 1, img_h - 1)
+        fx, fy = px - x0, py - y0
+        d = (depth_norm[y0, x0] * (1 - fx) * (1 - fy) +
+             depth_norm[y0, x1] * fx * (1 - fy) +
+             depth_norm[y1, x0] * (1 - fx) * fy +
+             depth_norm[y1, x1] * fx * fy)
+        return round(float(d), 5)
+    except Exception as e:
+        print(f"[depth] Inference error: {e}", file=sys.stderr)
+        return None
+
+
+def _estimate_depth_batch(frames_and_balls: list[tuple]) -> dict[int, float]:
+    """Run depth estimation on a batch of (frame_idx, frame_bgr, cx_norm, cy_norm) tuples.
+
+    Returns {frame_idx: relative_depth_0_to_1}.
+    Skips gracefully if depth model is unavailable.
+    """
+    try:
+        from PIL import Image as PILImage
+        depth_pipe = _get_depth_model()
+        if depth_pipe is None:
+            return {}
+    except ImportError:
+        return {}
+
+    results = {}
+    total = len(frames_and_balls)
+    for i, (frame_idx, frame_bgr, cx_norm, cy_norm) in enumerate(frames_and_balls):
+        if i % 20 == 0:
+            print(f"[depth] Estimating depth: {i}/{total}", file=sys.stderr)
+        d = _estimate_depth_at_ball(frame_bgr, cx_norm, cy_norm)
+        if d is not None:
+            results[frame_idx] = d
+    return results
 
 
 def _detect_ball_yolo(frame, model, conf_thresh=0.20):
@@ -1509,6 +1615,38 @@ def analyze_video_cv(video_path: str):
           f"{n_ball_total - n_ball_detected} interpolated, "
           f"{n_ball_total} total", file=sys.stderr)
 
+    # ── Pass 2: Depth Anything V2 on YOLO-detected (non-interpolated) frames ──
+    ball_depth = {}   # frame_idx -> relative_depth [0,1]
+    if HAS_TRANSFORMERS and HAS_TORCH and n_ball_detected > 0:
+        send_progress(50, "Estimating depth (Depth Anything V2)...")
+        try:
+            depth_pipe = _get_depth_model()
+            if depth_pipe is not None:
+                from PIL import Image as PILImage
+                cap2 = cv2.VideoCapture(video_path)
+                frames_to_process = sorted(ball_raw.keys())
+                total_depth = len(frames_to_process)
+                prev_fi = -1
+                for i, fi in enumerate(frames_to_process):
+                    # Seek only when needed (sequential reads are faster)
+                    if fi != prev_fi + 1:
+                        cap2.set(cv2.CAP_PROP_POS_FRAMES, fi)
+                    ret2, frame2 = cap2.read()
+                    prev_fi = fi
+                    if not ret2:
+                        continue
+                    cx, cy = ball_raw[fi][0], ball_raw[fi][1]
+                    d = _estimate_depth_at_ball(frame2, cx, cy)
+                    if d is not None:
+                        ball_depth[fi] = d
+                    if i % 30 == 0:
+                        pct = 50 + int(i / max(total_depth, 1) * 15)
+                        send_progress(pct, f"Depth estimation: {i + 1}/{total_depth} frames")
+                cap2.release()
+                print(f"[depth] Estimated depth for {len(ball_depth)}/{total_depth} frames", file=sys.stderr)
+        except Exception as e:
+            print(f"[depth] Depth estimation pass failed: {e}", file=sys.stderr)
+
     # ── Emit all frame events ──────────────────────────────────────────────
     send_progress(70, "Sending results...")
     n_frames = len(all_frame_data)
@@ -1532,6 +1670,9 @@ def analyze_video_cv(video_path: str):
             frame_msg["ball_conf"] = bd['conf']
             if bd['bbox'] is not None:
                 frame_msg["ball_bbox"] = bd['bbox']
+            # Depth estimate available only for YOLO-detected (non-interpolated) frames
+            if fi in ball_depth:
+                frame_msg["ball_depth_estimate"] = ball_depth[fi]
 
         send(frame_msg)
 

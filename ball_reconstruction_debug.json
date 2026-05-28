@@ -1,0 +1,2532 @@
+[
+  {
+    "frame": 60,
+    "u": -0.481116,
+    "v": -0.23620799999999997,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.250438,
+      0.602571,
+      0.268447,
+      0.633636
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.018008999999999997,
+    "bboxHeightNorm": 0.03106500000000001,
+    "bboxWidthPx": 34.577279999999995,
+    "bboxHeightPx": 33.55020000000001,
+    "confidence": 0.7605,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 42.69737701078422,
+    "zFromHeight": 44.0044816474253,
+    "zFromMinSide": 42.69737701078422,
+    "zUsed": 42.69737701078422,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.774478992746695,
+      1.0990279889391186,
+      5.7211804518519855
+    ],
+    "worldPosition": [
+      -2.774478992746695,
+      1.0990279889391186,
+      5.7211804518519855
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 61,
+    "u": -0.48039,
+    "v": -0.17149999999999999,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.250357,
+      0.566993,
+      0.269254,
+      0.604508
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.018896999999999997,
+    "bboxHeightNorm": 0.037515000000000076,
+    "bboxWidthPx": 36.282239999999994,
+    "bboxHeightPx": 40.51620000000008,
+    "confidence": 0.7681,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 40.69095954845812,
+    "zFromHeight": 36.4387371018863,
+    "zFromMinSide": 36.4387371018863,
+    "zUsed": 36.4387371018863,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5597296436497707,
+      2.2363981563727293,
+      11.892867495056215
+    ],
+    "worldPosition": [
+      -2.5597296436497707,
+      2.2363981563727293,
+      11.892867495056215
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 62,
+    "u": -0.479414,
+    "v": -0.109958,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.250331,
+      0.53603,
+      0.270254,
+      0.573928
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01992299999999997,
+    "bboxHeightNorm": 0.03789799999999999,
+    "bboxWidthPx": 38.25215999999994,
+    "bboxHeightPx": 40.929839999999984,
+    "confidence": 0.7185,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 38.59544559490108,
+    "zFromHeight": 36.07048452101082,
+    "zFromMinSide": 36.07048452101082,
+    "zUsed": 36.07048452101082,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5418459131436784,
+      2.4598929699519365,
+      12.23481760259137
+    ],
+    "worldPosition": [
+      -2.5418459131436784,
+      2.4598929699519365,
+      12.23481760259137
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 63,
+    "u": -0.478464,
+    "v": -0.049126,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.251168,
+      0.506255,
+      0.270367,
+      0.542871
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01919900000000002,
+    "bboxHeightNorm": 0.03661599999999998,
+    "bboxWidthPx": 36.86208000000004,
+    "bboxHeightPx": 39.54527999999998,
+    "confidence": 0.7748,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 40.05089132700724,
+    "zFromHeight": 37.3333849240023,
+    "zFromMinSide": 37.3333849240023,
+    "zUsed": 37.3333849240023,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5783387986408393,
+      2.4515764667220195,
+      10.959514953475683
+    ],
+    "worldPosition": [
+      -2.5783387986408393,
+      2.4515764667220195,
+      10.959514953475683
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 64,
+    "u": -0.47758199999999995,
+    "v": -0.0009419999999999984,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.250652,
+      0.481778,
+      0.271765,
+      0.519164
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.021112999999999993,
+    "bboxHeightNorm": 0.037385999999999975,
+    "bboxWidthPx": 40.536959999999986,
+    "bboxHeightPx": 40.37687999999997,
+    "confidence": 0.7833,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 36.42007590523437,
+    "zFromHeight": 36.56446858121405,
+    "zFromMinSide": 36.42007590523437,
+    "zUsed": 36.42007590523437,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5430570564849067,
+      2.711916508125534,
+      11.847391570919001
+    ],
+    "worldPosition": [
+      -2.5430570564849067,
+      2.711916508125534,
+      11.847391570919001
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 65,
+    "u": -0.47218000000000004,
+    "v": 0.05516399999999999,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.253927,
+      0.453827,
+      0.273892,
+      0.49101
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01996500000000001,
+    "bboxHeightNorm": 0.03718300000000002,
+    "bboxWidthPx": 38.33280000000002,
+    "bboxHeightPx": 40.15764000000002,
+    "confidence": 0.5116,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 38.51425307223704,
+    "zFromHeight": 36.76409171872272,
+    "zFromMinSide": 36.76409171872272,
+    "zUsed": 36.76409171872272,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5266268591620316,
+      2.822406681281719,
+      11.485473199283994
+    ],
+    "worldPosition": [
+      -2.5266268591620316,
+      2.822406681281719,
+      11.485473199283994
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 66,
+    "u": -0.46965199999999996,
+    "v": 0.13905999999999996,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.255126,
+      0.414149,
+      0.275223,
+      0.446791
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.020096999999999976,
+    "bboxHeightNorm": 0.032642000000000004,
+    "bboxWidthPx": 38.586239999999954,
+    "bboxHeightPx": 35.25336000000001,
+    "confidence": 0.5392,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 38.261285892780705,
+    "zFromHeight": 41.87853753989545,
+    "zFromMinSide": 38.261285892780705,
+    "zUsed": 38.261285892780705,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5606919269783663,
+      2.8707532673163243,
+      9.96593507834779
+    ],
+    "worldPosition": [
+      -2.5606919269783663,
+      2.8707532673163243,
+      9.96593507834779
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 69,
+    "u": -0.46330800000000005,
+    "v": 0.238112,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.259555,
+      0.363905,
+      0.277137,
+      0.397982
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.017582000000000042,
+    "bboxHeightNorm": 0.034077000000000024,
+    "bboxWidthPx": 33.75744000000008,
+    "bboxHeightPx": 36.80316000000003,
+    "confidence": 0.3138,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 43.7343341250831,
+    "zFromHeight": 40.115010780798386,
+    "zFromMinSide": 40.115010780798386,
+    "zUsed": 40.115010780798386,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.58378914949954,
+      2.9423807444963215,
+      8.083559368675786
+    ],
+    "worldPosition": [
+      -2.58378914949954,
+      2.9423807444963215,
+      8.083559368675786
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 71,
+    "u": -0.45946,
+    "v": 0.28359999999999996,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.259981,
+      0.340622,
+      0.280559,
+      0.375778
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.020577999999999985,
+    "bboxHeightNorm": 0.03515600000000002,
+    "bboxWidthPx": 39.50975999999997,
+    "bboxHeightPx": 37.96848000000002,
+    "confidence": 0.4672,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 37.366948322830865,
+    "zFromHeight": 38.883809943601854,
+    "zFromMinSide": 37.366948322830865,
+    "zUsed": 37.366948322830865,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.4783514681615912,
+      3.3931472269756533,
+      10.80043752183375
+    ],
+    "worldPosition": [
+      -2.4783514681615912,
+      3.3931472269756533,
+      10.80043752183375
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 73,
+    "u": -0.45872,
+    "v": 0.31077999999999995,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.260752,
+      0.325045,
+      0.280527,
+      0.364176
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.019775000000000043,
+    "bboxHeightNorm": 0.03913100000000003,
+    "bboxWidthPx": 37.96800000000008,
+    "bboxHeightPx": 42.26148000000003,
+    "confidence": 0.4873,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 38.884301521477184,
+    "zFromHeight": 34.933919970797234,
+    "zFromMinSide": 34.933919970797234,
+    "zUsed": 34.933919970797234,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.400349277191985,
+      3.7415468480609313,
+      13.212272805808318
+    ],
+    "worldPosition": [
+      -2.400349277191985,
+      3.7415468480609313,
+      13.212272805808318
+    ],
+    "accepted": true,
+    "rejectedReason": "plausibility-check-failed (suppressed in debugMode)",
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 76,
+    "u": -0.45312399999999997,
+    "v": 0.336584,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.26467,
+      0.318599,
+      0.282206,
+      0.344818
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.017535999999999996,
+    "bboxHeightNorm": 0.026218999999999992,
+    "bboxWidthPx": 33.66911999999999,
+    "bboxHeightPx": 28.31651999999999,
+    "confidence": 0.4449,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 43.8490569449825,
+    "zFromHeight": 52.13773303242946,
+    "zFromMinSide": 43.8490569449825,
+    "zUsed": 43.8490569449825,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.637215268187704,
+      2.834279846480417,
+      4.326001671184187
+    ],
+    "worldPosition": [
+      -2.637215268187704,
+      2.834279846480417,
+      4.326001671184187
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 77,
+    "u": -0.452944,
+    "v": 0.33741600000000005,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.264808,
+      0.317382,
+      0.282248,
+      0.345202
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01744000000000001,
+    "bboxHeightNorm": 0.02782000000000001,
+    "bboxWidthPx": 33.48480000000002,
+    "bboxHeightPx": 30.04560000000001,
+    "confidence": 0.497,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 44.090427900642915,
+    "zFromHeight": 49.137283334912546,
+    "zFromMinSide": 44.090427900642915,
+    "zUsed": 44.090427900642915,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.643263325912731,
+      2.810650642668014,
+      4.08529662613487
+    ],
+    "worldPosition": [
+      -2.643263325912731,
+      2.810650642668014,
+      4.08529662613487
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 78,
+    "u": -0.45308400000000004,
+    "v": 0.33707,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.264723,
+      0.31713,
+      0.282193,
+      0.3458
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01747000000000004,
+    "bboxHeightNorm": 0.028669999999999973,
+    "bboxWidthPx": 33.54240000000008,
+    "bboxHeightPx": 30.96359999999997,
+    "confidence": 0.3355,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 44.01471451558163,
+    "zFromHeight": 47.68047514395775,
+    "zFromMinSide": 44.01471451558163,
+    "zUsed": 44.01471451558163,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.6418705393788944,
+      2.817774581704935,
+      4.16082405676152
+    ],
+    "worldPosition": [
+      -2.6418705393788944,
+      2.817774581704935,
+      4.16082405676152
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 79,
+    "u": -0.448862,
+    "v": 0.335724,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.268655,
+      0.318997,
+      0.282483,
+      0.345278
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.013828000000000007,
+    "bboxHeightNorm": 0.026281,
+    "bboxWidthPx": 26.549760000000013,
+    "bboxHeightPx": 28.38348,
+    "confidence": 0.6331,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 55.60725069331881,
+    "zFromHeight": 52.01473392858976,
+    "zFromMinSide": 52.01473392858976,
+    "zUsed": 52.01473392858976,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.848643506322385,
+      1.9370409277475353,
+      -3.804021391048302
+    ],
+    "worldPosition": [
+      -2.848643506322385,
+      1.9370409277475353,
+      -3.804021391048302
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 80,
+    "u": -0.448562,
+    "v": 0.32511599999999996,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.268365,
+      0.323802,
+      0.283073,
+      0.351083
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.014707999999999999,
+    "bboxHeightNorm": 0.027281,
+    "bboxWidthPx": 28.239359999999998,
+    "bboxHeightPx": 29.46348,
+    "confidence": 0.6975,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 52.28019190829569,
+    "zFromHeight": 50.10810536187337,
+    "zFromMinSide": 50.10810536187337,
+    "zUsed": 50.10810536187337,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.79145118645028,
+      2.105415609500813,
+      -1.8998544975450002
+    ],
+    "worldPosition": [
+      -2.79145118645028,
+      2.105415609500813,
+      -1.8998544975450002
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 81,
+    "u": -0.447966,
+    "v": 0.31797600000000004,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.267432,
+      0.328589,
+      0.284602,
+      0.353436
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01717000000000002,
+    "bboxHeightNorm": 0.024846999999999952,
+    "bboxWidthPx": 32.966400000000036,
+    "bboxHeightPx": 26.83475999999995,
+    "confidence": 0.5605,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 44.7837543731632,
+    "zFromHeight": 55.0166709211281,
+    "zFromMinSide": 44.7837543731632,
+    "zUsed": 44.7837543731632,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.633632498539932,
+      2.668543260999984,
+      3.404884614099693
+    ],
+    "worldPosition": [
+      -2.633632498539932,
+      2.668543260999984,
+      3.404884614099693
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 82,
+    "u": -0.445928,
+    "v": 0.300242,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.268137,
+      0.335426,
+      0.285934,
+      0.364332
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.017797000000000007,
+    "bboxHeightNorm": 0.028905999999999987,
+    "bboxWidthPx": 34.170240000000014,
+    "bboxHeightPx": 31.218479999999985,
+    "confidence": 0.8144,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 43.20599329028559,
+    "zFromHeight": 47.29119291417934,
+    "zFromMinSide": 43.20599329028559,
+    "zUsed": 43.20599329028559,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.576278545312696,
+      2.785169137426948,
+      4.984031126531946
+    ],
+    "worldPosition": [
+      -2.576278545312696,
+      2.785169137426948,
+      4.984031126531946
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 83,
+    "u": -0.443222,
+    "v": 0.27966599999999997,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.269173,
+      0.346844,
+      0.287605,
+      0.37349
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.018432000000000004,
+    "bboxHeightNorm": 0.026646000000000003,
+    "bboxWidthPx": 35.38944000000001,
+    "bboxHeightPx": 28.777680000000004,
+    "confidence": 0.5933,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 41.7175055657125,
+    "zFromHeight": 51.3022300674498,
+    "zFromMinSide": 41.7175055657125,
+    "zUsed": 41.7175055657125,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5185512440398727,
+      2.8868911727069424,
+      6.475076089011232
+    ],
+    "worldPosition": [
+      -2.5185512440398727,
+      2.8868911727069424,
+      6.475076089011232
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 84,
+    "u": -0.44170200000000004,
+    "v": 0.260196,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.270408,
+      0.355003,
+      0.287889,
+      0.384801
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.017481000000000024,
+    "bboxHeightNorm": 0.02979799999999999,
+    "bboxWidthPx": 33.56352000000005,
+    "bboxHeightPx": 32.181839999999994,
+    "confidence": 0.6666,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 43.98701805315553,
+    "zFromHeight": 45.87553602178897,
+    "zFromMinSide": 43.98701805315553,
+    "zUsed": 43.98701805315553,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.5738585417273034,
+      2.563454006265217,
+      4.225687552402135
+    ],
+    "worldPosition": [
+      -2.5738585417273034,
+      2.563454006265217,
+      4.225687552402135
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 85,
+    "u": -0.43696999999999997,
+    "v": 0.23412999999999995,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.273948,
+      0.369185,
+      0.289082,
+      0.396684
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01513399999999998,
+    "bboxHeightNorm": 0.027498999999999996,
+    "bboxWidthPx": 29.057279999999963,
+    "bboxHeightPx": 29.698919999999994,
+    "confidence": 0.8651,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 50.80858085021897,
+    "zFromHeight": 49.71087029991155,
+    "zFromMinSide": 49.71087029991155,
+    "zUsed": 49.71087029991155,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.702815880041207,
+      1.8050149736664522,
+      -1.454883428812991
+    ],
+    "worldPosition": [
+      -2.702815880041207,
+      1.8050149736664522,
+      -1.454883428812991
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 86,
+    "u": -0.43572599999999995,
+    "v": 0.23460999999999999,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.273894,
+      0.364597,
+      0.290379,
+      0.400793
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016484999999999972,
+    "bboxHeightNorm": 0.036196000000000006,
+    "bboxWidthPx": 31.651199999999946,
+    "bboxHeightPx": 39.091680000000004,
+    "confidence": 0.3457,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 46.644650445084274,
+    "zFromHeight": 37.76658256098097,
+    "zFromMinSide": 37.76658256098097,
+    "zUsed": 37.76658256098097,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.3688197845653898,
+      3.2069795330401796,
+      10.425841751194078
+    ],
+    "worldPosition": [
+      -2.3688197845653898,
+      3.2069795330401796,
+      10.425841751194078
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 87,
+    "u": -0.43376400000000004,
+    "v": 0.267648,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.27331,
+      0.346217,
+      0.292926,
+      0.386136
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.019616000000000022,
+    "bboxHeightNorm": 0.03991899999999998,
+    "bboxWidthPx": 37.66272000000004,
+    "bboxHeightPx": 43.11251999999998,
+    "confidence": 0.2699,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 39.199483206933735,
+    "zFromHeight": 34.24432531820106,
+    "zFromMinSide": 34.24432531820106,
+    "zUsed": 34.24432531820106,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.2632683024991334,
+      3.705974341706668,
+      13.917912488275242
+    ],
+    "worldPosition": [
+      -2.2632683024991334,
+      3.705974341706668,
+      13.917912488275242
+    ],
+    "accepted": true,
+    "rejectedReason": "plausibility-check-failed (suppressed in debugMode)",
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 89,
+    "u": -0.42800800000000006,
+    "v": 0.33941200000000005,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.276353,
+      0.311754,
+      0.295638,
+      0.348834
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.019284999999999997,
+    "bboxHeightNorm": 0.03708,
+    "bboxWidthPx": 37.02719999999999,
+    "bboxHeightPx": 40.046400000000006,
+    "confidence": 0.5322,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 39.87228740405564,
+    "zFromHeight": 36.86621419571918,
+    "zFromMinSide": 36.86621419571918,
+    "zUsed": 36.86621419571918,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.3041464824549474,
+      3.6065731543972532,
+      11.282610665506496
+    ],
+    "worldPosition": [
+      -2.3041464824549474,
+      3.6065731543972532,
+      11.282610665506496
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 108,
+    "u": -0.34553999999999996,
+    "v": 0.335692,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.320765,
+      0.320057,
+      0.333696,
+      0.344251
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01293099999999997,
+    "bboxHeightNorm": 0.024193999999999993,
+    "bboxWidthPx": 24.827519999999943,
+    "bboxHeightPx": 26.129519999999992,
+    "confidence": 0.2961,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 59.464624745743926,
+    "zFromHeight": 56.50157982877027,
+    "zFromMinSide": 56.50157982877027,
+    "zUsed": 56.50157982877027,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.1820745063841516,
+      1.4454688040070431,
+      -8.24607430058009
+    ],
+    "worldPosition": [
+      -2.1820745063841516,
+      1.4454688040070431,
+      -8.24607430058009
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 109,
+    "u": -0.34236,
+    "v": 0.31539799999999996,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.319737,
+      0.329776,
+      0.337903,
+      0.354827
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.018166000000000015,
+    "bboxHeightNorm": 0.02505099999999999,
+    "bboxWidthPx": 34.87872000000003,
+    "bboxHeightPx": 27.05507999999999,
+    "confidence": 0.2132,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 42.32836411908028,
+    "zFromHeight": 54.56864885143379,
+    "zFromMinSide": 42.32836411908028,
+    "zUsed": 42.32836411908028,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.9526286962176722,
+      2.932488490080864,
+      5.87038618473715
+    ],
+    "worldPosition": [
+      -1.9526286962176722,
+      2.932488490080864,
+      5.87038618473715
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 110,
+    "u": -0.333418,
+    "v": 0.287254,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.326011,
+      0.346484,
+      0.340571,
+      0.366261
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.014560000000000017,
+    "bboxHeightNorm": 0.01977699999999999,
+    "bboxWidthPx": 27.955200000000033,
+    "bboxHeightPx": 21.35915999999999,
+    "confidence": 0.3662,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 52.8116114414294,
+    "zFromHeight": 69.12065643814877,
+    "zFromMinSide": 52.8116114414294,
+    "zUsed": 52.8116114414294,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -2.0405347741829027,
+      1.6549445981754758,
+      -4.543993933125492
+    ],
+    "worldPosition": [
+      -2.0405347741829027,
+      1.6549445981754758,
+      -4.543993933125492
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 111,
+    "u": -0.33370200000000005,
+    "v": 0.300512,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.323979,
+      0.338424,
+      0.34232,
+      0.361064
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.018340999999999996,
+    "bboxHeightNorm": 0.022639999999999993,
+    "bboxWidthPx": 35.21471999999999,
+    "bboxHeightPx": 24.451199999999993,
+    "confidence": 0.6616,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 41.92448953640549,
+    "zFromHeight": 60.379824309949996,
+    "zFromMinSide": 41.92448953640549,
+    "zUsed": 41.92448953640549,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.897448342191986,
+      2.9298515579655033,
+      6.28036124775744
+    ],
+    "worldPosition": [
+      -1.897448342191986,
+      2.9298515579655033,
+      6.28036124775744
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 113,
+    "u": -0.31200799999999995,
+    "v": 0.390718,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.336058,
+      0.294515,
+      0.351935,
+      0.314768
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.015876999999999974,
+    "bboxHeightNorm": 0.020252999999999965,
+    "bboxWidthPx": 30.48383999999995,
+    "bboxHeightPx": 21.873239999999964,
+    "confidence": 0.3573,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 48.430878792417595,
+    "zFromHeight": 67.49613501097465,
+    "zFromMinSide": 48.430878792417595,
+    "zUsed": 48.430878792417595,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.8391782009620923,
+      2.53227573004399,
+      -0.233547346679444
+    ],
+    "worldPosition": [
+      -1.8391782009620923,
+      2.53227573004399,
+      -0.233547346679444
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 118,
+    "u": -0.26778199999999996,
+    "v": 0.540322,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.358429,
+      0.216474,
+      0.37379,
+      0.243204
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.015361000000000014,
+    "bboxHeightNorm": 0.026730000000000004,
+    "bboxWidthPx": 29.493120000000026,
+    "bboxHeightPx": 28.868400000000005,
+    "confidence": 0.4441,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 50.05774771090503,
+    "zFromHeight": 51.141010938169366,
+    "zFromMinSide": 50.05774771090503,
+    "zUsed": 50.05774771090503,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.551296798030792,
+      2.930847499114992,
+      -1.9213527691736374
+    ],
+    "worldPosition": [
+      -1.551296798030792,
+      2.930847499114992,
+      -1.9213527691736374
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 119,
+    "u": -0.256134,
+    "v": 0.562728,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.364035,
+      0.205986,
+      0.379832,
+      0.231285
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.015797000000000005,
+    "bboxHeightNorm": 0.025298999999999988,
+    "bboxWidthPx": 30.33024000000001,
+    "bboxHeightPx": 27.322919999999986,
+    "confidence": 0.7044,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 48.676145001406134,
+    "zFromHeight": 54.03372553766031,
+    "zFromMinSide": 48.676145001406134,
+    "zUsed": 48.676145001406134,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.4677018149925083,
+      3.1436628879789437,
+      -0.5525520378495941
+    ],
+    "worldPosition": [
+      -1.4677018149925083,
+      3.1436628879789437,
+      -0.5525520378495941
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 120,
+    "u": -0.24753599999999998,
+    "v": 0.584336,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.369364,
+      0.194189,
+      0.383101,
+      0.221474
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.013737,
+    "bboxHeightNorm": 0.027285000000000004,
+    "bboxWidthPx": 26.37504,
+    "bboxHeightPx": 29.467800000000004,
+    "confidence": 0.6577,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 55.97561786323163,
+    "zFromHeight": 50.10075947873437,
+    "zFromMinSide": 50.10075947873437,
+    "zUsed": 50.10075947873437,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.4122993804502568,
+      3.094631573870525,
+      -1.9826151976119135
+    ],
+    "worldPosition": [
+      -1.4122993804502568,
+      3.094631573870525,
+      -1.9826151976119135
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 121,
+    "u": -0.23899000000000004,
+    "v": 0.599904,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.37328,
+      0.184645,
+      0.38773,
+      0.21545
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.014450000000000018,
+    "bboxHeightNorm": 0.030805,
+    "bboxWidthPx": 27.744000000000035,
+    "bboxHeightPx": 33.2694,
+    "confidence": 0.6354,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 53.21363754928802,
+    "zFromHeight": 44.37588775774282,
+    "zFromMinSide": 44.37588775774282,
+    "zUsed": 44.37588775774282,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.351986733478327,
+      3.665921777792975,
+      3.7222849319449267
+    ],
+    "worldPosition": [
+      -1.351986733478327,
+      3.665921777792975,
+      3.7222849319449267
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 122,
+    "u": -0.22941999999999996,
+    "v": 0.61279,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.376958,
+      0.180154,
+      0.393623,
+      0.207055
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016664999999999985,
+    "bboxHeightNorm": 0.02690099999999998,
+    "bboxWidthPx": 31.996799999999972,
+    "bboxHeightPx": 29.05307999999998,
+    "confidence": 0.5545,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 46.14083783901672,
+    "zFromHeight": 50.8159258903858,
+    "zFromMinSide": 46.14083783901672,
+    "zUsed": 46.14083783901672,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.2920191432761428,
+      3.5533471868908437,
+      1.957372749663655
+    ],
+    "worldPosition": [
+      -1.2920191432761428,
+      3.5533471868908437,
+      1.957372749663655
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 123,
+    "u": -0.21827799999999997,
+    "v": 0.624236,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.382941,
+      0.174048,
+      0.398781,
+      0.201715
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01584000000000002,
+    "bboxHeightNorm": 0.027666999999999997,
+    "bboxWidthPx": 30.41280000000004,
+    "bboxHeightPx": 29.880359999999996,
+    "confidence": 0.7857,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 48.5440064764654,
+    "zFromHeight": 49.40901515803186,
+    "zFromMinSide": 48.5440064764654,
+    "zUsed": 48.5440064764654,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.21554162755776,
+      3.383095333708251,
+      -0.44359755922590693
+    ],
+    "worldPosition": [
+      -1.21554162755776,
+      3.383095333708251,
+      -0.44359755922590693
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 124,
+    "u": -0.208804,
+    "v": 0.633222,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.387199,
+      0.169278,
+      0.403997,
+      0.1975
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01679799999999998,
+    "bboxHeightNorm": 0.028221999999999997,
+    "bboxWidthPx": 32.25215999999996,
+    "bboxHeightPx": 30.479759999999995,
+    "confidence": 0.7256,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 45.77551271503833,
+    "zFromHeight": 48.43736171700332,
+    "zFromMinSide": 45.77551271503833,
+    "zUsed": 45.77551271503833,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.1632825834625469,
+      3.656838391968802,
+      2.3163321758742796
+    ],
+    "worldPosition": [
+      -1.1632825834625469,
+      3.656838391968802,
+      2.3163321758742796
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 125,
+    "u": -0.19932000000000005,
+    "v": 0.642702,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.392684,
+      0.165159,
+      0.407996,
+      0.192138
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.015312000000000048,
+    "bboxHeightNorm": 0.026979000000000003,
+    "bboxWidthPx": 29.39904000000009,
+    "bboxHeightPx": 29.137320000000003,
+    "confidence": 0.5832,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 50.217937734274464,
+    "zFromHeight": 50.669010058833436,
+    "zFromMinSide": 50.217937734274464,
+    "zUsed": 50.217937734274464,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.0810225956408703,
+      3.3070844016573337,
+      -2.1191689030724987
+    ],
+    "worldPosition": [
+      -1.0810225956408703,
+      3.3070844016573337,
+      -2.1191689030724987
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 126,
+    "u": -0.188272,
+    "v": 0.645258,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.397973,
+      0.163568,
+      0.413756,
+      0.191174
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01578299999999999,
+    "bboxHeightNorm": 0.02760600000000002,
+    "bboxWidthPx": 30.303359999999984,
+    "bboxHeightPx": 29.81448000000002,
+    "confidence": 0.7975,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 48.719322219300096,
+    "zFromHeight": 49.518192508051385,
+    "zFromMinSide": 48.719322219300096,
+    "zUsed": 48.719322219300096,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -1.0152326986039852,
+      3.445689578450984,
+      -0.6226663312663305
+    ],
+    "worldPosition": [
+      -1.0152326986039852,
+      3.445689578450984,
+      -0.6226663312663305
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 127,
+    "u": -0.16920000000000002,
+    "v": 0.645956,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.407254,
+      0.1627,
+      0.423546,
+      0.191344
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016291999999999973,
+    "bboxHeightNorm": 0.028643999999999975,
+    "bboxWidthPx": 31.28063999999995,
+    "bboxHeightPx": 30.935519999999972,
+    "confidence": 0.5842,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 47.1972171978403,
+    "zFromHeight": 47.723754446909254,
+    "zFromMinSide": 47.1972171978403,
+    "zUsed": 47.1972171978403,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.9024994589540392,
+      3.5790525653545684,
+      0.8997937428421423
+    ],
+    "worldPosition": [
+      -0.9024994589540392,
+      3.5790525653545684,
+      0.8997937428421423
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 128,
+    "u": -0.15915599999999996,
+    "v": 0.64195,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.412123,
+      0.165942,
+      0.428722,
+      0.192109
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016598999999999975,
+    "bboxHeightNorm": 0.026166999999999996,
+    "bboxWidthPx": 31.870079999999952,
+    "bboxHeightPx": 28.260359999999995,
+    "confidence": 0.3965,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 46.32430041491741,
+    "zFromHeight": 52.24134300367897,
+    "zFromMinSide": 46.32430041491741,
+    "zUsed": 46.32430041491741,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.8471419972672254,
+      3.6399275790858323,
+      1.7747414609531518
+    ],
+    "worldPosition": [
+      -0.8471419972672254,
+      3.6399275790858323,
+      1.7747414609531518
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 129,
+    "u": -0.14959999999999996,
+    "v": 0.634604,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.417053,
+      0.168803,
+      0.433348,
+      0.196593
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016295000000000004,
+    "bboxHeightNorm": 0.02778999999999998,
+    "bboxWidthPx": 31.286400000000008,
+    "bboxHeightPx": 30.01319999999998,
+    "confidence": 0.413,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 47.18852792802779,
+    "zFromHeight": 49.19032826114676,
+    "zFromMinSide": 47.18852792802779,
+    "zUsed": 47.18852792802779,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.7765301811202672,
+      3.5390300219741606,
+      0.9181145020267607
+    ],
+    "worldPosition": [
+      -0.7765301811202672,
+      3.5390300219741606,
+      0.9181145020267607
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 130,
+    "u": -0.14064,
+    "v": 0.625568,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.421103,
+      0.173232,
+      0.438256,
+      0.2012
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.017152999999999974,
+    "bboxHeightNorm": 0.027967999999999993,
+    "bboxWidthPx": 32.93375999999995,
+    "bboxHeightPx": 30.205439999999992,
+    "confidence": 0.7684,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 44.82813866887507,
+    "zFromHeight": 48.877260525503,
+    "zFromMinSide": 44.82813866887507,
+    "zUsed": 44.82813866887507,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.7500063079143643,
+      3.7130389097214835,
+      3.278716717750875
+    ],
+    "worldPosition": [
+      -0.7500063079143643,
+      3.7130389097214835,
+      3.278716717750875
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 131,
+    "u": -0.12981399999999998,
+    "v": 0.612304,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.426591,
+      0.179312,
+      0.443594,
+      0.208384
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01700299999999999,
+    "bboxHeightNorm": 0.029072000000000014,
+    "bboxWidthPx": 32.64575999999998,
+    "bboxHeightPx": 31.397760000000016,
+    "confidence": 0.7906,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 45.22361127961027,
+    "zFromHeight": 47.02116202453449,
+    "zFromMinSide": 45.22361127961027,
+    "zUsed": 45.22361127961027,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.6781883995280655,
+      3.632795159558528,
+      2.8926515384019496
+    ],
+    "worldPosition": [
+      -0.6781883995280655,
+      3.632795159558528,
+      2.8926515384019496
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 132,
+    "u": -0.12072799999999995,
+    "v": 0.6001380000000001,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.431512,
+      0.185565,
+      0.447761,
+      0.214297
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016249000000000013,
+    "bboxHeightNorm": 0.02873199999999998,
+    "bboxWidthPx": 31.198080000000026,
+    "bboxHeightPx": 31.03055999999998,
+    "confidence": 0.688,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 47.32211598173502,
+    "zFromHeight": 47.577586745693594,
+    "zFromMinSide": 47.32211598173502,
+    "zUsed": 47.32211598173502,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.5890144535380649,
+      3.4033069323803504,
+      0.8078169049054722
+    ],
+    "worldPosition": [
+      -0.5890144535380649,
+      3.4033069323803504,
+      0.8078169049054722
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 133,
+    "u": -0.11031199999999997,
+    "v": 0.5826439999999999,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.436544,
+      0.195138,
+      0.453144,
+      0.222219
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016600000000000004,
+    "bboxHeightNorm": 0.027080999999999994,
+    "bboxWidthPx": 31.872000000000007,
+    "bboxHeightPx": 29.247479999999992,
+    "confidence": 0.4554,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 46.32150979441041,
+    "zFromHeight": 50.4781663297983,
+    "zFromMinSide": 46.32150979441041,
+    "zUsed": 46.32150979441041,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.5393055285222972,
+      3.431092444853875,
+      1.8160330853349933
+    ],
+    "worldPosition": [
+      -0.5393055285222972,
+      3.431092444853875,
+      1.8160330853349933
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 139,
+    "u": -0.06264999999999998,
+    "v": 0.450136,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.460598,
+      0.26084,
+      0.476751,
+      0.289025
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016152999999999973,
+    "bboxHeightNorm": 0.02818499999999996,
+    "bboxWidthPx": 31.013759999999948,
+    "bboxHeightPx": 30.439799999999956,
+    "confidence": 0.2878,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 47.60335928850456,
+    "zFromHeight": 48.50094810634272,
+    "zFromMinSide": 47.60335928850456,
+    "zUsed": 47.60335928850456,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.20962887380995832,
+      2.8347158876349523,
+      0.6136887190019564
+    ],
+    "worldPosition": [
+      -0.20962887380995832,
+      2.8347158876349523,
+      0.6136887190019564
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 140,
+    "u": -0.048727999999999994,
+    "v": 0.41432800000000003,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.468533,
+      0.277854,
+      0.482738,
+      0.307818
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.014205000000000023,
+    "bboxHeightNorm": 0.02996399999999999,
+    "bboxWidthPx": 27.273600000000044,
+    "bboxHeightPx": 32.36111999999999,
+    "confidence": 0.5519,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 54.1314370001557,
+    "zFromHeight": 45.62138640960045,
+    "zFromMinSide": 45.62138640960045,
+    "zUsed": 45.62138640960045,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      -0.17053546799256014,
+      2.9102104935589868,
+      2.6060184304938545
+    ],
+    "worldPosition": [
+      -0.17053546799256014,
+      2.9102104935589868,
+      2.6060184304938545
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 141,
+    "u": -0.03851400000000005,
+    "v": 0.382872,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.473897,
+      0.29783,
+      0.48759,
+      0.319297
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01369300000000001,
+    "bboxHeightNorm": 0.021467000000000014,
+    "bboxWidthPx": 26.29056000000002,
+    "bboxHeightPx": 23.184360000000016,
+    "confidence": 0.5177,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 56.15548547339607,
+    "zFromHeight": 63.6790991930529,
+    "zFromMinSide": 56.15548547339607,
+    "zUsed": 56.15548547339607,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      0.17706176445468413,
+      1.6850146401105137,
+      -7.852719939872081
+    ],
+    "worldPosition": [
+      0.17706176445468413,
+      1.6850146401105137,
+      -7.852719939872081
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 146,
+    "u": 0.015992000000000006,
+    "v": 0.28956000000000004,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.498809,
+      0.341072,
+      0.517183,
+      0.369368
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.018373999999999946,
+    "bboxHeightNorm": 0.028295999999999988,
+    "bboxWidthPx": 35.278079999999896,
+    "bboxHeightPx": 30.559679999999986,
+    "confidence": 0.2726,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 41.849192477806426,
+    "zFromHeight": 48.31068781372873,
+    "zFromMinSide": 41.849192477806426,
+    "zUsed": 41.849192477806426,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      0.10070858684425077,
+      2.903418350728664,
+      6.424836135286476
+    ],
+    "worldPosition": [
+      0.10070858684425077,
+      2.903418350728664,
+      6.424836135286476
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 148,
+    "u": 0.05527799999999994,
+    "v": 0.38537999999999994,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.519813,
+      0.296387,
+      0.535465,
+      0.318232
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.015652,
+    "bboxHeightNorm": 0.021845000000000003,
+    "bboxWidthPx": 30.05184,
+    "bboxHeightPx": 23.592600000000004,
+    "confidence": 0.4825,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 49.12708041063206,
+    "zFromHeight": 62.577213201065106,
+    "zFromMinSide": 49.12708041063206,
+    "zUsed": 49.12708041063206,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      0.6161584294063505,
+      2.4389779387744053,
+      -0.8441623990661427
+    ],
+    "worldPosition": [
+      0.6161584294063505,
+      2.4389779387744053,
+      -0.8441623990661427
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 153,
+    "u": 0.15520599999999996,
+    "v": 0.55672,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.569208,
+      0.206979,
+      0.585998,
+      0.2363
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01678999999999997,
+    "bboxHeightNorm": 0.029321000000000014,
+    "bboxWidthPx": 32.236799999999945,
+    "bboxHeightPx": 31.666680000000014,
+    "confidence": 0.3212,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 45.797323560882326,
+    "zFromHeight": 46.62184858556212,
+    "zFromMinSide": 45.797323560882326,
+    "zUsed": 45.797323560882326,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      1.1108425429523499,
+      3.388297247740309,
+      2.4047273989875038
+    ],
+    "worldPosition": [
+      1.1108425429523499,
+      3.388297247740309,
+      2.4047273989875038
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 171,
+    "u": 0.48050799999999994,
+    "v": 0.5915079999999999,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.73141,
+      0.190581,
+      0.749098,
+      0.21791
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.017688000000000037,
+    "bboxHeightNorm": 0.027328999999999992,
+    "bboxWidthPx": 33.96096000000007,
+    "bboxHeightPx": 29.515319999999992,
+    "confidence": 0.2669,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 43.472244605789875,
+    "zFromHeight": 50.020096687667596,
+    "zFromMinSide": 43.472244605789875,
+    "zUsed": 43.472244605789875,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      2.917002786657833,
+      3.7189489767615824,
+      4.76605321722019
+    ],
+    "worldPosition": [
+      2.917002786657833,
+      3.7189489767615824,
+      4.76605321722019
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 172,
+    "u": 0.4985379999999999,
+    "v": 0.558646,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.740925,
+      0.204766,
+      0.757612,
+      0.236589
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.016687000000000007,
+    "bboxHeightNorm": 0.03182299999999999,
+    "bboxWidthPx": 32.039040000000014,
+    "bboxHeightPx": 34.36883999999999,
+    "confidence": 0.3271,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 46.080006147732526,
+    "zFromHeight": 42.95632788791968,
+    "zFromMinSide": 42.95632788791968,
+    "zUsed": 42.95632788791968,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      2.9717174812442986,
+      3.6579785209519544,
+      5.297107880753352
+    ],
+    "worldPosition": [
+      2.9717174812442986,
+      3.6579785209519544,
+      5.297107880753352
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 175,
+    "u": 0.43395800000000007,
+    "v": 0.5044219999999999,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.70712,
+      0.22863,
+      0.726837,
+      0.266949
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.019716999999999985,
+    "bboxHeightNorm": 0.03831899999999999,
+    "bboxWidthPx": 37.85663999999997,
+    "bboxHeightPx": 41.384519999999995,
+    "confidence": 0.3754,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 38.99868451525148,
+    "zFromHeight": 35.67418832373673,
+    "zFromMinSide": 35.67418832373673,
+    "zUsed": 35.67418832373673,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      1.9257868974151207,
+      4.184807531236983,
+      12.544676886431581
+    ],
+    "worldPosition": [
+      1.9257868974151207,
+      4.184807531236983,
+      12.544676886431581
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 177,
+    "u": 0.5084679999999999,
+    "v": 0.611776,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.746869,
+      0.179708,
+      0.761599,
+      0.208515
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.01473000000000002,
+    "bboxHeightNorm": 0.028807,
+    "bboxWidthPx": 28.28160000000004,
+    "bboxHeightPx": 31.11156,
+    "confidence": 0.5245,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 52.202108797502504,
+    "zFromHeight": 47.453716887467195,
+    "zFromMinSide": 47.453716887467195,
+    "zUsed": 47.453716887467195,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      3.488244983344953,
+      3.4335723751386205,
+      0.8030988262123344
+    ],
+    "worldPosition": [
+      3.488244983344953,
+      3.4335723751386205,
+      0.8030988262123344
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  },
+  {
+    "frame": 186,
+    "u": 0.830992,
+    "v": 0.942448,
+    "videoWidth": 1920,
+    "videoHeight": 1080,
+    "bbox": [
+      0.906818,
+      0.015077,
+      0.924174,
+      0.042476
+    ],
+    "bboxFormatAssumed": "x1y1x2y2-norm",
+    "bboxWidthNorm": 0.017356000000000038,
+    "bboxHeightNorm": 0.027399,
+    "bboxWidthPx": 33.32352000000007,
+    "bboxHeightPx": 29.59092,
+    "confidence": 0.2437,
+    "fovY": 8.784594971702216,
+    "fovX": 15.5515378816697,
+    "fx": 7030.281715083091,
+    "fy": 7030.281715083091,
+    "ballDiameterM": 0.21,
+    "zFromWidth": 44.303817848998115,
+    "zFromHeight": 49.89230345550084,
+    "zFromMinSide": 44.303817848998115,
+    "zUsed": 44.303817848998115,
+    "method": "bbox-depth",
+    "worldPositionRaw": [
+      5.1228919346004655,
+      4.827360698555541,
+      3.8467354238910616
+    ],
+    "worldPosition": [
+      5.1228919346004655,
+      4.827360698555541,
+      3.8467354238910616
+    ],
+    "accepted": true,
+    "rejectedReason": null,
+    "cameraPosition": [
+      -1.3394709681324952,
+      7.634102143167416,
+      47.99136264945608
+    ]
+  }
+]

@@ -2,6 +2,15 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
+/** Identifies which reconstruction method produced a ball_3d_pos value. */
+export type BallReconstructionMethod =
+  | "homography-ray"
+  | "bbox-depth"
+  | "ground-intersection"
+  | "bbox-bottom-ray"
+  | "ballistic-arc"
+  | "physics-reprojection";
+
 export interface FrameData {
   action: "frame";
   frame: number;
@@ -24,6 +33,21 @@ export interface FrameData {
   ball_conf?: number;
   /** Normalised [x1,y1,x2,y2] bounding box from YOLO (absent when interpolated). */
   ball_bbox?: [number, number, number, number];
+  /**
+   * Relative depth at ball centre from Depth Anything V2 [0,1] (0=near, 1=far).
+   * Present only for YOLO-detected (non-interpolated) frames when the depth model is available.
+   */
+  ball_depth_estimate?: number;
+  /**
+   * Physics-solver 3D position [x, y, z] in world metres after ballistic trajectory fitting.
+   * Populated in-browser after analysis + calibration are both available.
+   */
+  ball_3d_pos?: [number, number, number];
+  /**
+   * Which reconstruction method produced ball_3d_pos.
+   * Present only when ball_3d_pos is set.
+   */
+  ball_3d_method?: BallReconstructionMethod;
 }
 
 export interface CourtDataEntry {

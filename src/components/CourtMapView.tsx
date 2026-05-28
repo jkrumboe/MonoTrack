@@ -1,6 +1,8 @@
 import { useMemo } from "react";
 import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
 import { imageToCourtHomography, applyHomography } from "../utils/courtHomography";
+import { estimateBallWorldPosition } from "../utils/ballReconstruction";
+import type { CalibrationResult } from "../utils/cameraSolver";
 
 // FIVB volleyball court dimensions (metres)
 const COURT_LENGTH = 18.0;
@@ -10,6 +12,8 @@ const NET_Y_NORM   = 0.5;                          // net at midpoint
 const ATTACK_NORM  = ATTACK_DIST / COURT_LENGTH;   // ≈0.1667
 const HALF_L = COURT_LENGTH / 2;
 const HALF_W = COURT_WIDTH  / 2;
+const NET_HEIGHT_M = 2.43;  // FIVB men's net height
+const SIDE_MAX_H   = 6.0;   // metres shown in elevation view
 
 const TRAIL_FRAMES = 120;
 
@@ -53,6 +57,8 @@ interface CourtMapViewProps {
   currentFrame: number;
   courtData: CourtDataEntry[];
   isRealVideo: boolean;
+  calibration?: CalibrationResult | null;
+  videoAspect?: number;
 }
 
 // Court lines in normalised [0,1] coordinates [x1,y1,x2,y2]
@@ -77,16 +83,19 @@ export default function CourtMapView({
   currentFrame,
   courtData,
   isRealVideo,
+  calibration,
+  videoAspect,
 }: CourtMapViewProps) {
   // Build image→court homography from the nearest court detection
-  const H = useMemo<number[][] | null>(() => {
-    if (!isRealVideo || courtData.length === 0) return null;
+  const { H, courtCorners } = useMemo(() => {
+    if (!isRealVideo || courtData.length === 0)
+      return { H: null, courtCorners: undefined as number[][] | undefined };
     let best = courtData[0];
     for (const entry of courtData) {
       if (entry.frame <= currentFrame) best = entry;
       else break;
     }
-    return imageToCourtHomography(best.corners);
+    return { H: imageToCourtHomography(best.corners), courtCorners: best.corners };
   }, [courtData, currentFrame, isRealVideo]);
 
   const frameIdx = Math.min(currentFrame, frames.length - 1);
@@ -124,6 +133,34 @@ export default function CourtMapView({
     if (pos1) trail1.push(pos1);
     if (pos2) trail2.push(pos2);
   }
+
+  // Ball height trail for the side/elevation view
+  const ballHeights = useMemo(() => {
+    const results: { ny: number; h: number; interpolated: boolean }[] = [];
+    if (!calibration || !videoAspect || videoAspect <= 0) return results;
+    for (let i = trailStart; i <= frameIdx; i++) {
+      const f = frames[i];
+      if (!f?.ball_img_pos) continue;
+      const est = estimateBallWorldPosition(f, calibration, videoAspect, courtCorners);
+      if (!est) continue;
+      const ny = H
+        ? Math.max(0, Math.min(1, applyHomography(H, f.ball_img_pos[0], f.ball_img_pos[1])[1]))
+        : 0.5;
+      results.push({ ny, h: est.height, interpolated: !!f.ball_interpolated });
+    }
+    return results;
+  }, [frames, trailStart, frameIdx, calibration, videoAspect, courtCorners, H]);
+
+  // Current frame ball height + court-ny for the side view dot
+  const currentBallSide = useMemo(() => {
+    if (!frame?.ball_img_pos || !calibration || !videoAspect || videoAspect <= 0) return null;
+    const est = estimateBallWorldPosition(frame, calibration, videoAspect, courtCorners);
+    if (!est) return null;
+    const ny = H
+      ? Math.max(0, Math.min(1, applyHomography(H, frame.ball_img_pos[0], frame.ball_img_pos[1])[1]))
+      : 0.5;
+    return { ny, h: est.height, interpolated: !!frame.ball_interpolated };
+  }, [frame, calibration, videoAspect, courtCorners, H]);
 
   // SVG dimensions (portrait court)
   const svgW = 180;
@@ -165,6 +202,28 @@ export default function CourtMapView({
       >
         {/* Court surface */}
         <rect x={pad} y={pad} width={cW} height={cH} fill="#1a3d6e" rx={2} />
+
+        {/* Half-court shading: subtle fill for each half to aid spatial orientation */}
+        {(() => {
+          const [, sy_net] = toSvg(0, NET_Y_NORM);
+          return (
+            <>
+              {/* Far half (top) – slightly lighter */}
+              <rect x={pad} y={pad} width={cW} height={sy_net - pad}
+                fill="#1e4a80" rx={1} opacity={0.5} />
+              {/* Near half (bottom) – baseline shade */}
+              <rect x={pad} y={sy_net} width={cW} height={pad + cH - sy_net}
+                fill="#152f55" rx={1} opacity={0.5} />
+              {/* Zone labels */}
+              <text x={pad + cW / 2} y={pad + (sy_net - pad) / 2 + 3}
+                textAnchor="middle" fontSize={8} fill="#7eb3e8" opacity={0.65}
+                fontFamily="monospace">FAR HALF</text>
+              <text x={pad + cW / 2} y={sy_net + (pad + cH - sy_net) / 2 + 3}
+                textAnchor="middle" fontSize={8} fill="#7eb3e8" opacity={0.65}
+                fontFamily="monospace">NEAR HALF</text>
+            </>
+          );
+        })()}
 
         {/* Court lines */}
         {COURT_SVG_LINES.map(([x1, y1, x2, y2], i) => {
@@ -284,6 +343,138 @@ export default function CourtMapView({
           );
         })()}
       </svg>
+
+      {/* ── Side / Elevation View ───────────────────────────────────── */}
+      {(() => {
+        const sW = svgW;
+        const sH = 150;
+        const sPL = 28; // left (y-axis labels)
+        const sPR = 6;
+        const sPT = 6;
+        const sPB = 18; // bottom (x-axis labels)
+        const sCW = sW - sPL - sPR;
+        const sCH = sH - sPT - sPB;
+
+        const toSX = (ny: number) => sPL + ny * sCW;
+        const toSY = (h: number) => sPT + (1 - h / SIDE_MAX_H) * sCH;
+
+        const netX = toSX(NET_Y_NORM);
+        const atkNearX = toSX(NET_Y_NORM + ATTACK_NORM);
+        const atkFarX  = toSX(NET_Y_NORM - ATTACK_NORM);
+        const netLineY = toSY(NET_HEIGHT_M);
+        const groundY  = toSY(0);
+        const heightMarks = [1, 2, 3, 4, 5];
+
+        const hasBall = ballHeights.length > 0 || currentBallSide !== null;
+
+        return (
+          <>
+            <div style={{ textAlign: "center", fontSize: 11, color: "#7eb3e8",
+              fontFamily: "monospace", marginTop: 6, marginBottom: 2 }}>
+              SIDE VIEW
+            </div>
+            <svg width={sW} height={sH} viewBox={`0 0 ${sW} ${sH}`}
+              style={{ display: "block", margin: "0 auto" }}>
+
+              {/* Background halves */}
+              <rect x={sPL} y={sPT} width={netX - sPL} height={sCH} fill="#1e4a80" rx={1} opacity={0.9} />
+              <rect x={netX} y={sPT} width={sPL + sCW - netX} height={sCH} fill="#152f55" rx={1} opacity={0.9} />
+
+              {/* Height grid lines */}
+              {heightMarks.map(m => {
+                const gy = toSY(m);
+                const isNetH = m === Math.round(NET_HEIGHT_M);
+                return (
+                  <g key={m}>
+                    <line x1={sPL} y1={gy} x2={sPL + sCW} y2={gy}
+                      stroke={isNetH ? "#f59e0b" : "#2a5080"}
+                      strokeWidth={isNetH ? 1 : 0.75}
+                      strokeDasharray={isNetH ? "5 3" : "3 4"}
+                      opacity={isNetH ? 0.75 : 0.5} />
+                    <text x={sPL - 3} y={gy + 3} textAnchor="end"
+                      fontSize={7} fill="#8ab0d8" fontFamily="monospace">{m}m</text>
+                  </g>
+                );
+              })}
+
+              {/* Ground / border */}
+              <rect x={sPL} y={sPT} width={sCW} height={sCH}
+                fill="none" stroke="#3a6090" strokeWidth={1} />
+
+              {/* Attack zone lines */}
+              <line x1={atkFarX} y1={sPT} x2={atkFarX} y2={groundY}
+                stroke="#facc15" strokeWidth={1} strokeDasharray="4 3" opacity={0.7} />
+              <line x1={atkNearX} y1={sPT} x2={atkNearX} y2={groundY}
+                stroke="#facc15" strokeWidth={1} strokeDasharray="4 3" opacity={0.7} />
+
+              {/* Net height indicator line */}
+              <line x1={sPL} y1={netLineY} x2={sPL + sCW} y2={netLineY}
+                stroke="#f59e0b" strokeWidth={1.5} strokeDasharray="6 3" opacity={0.85} />
+              <text x={sPL + sCW + 2} y={netLineY + 3} fontSize={7}
+                fill="#f59e0b" fontFamily="monospace">{NET_HEIGHT_M}m</text>
+
+              {/* Net post (vertical bar from ground to net height) */}
+              <line x1={netX} y1={groundY} x2={netX} y2={netLineY}
+                stroke="#e0e0e0" strokeWidth={3} opacity={0.9}
+                strokeLinecap="round" />
+              {/* Net top (thin wire above the post) */}
+              <line x1={netX - sCW * 0.45} y1={netLineY}
+                    x2={netX + sCW * 0.45} y2={netLineY}
+                stroke="#e0e0e0" strokeWidth={1} opacity={0.5}
+                strokeDasharray="2 3" />
+
+              {/* Ball height trail */}
+              {ballHeights.map(({ ny, h, interpolated }, i) => {
+                const alpha = ((i + 1) / ballHeights.length) * 0.65;
+                const r = 2.5 + (i / Math.max(1, ballHeights.length - 1)) * 2;
+                return (
+                  <circle key={i}
+                    cx={toSX(ny)} cy={toSY(h)} r={r}
+                    fill={interpolated ? "#aaa" : "#ffe082"}
+                    opacity={alpha} />
+                );
+              })}
+
+              {/* Current ball dot */}
+              {currentBallSide && (() => {
+                const { ny, h, interpolated } = currentBallSide;
+                const cx = toSX(ny);
+                const cy = toSY(h);
+                const aboveNet = h >= NET_HEIGHT_M;
+                return (
+                  <g>
+                    {/* Vertical stem to ground */}
+                    <line x1={cx} y1={groundY} x2={cx} y2={cy}
+                      stroke={aboveNet ? "#4fc3f7" : "#ff7043"}
+                      strokeWidth={1} strokeDasharray="2 2" opacity={0.5} />
+                    <circle cx={cx} cy={cy} r={8}
+                      fill={interpolated ? "#ccc" : (aboveNet ? "#ffe082" : "#ff8a65")}
+                      stroke={aboveNet ? "#ffb300" : "#e64a19"}
+                      strokeWidth={1.5}
+                      strokeDasharray={interpolated ? "3 2" : undefined}
+                      opacity={0.95} />
+                    <text x={cx} y={cy + 3} textAnchor="middle"
+                      fontSize={7} fontWeight="bold" fill="#333">B</text>
+                  </g>
+                );
+              })()}
+
+              {/* No-calibration placeholder */}
+              {!hasBall && !calibration && (
+                <text x={sPL + sCW / 2} y={sPT + sCH / 2 + 4}
+                  textAnchor="middle" fontSize={8} fill="#4a6a90"
+                  fontFamily="monospace">calibrate camera for height</text>
+              )}
+
+              {/* X-axis labels */}
+              <text x={sPL + 4} y={sH - 3} fontSize={7} fill="#7eb3e8" fontFamily="monospace">FAR</text>
+              <text x={netX} y={sH - 3} textAnchor="middle" fontSize={7} fill="#ccc" fontFamily="monospace">NET</text>
+              <text x={sPL + sCW - 4} y={sH - 3} textAnchor="end" fontSize={7} fill="#7eb3e8" fontFamily="monospace">NEAR</text>
+            </svg>
+          </>
+        );
+      })()}
+
       <div className="court-map-legend">
         <span className="legend-p1">Team 1</span>
         <span className="legend-p2">Team 2</span>

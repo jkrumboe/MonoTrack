@@ -316,6 +316,13 @@ async fn stop_analysis(state: State<'_, AnalyzerProcess>) -> Result<String, Stri
     Ok("Analysis stopped".to_string())
 }
 
+/// Write `content` to the file at `path`. Used by the frontend export helpers
+/// because Tauri's WebView does not support the `<a download>` blob-URL trick.
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path, e))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -328,7 +335,7 @@ pub fn run() {
             stdin: Mutex::new(None),
             stdout: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![start_analysis, stop_analysis, detect_court])
+        .invoke_handler(tauri::generate_handler![start_analysis, stop_analysis, detect_court, write_text_file])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

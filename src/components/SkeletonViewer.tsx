@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
 import { estimateBallWorldPosition } from "../utils/ballReconstruction";
+import type { TrajectoryMode } from "../utils/ballReconstruction";
 import type { CalibrationResult } from "../utils/cameraSolver";
 
 // FIVB volleyball court dimensions (metres)
@@ -32,6 +33,12 @@ interface SkeletonViewerProps {
   isRealVideo?: boolean;
   overlayVideoAspect?: number;
   resetViewTrigger?: number;
+  /** Raw bbox-depth 3D positions shown as a grey debug point cloud. */
+  rawBboxPoints?: ReadonlyArray<[number, number, number]>;
+  /** Active trajectory mode — controls fallback behaviour in the 3D viewer. */
+  trajectoryMode?: TrajectoryMode;
+  /** Rejected physics-reprojection arcs, grouped by arc. Rendered as red line segments. */
+  rejectedArcSegments?: ReadonlyArray<ReadonlyArray<[number, number, number]>>;
 }
 
 export default function SkeletonViewer({
@@ -43,6 +50,9 @@ export default function SkeletonViewer({
   courtData,
   overlayVideoAspect,
   resetViewTrigger,
+  rawBboxPoints,
+  trajectoryMode,
+  rejectedArcSegments,
 }: SkeletonViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayModeRef = useRef(overlay);
@@ -56,7 +66,9 @@ export default function SkeletonViewer({
     ballMesh: THREE.Mesh;
     ballShadow: THREE.Mesh;
     ballStem: THREE.Line;
-    ballTrail: THREE.Line;
+    ballTrail: THREE.LineSegments;
+    rejectedArcTrail: THREE.LineSegments;
+    rawBboxCloud: THREE.Points;
   } | null>(null);
   const lastRenderSizeRef = useRef({ w: 0, h: 0, aspect: 0 });
 
@@ -138,15 +150,31 @@ export default function SkeletonViewer({
     ballStem.visible = false;
     scene.add(ballStem);
 
-    const ballTrail = new THREE.Line(
+    const ballTrail = new THREE.LineSegments(
       new THREE.BufferGeometry().setFromPoints([]),
       new THREE.LineBasicMaterial({ color: 0xffca28, transparent: true, opacity: 0.65 }),
     );
     scene.add(ballTrail);
 
+    // Rejected physics-reprojection arcs (red line segments)
+    const rejectedArcTrail = new THREE.LineSegments(
+      new THREE.BufferGeometry().setFromPoints([]),
+      new THREE.LineBasicMaterial({ color: 0xff3333, transparent: true, opacity: 0.65 }),
+    );
+    scene.add(rejectedArcTrail);
+
+    // Raw bbox-depth debug point cloud (grey, behind the fitted trajectory)
+    const rawBboxCloud = new THREE.Points(
+      new THREE.BufferGeometry(),
+      new THREE.PointsMaterial({ color: 0x888888, size: 0.12, sizeAttenuation: true, transparent: true, opacity: 0.55 }),
+    );
+    rawBboxCloud.visible = false;
+    scene.add(rawBboxCloud);
+
     sceneRef.current = {
       scene, camera, renderer, controls, courtGroup,
-      ballMesh, ballShadow, ballStem, ballTrail,
+      ballMesh, ballShadow, ballStem, ballTrail, rejectedArcTrail,
+      rawBboxCloud,
     };
 
     // Animation loop
@@ -276,9 +304,9 @@ export default function SkeletonViewer({
       controls.target.set(...calibration.lookAt);
       camera.lookAt(new THREE.Vector3(...calibration.lookAt));
     } else {
-      // In side-by-side mode, keep the calibrated viewing direction while
-      // still allowing manual orbit around that target.
-      controls.target.set(...calibration.lookAt);
+      // In side-by-side mode, orbit around the court centre, not the camera's
+      // look-at point (which is typically off-centre for telephoto cameras).
+      controls.target.set(0, 1, 0);
       controls.enableDamping = false;
       controls.update();
       controls.enableDamping = true;
@@ -294,7 +322,11 @@ export default function SkeletonViewer({
       camera.position.set(...calibration.position);
       camera.fov = calibration.fov;
       camera.updateProjectionMatrix();
-      controls.target.set(...calibration.lookAt);
+      if (overlay) {
+        controls.target.set(...calibration.lookAt);
+      } else {
+        controls.target.set(0, 1, 0);
+      }
     } else {
       camera.position.set(0, 15, 20);
       camera.fov = 60;
@@ -324,11 +356,26 @@ export default function SkeletonViewer({
       }
       return best.corners;
     };
-    const pts: Array<{ frame: number; x: number; y: number; z: number; gx: number; gz: number }> = [];
+    const pts: Array<{ frame: number; x: number; y: number; z: number; gx: number; gz: number; method: string }> = [];
     for (let i = start; i <= idx; i++) {
-      const estimate = estimateBallWorldPosition(frames[i], calibration, aspect, nearestCorners(i));
+      const f = frames[i];
+      if (!f) continue;
+      // Prefer physics-solver 3D position when available
+      if (f.ball_3d_pos) {
+        const [bx, by, bz] = f.ball_3d_pos;
+        if (inRenderableCourtVolume(bx, by, bz)) {
+          pts.push({ frame: i, x: bx, y: by, z: bz, gx: bx, gz: bz, method: f.ball_3d_method ?? "unknown" });
+          continue;
+        }
+      }
+      // In physics-reprojection mode, never fall back to per-frame estimation.
+      // Frames not covered by the arc solver are intentionally absent from the trail.
+      if (trajectoryMode === "physics-reprojection") continue;
+      const estimate = estimateBallWorldPosition(f, calibration, aspect, nearestCorners(i));
       if (!estimate) continue;
       if (!inRenderableCourtVolume(estimate.position[0], estimate.position[1], estimate.position[2])) continue;
+      // Skip ground-intersection results — they produce impossible z values for airborne balls.
+      if (estimate.method === "ground-intersection") continue;
       pts.push({
         frame: i,
         x: estimate.position[0],
@@ -336,10 +383,11 @@ export default function SkeletonViewer({
         z: estimate.position[2],
         gx: estimate.ground[0],
         gz: estimate.ground[2],
+        method: estimate.method,
       });
     }
     return pts;
-  }, [calibration, frames, currentFrame, videoAspect, overlayVideoAspect, courtData]);
+  }, [calibration, frames, currentFrame, videoAspect, overlayVideoAspect, courtData, trajectoryMode]);
 
   useEffect(() => {
     const sceneState = sceneRef.current;
@@ -350,7 +398,8 @@ export default function SkeletonViewer({
       ballMesh.visible = false;
       ballShadow.visible = false;
       ballStem.visible = false;
-      ballTrail.geometry.setFromPoints([]);
+      ballTrail.geometry.dispose();
+      ballTrail.geometry = new THREE.BufferGeometry();
       return;
     }
 
@@ -362,18 +411,68 @@ export default function SkeletonViewer({
     ballShadow.position.set(cur.gx, 0.005, cur.gz);
 
     ballStem.visible = true;
-    ballStem.geometry.setFromPoints([
+    ballStem.geometry.dispose();
+    ballStem.geometry = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(cur.gx, 0.01, cur.gz),
       new THREE.Vector3(cur.x, cur.y, cur.z),
     ]);
 
-    if (ballTrajectory.length > 1) {
-      const points = ballTrajectory.map((p) => new THREE.Vector3(p.x, p.y, p.z));
-      ballTrail.geometry.setFromPoints(points);
-    } else {
-      ballTrail.geometry.setFromPoints([]);
+    ballTrail.geometry.dispose();
+    // Build segment pairs — skip across frame gaps > 2, 3D jumps > 2 m, or method changes
+    const segPoints: THREE.Vector3[] = [];
+    for (let i = 1; i < ballTrajectory.length; i++) {
+      const prev = ballTrajectory[i - 1];
+      const curr = ballTrajectory[i];
+      const frameDiff = curr.frame - prev.frame;
+      const dist = Math.hypot(curr.x - prev.x, curr.y - prev.y, curr.z - prev.z);
+      if (frameDiff <= 3 && dist <= 2 && prev.method === curr.method) {
+        segPoints.push(new THREE.Vector3(prev.x, prev.y, prev.z));
+        segPoints.push(new THREE.Vector3(curr.x, curr.y, curr.z));
+      }
     }
+    ballTrail.geometry = new THREE.BufferGeometry().setFromPoints(segPoints);
   }, [ballTrajectory]);
+
+  // Raw bbox-depth debug cloud
+  useEffect(() => {
+    if (!sceneRef.current) return;
+    const { rawBboxCloud } = sceneRef.current;
+    if (!rawBboxPoints || rawBboxPoints.length === 0) {
+      rawBboxCloud.visible = false;
+      return;
+    }
+    const buf = new Float32Array(rawBboxPoints.length * 3);
+    rawBboxPoints.forEach(([x, y, z], i) => {
+      buf[i * 3]     = x;
+      buf[i * 3 + 1] = y;
+      buf[i * 3 + 2] = z;
+    });
+    rawBboxCloud.geometry.dispose();
+    rawBboxCloud.geometry = new THREE.BufferGeometry();
+    rawBboxCloud.geometry.setAttribute("position", new THREE.BufferAttribute(buf, 3));
+    rawBboxCloud.visible = true;
+  }, [rawBboxPoints]);
+
+  // Rejected physics-reprojection arcs (red line segments, no cross-arc connections)
+  useEffect(() => {
+    if (!sceneRef.current) return;
+    const { rejectedArcTrail } = sceneRef.current;
+    rejectedArcTrail.geometry.dispose();
+    if (!rejectedArcSegments || rejectedArcSegments.length === 0) {
+      rejectedArcTrail.geometry = new THREE.BufferGeometry().setFromPoints([]);
+      return;
+    }
+    const segPoints: THREE.Vector3[] = [];
+    for (const arcPts of rejectedArcSegments) {
+      for (let i = 1; i < arcPts.length; i++) {
+        const [px, py, pz] = arcPts[i - 1];
+        const [cx, cy, cz] = arcPts[i];
+        segPoints.push(new THREE.Vector3(px, py, pz));
+        segPoints.push(new THREE.Vector3(cx, cy, cz));
+      }
+    }
+    rejectedArcTrail.geometry = new THREE.BufferGeometry().setFromPoints(segPoints);
+  }, [rejectedArcSegments]);
 
   return <div ref={containerRef} style={{ width: "100%", height: "100%", minHeight: 400 }} />;
 }
