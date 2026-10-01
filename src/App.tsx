@@ -15,7 +15,7 @@ import PlaybackControls from "./components/PlaybackControls";
 import PlayerTrackingOverlay from "./components/PlayerTrackingOverlay";
 import BallDebugView from "./components/BallDebugView";
 import DepthFilterView from "./components/DepthFilterView";
-import { solveBallTrajectories, type BallFrameDebug, type PhysicsReprojectionDebug, type TrajectoryMode } from "./utils/ballReconstruction";
+import { solveBallTrajectories, type BallFrameDebug, type BallTouch, type PhysicsReprojectionDebug, type TrajectoryMode } from "./utils/ballReconstruction";
 import type { FrameData, BallReconstructionMethod } from "./hooks/useAnalysis";
 import "./App.css";
 
@@ -60,40 +60,72 @@ function projectKeypointsFromCalibration(
   });
 }
 
-/** Export the solved 3D ball trajectory as a JSON file download. */
-async function exportBallTrajectory(exportFrames: FrameData[]): Promise<void> {
-  const rows = exportFrames
-    .filter((f) => f.ball_3d_pos != null)
-    .map((f) => ({
-      frame: f.frame,
-      timestamp: f.timestamp,
-      x: f.ball_3d_pos![0],
-      y: f.ball_3d_pos![1],
-      z: f.ball_3d_pos![2],
-      method: f.ball_3d_method ?? null,
-      conf: f.ball_conf ?? null,
-      interpolated: f.ball_interpolated ?? false,
-    }));
-  const json = JSON.stringify(rows, null, 2);
-  const path = await save({
-    defaultPath: "ball_trajectory.json",
-    filters: [{ name: "JSON", extensions: ["json"] }],
-  });
-  if (path) {
-    await invoke("write_text_file", { path, content: json });
-  }
-}
+/** Overlay showing manual ball-centre correction markers on the video pane. */
+function BallCorrectionOverlay({
+  videoEl,
+  containerEl,
+  corrections,
+  currentFrame,
+}: Readonly<{
+  videoEl: HTMLVideoElement;
+  containerEl: HTMLDivElement;
+  corrections: Map<number, [number, number]>;
+  currentFrame: number;
+}>) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-/** Export all per-frame reconstruction debug records as a JSON file download. */
-async function exportDebugJSON(records: BallFrameDebug[]): Promise<void> {
-  const json = JSON.stringify(records, null, 2);
-  const path = await save({
-    defaultPath: "ball_reconstruction_debug.json",
-    filters: [{ name: "JSON", extensions: ["json"] }],
-  });
-  if (path) {
-    await invoke("write_text_file", { path, content: json });
-  }
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const cw = containerEl.clientWidth;
+    const ch = containerEl.clientHeight;
+    canvas.width = cw;
+    canvas.height = ch;
+    ctx.clearRect(0, 0, cw, ch);
+
+    const vw = videoEl.videoWidth || 1;
+    const vh = videoEl.videoHeight || 1;
+    const videoAR = vw / vh;
+    const containerAR = cw / ch;
+    let renderW: number, renderH: number, offsetX: number, offsetY: number;
+    if (videoAR > containerAR) {
+      renderW = cw; renderH = cw / videoAR; offsetX = 0; offsetY = (ch - renderH) / 2;
+    } else {
+      renderH = ch; renderW = ch * videoAR; offsetX = (cw - renderW) / 2; offsetY = 0;
+    }
+
+    for (const [frame, [nx, ny]] of corrections) {
+      const px = offsetX + nx * renderW;
+      const py = offsetY + ny * renderH;
+      const isCurrent = frame === currentFrame;
+      ctx.beginPath();
+      ctx.arc(px, py, 7, 0, Math.PI * 2);
+      ctx.strokeStyle = isCurrent ? "#00ff88" : "#ffff00";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // Crosshair
+      const S = 10;
+      ctx.beginPath();
+      ctx.moveTo(px - S, py); ctx.lineTo(px + S, py);
+      ctx.moveTo(px, py - S); ctx.lineTo(px, py + S);
+      ctx.strokeStyle = isCurrent ? "#00ff88" : "#ffff00";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // Frame label
+      ctx.fillStyle = isCurrent ? "#00ff88" : "#ffff00";
+      ctx.font = "10px monospace";
+      ctx.fillText(`f${frame}`, px + 9, py - 5);
+    }
+  }, [videoEl, containerEl, corrections, currentFrame]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+    />
+  );
 }
 
 function App() {
@@ -112,6 +144,8 @@ function App() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [videoPath, setVideoPath] = useState("");
+  /** Surfaces failures from the file dialog, which otherwise fail silently. */
+  const [openError, setOpenError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("side-by-side");
   const [sidebarTab, setSidebarTab] = useState<"stats" | "court" | "ball-debug" | "depth">("stats");
   const [_videoDuration, setVideoDuration] = useState<number | null>(null);
@@ -128,13 +162,23 @@ function App() {
   const [ball3dDebug, setBall3dDebug] = useState<BallFrameDebug[]>([]);
   /** Physics-reprojection diagnostic (only populated in physics-reprojection mode). */
   const [physicsDebug, setPhysicsDebug] = useState<PhysicsReprojectionDebug[] | undefined>(undefined);
+  /** Player touches (serve, reception, set, ...) placed by the rally solver. */
+  const [ballTouches, setBallTouches] = useState<BallTouch[]>([]);
   /** True when physics-reprojection mode ran but produced zero fitted arcs. */
   const [physicsFailedWarning, setPhysicsFailedWarning] = useState(false);
   // ── Solver option state ──────────────────────────────────────────────────
-  const [trajectoryMode, setTrajectoryMode] = useState<TrajectoryMode>("physics-reprojection");
-  const [useCalibrationFov, setUseCalibrationFov] = useState(true);
-  const [manualFovYDeg, setManualFovYDeg] = useState(30);
+  // Fixed: physics reprojection is the only mode that can place the ball in
+  // depth from a single camera, so it is no longer user-selectable.
+  const trajectoryMode: TrajectoryMode = "physics-reprojection";
+  // The solved calibration always supplies the FoV; there is no manual override
+  // now that the calibration is reliable.
+  const useCalibrationFov = true;
+  const manualFovYDeg = 30;
   const [minBallConfidence, setMinBallConfidence] = useState(0.6);
+  /** Manual 2D correction mode — clicking the video sets ball centre for current frame. */
+  const [correctionMode, setCorrectionMode] = useState(false);
+  /** Map<frameIndex, [normX, normY]> — user-overridden ball centre positions. */
+  const [manualBallCorrections, setManualBallCorrections] = useState<Map<number, [number, number]>>(new Map());
   const [calibrationViewTransform, setCalibrationViewTransform] = useState({ zoom: 1, panX: 0, panY: 0 });
   const [overlayEl, setOverlayEl] = useState<HTMLDivElement | null>(null);
   const [splitVideoEl, setSplitVideoEl] = useState<HTMLDivElement | null>(null);
@@ -146,40 +190,23 @@ function App() {
   const dragStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const playIntervalRef = useRef<number | null>(null);
-  const prevCalibrationRef = useRef<CalibrationResult | null>(null);
   const lastCalibratedCourtFrameRef = useRef<number | null>(null);
 
   /** Smooth a new calibration against the previous one to prevent 3D camera jumps. */
-  const smoothCalibration = useCallback((newCal: CalibrationResult): CalibrationResult => {
-    const prev = prevCalibrationRef.current;
-    if (!prev) {
-      prevCalibrationRef.current = newCal;
-      return newCal;
-    }
-    const a = 0.35; // blend factor toward new value
-    const lerp = (p: number, n: number) => p + a * (n - p);
-    const smoothed: CalibrationResult = {
-      position: [
-        lerp(prev.position[0], newCal.position[0]),
-        lerp(prev.position[1], newCal.position[1]),
-        lerp(prev.position[2], newCal.position[2]),
-      ],
-      lookAt: [
-        lerp(prev.lookAt[0], newCal.lookAt[0]),
-        lerp(prev.lookAt[1], newCal.lookAt[1]),
-        lerp(prev.lookAt[2], newCal.lookAt[2]),
-      ],
-      fov: lerp(prev.fov, newCal.fov),
-    };
-    prevCalibrationRef.current = smoothed;
-    return smoothed;
-  }, []);
-
   const isRealVideo = videoPath !== "" && videoPath !== "demo.mp4";
   const videoAspect = useMemo(() => {
     if (!videoSize.width || !videoSize.height) return undefined;
     return videoSize.width / videoSize.height;
   }, [videoSize]);
+
+  /** Frames with manual ball-centre corrections applied (passed to the solver). */
+  const framesForSolver = useMemo(() => {
+    if (manualBallCorrections.size === 0) return frames;
+    return frames.map((f) => {
+      const corr = manualBallCorrections.get(f.frame);
+      return corr ? { ...f, ball_img_pos: corr } : f;
+    });
+  }, [frames, manualBallCorrections]);
 
   /**
    * After analysis completes and camera calibration is available, run the
@@ -196,18 +223,20 @@ function App() {
     useCalibrationFov,
     manualFovYDeg,
     minBallConfidence,
-  }), [videoSize, trajectoryMode, useCalibrationFov, manualFovYDeg, minBallConfidence]);
+  }), [videoSize, minBallConfidence]);
 
   useEffect(() => {
     if (status !== "complete" || !calibration || !videoAspect || frames.length === 0) return;
     const handle = setTimeout(() => {
-      const { positions, methods, stats, debugRecords, physicsDebug: pd } = solveBallTrajectories(
-        frames, calibration, videoAspect, solverOptions,
+      const { positions, methods, stats, debugRecords, physicsDebug: pd, touches,
+ } = solveBallTrajectories(
+        framesForSolver, calibration, videoAspect, solverOptions,
       );
       setBall3dMap(positions);
       setBall3dMethods(methods);
       setBall3dDebug(debugRecords);
       setPhysicsDebug(pd);
+      setBallTouches(touches ?? []);
 
       // Warn when physics mode produced zero fitted arcs despite having detections.
       if (solverOptions.trajectoryMode === "physics-reprojection") {
@@ -244,23 +273,22 @@ function App() {
       }
     }, 0);
     return () => clearTimeout(handle);
-  }, [status, calibration, videoAspect, frames, solverOptions]);
+  }, [status, calibration, videoAspect, framesForSolver, solverOptions]);
 
   /** Frames augmented with physics-solver 3D positions and methods where available. */
   const solvedFrames = useMemo<FrameData[]>(() => {
-    // In physics-reprojection mode, ONLY physics positions are valid.
-    // If the solver produced no positions (arc fitting failed), clear all stale
-    // ball_3d_pos so the export reflects the failure rather than old bbox-depth data.
-    if (trajectoryMode === "physics-reprojection") {
+    // In physics-reprojection / short-arc-debug mode, ONLY arc-fitted positions are valid.
+    // Rejected or unfitted arcs must not bleed stale bbox-depth positions into the output.
+    if (trajectoryMode === "physics-reprojection" || trajectoryMode === "short-arc-debug") {
       if (ball3dMap.size === 0) {
-        // Physics solver ran but found nothing — return frames with all 3D positions cleared.
+        // Solver ran but found nothing — return frames with all 3D positions cleared.
         return frames.map((f) => ({ ...f, ball_3d_pos: undefined, ball_3d_method: undefined }));
       }
       return frames.map((f) => {
         const pos = ball3dMap.get(f.frame);
         const method = ball3dMethods.get(f.frame);
         if (pos) return { ...f, ball_3d_pos: pos, ball_3d_method: method };
-        // Frame not covered by physics — clear any stale position.
+        // Frame not covered by accepted arc — clear any stale position.
         return { ...f, ball_3d_pos: undefined, ball_3d_method: undefined };
       });
     }
@@ -273,25 +301,6 @@ function App() {
     });
   }, [frames, ball3dMap, ball3dMethods, trajectoryMode]);
 
-  /** Raw bbox-depth 3D positions for debug cloud in SkeletonViewer. */
-  const rawBboxPoints = useMemo<ReadonlyArray<[number, number, number]>>(
-    () => ball3dDebug.flatMap((d) => (d.worldPositionRaw ? [d.worldPositionRaw] : [])),
-    [ball3dDebug],
-  );
-
-  /** Rejected physics-reprojection arcs grouped by arcId, for red trail in SkeletonViewer. */
-  const rejectedArcSegments = useMemo<ReadonlyArray<ReadonlyArray<[number, number, number]>>>(() => {
-    if (!physicsDebug) return [];
-    const arcMap = new Map<number, [number, number, number][]>();
-    for (const rec of physicsDebug) {
-      if (rec.arcAccepted !== false) continue;
-      if (rec.fittedX == null || rec.fittedY == null || rec.fittedZ == null) continue;
-      const id = rec.arcId ?? -1;
-      if (!arcMap.has(id)) arcMap.set(id, []);
-      arcMap.get(id)!.push([rec.fittedX, rec.fittedY, rec.fittedZ]);
-    }
-    return [...arcMap.values()];
-  }, [physicsDebug]);
 
   useEffect(() => {
     if (!splitVideoEl) {
@@ -373,9 +382,14 @@ function App() {
     const aspectRatio = video.videoWidth / video.videoHeight;
     const { result: cal } = solveCameraIterative(ndcPoints, aspectRatio);
     if (cal) {
-      setCalibration(smoothCalibration(cal));
+      // No temporal smoothing. The court is a single consensus detection for
+      // the whole clip, so there is nothing to smooth across — and lerping
+      // position, lookAt and fov independently does not interpolate a camera
+      // pose, it produces one that satisfies none of them. That was turning an
+      // exact solve into a ~300 px reprojection error.
+      setCalibration(cal);
     }
-  }, [getCornersForFrame, smoothCalibration, manualCalibrationLocked]);
+  }, [getCornersForFrame, manualCalibrationLocked]);
 
   // Store a reference to the video element when it mounts
   const handleVideoElement = useCallback((el: HTMLVideoElement | null) => {
@@ -409,7 +423,6 @@ function App() {
 
       const doCalibrate = () => {
         if (!cancelled) {
-          prevCalibrationRef.current = null;
           lastCalibratedCourtFrameRef.current = null;
           updateCalibrationForFrame(0);
         }
@@ -443,7 +456,6 @@ function App() {
 
   // Reset calibration, zoom, and ball solver state when video changes
   useEffect(() => {
-    prevCalibrationRef.current = null;
     lastCalibratedCourtFrameRef.current = null;
     setCalibration(null);
     setManualCalibrationLocked(false);
@@ -453,6 +465,8 @@ function App() {
     setBall3dMap(new Map());
     setBall3dMethods(new Map());
     setBall3dDebug([]);
+    setManualBallCorrections(new Map());
+    setCorrectionMode(false);
   }, [videoPath]);
 
   // Wheel zoom on video pane (non-passive so we can preventDefault)
@@ -515,15 +529,103 @@ function App() {
     }
   }, [showCalibration]);
 
-  const handleSelectVideo = useCallback(async () => {
-    const selected = await open({
-      multiple: false,
-      filters: [{ name: "Video", extensions: ["mp4", "avi", "mov", "mkv"] }],
+  /** Handle click on the video pane in correction mode: record ball centre. */
+  const handleVideoPaneClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!correctionMode) return;
+    const videoEl = videoElRef.current;
+    if (!videoEl) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+    const cw = rect.width;
+    const ch = rect.height;
+    const vw = videoEl.videoWidth || 1;
+    const vh = videoEl.videoHeight || 1;
+    // Compute object-fit:contain letterbox rect
+    const videoAR = vw / vh;
+    const containerAR = cw / ch;
+    let displayW: number, displayH: number, offsetX: number, offsetY: number;
+    if (containerAR > videoAR) {
+      displayH = ch; displayW = ch * videoAR;
+      offsetX = (cw - displayW) / 2; offsetY = 0;
+    } else {
+      displayW = cw; displayH = cw / videoAR;
+      offsetX = 0; offsetY = (ch - displayH) / 2;
+    }
+    const nx = (clickX - offsetX) / displayW;
+    const ny = (clickY - offsetY) / displayH;
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return; // clicked letterbox
+    setManualBallCorrections((prev) => {
+      const next = new Map(prev);
+      next.set(currentFrame, [nx, ny]);
+      return next;
     });
+  }, [correctionMode, currentFrame]);
 
-    if (selected) {
-      setVideoPath(selected as string);
-      startAnalysis(selected as string);
+  /** Calibration log: project court keypoints through camera and measure reprojection error. */
+  const calibrationLog = useMemo(() => {
+    if (!calibration || !videoSize.width || !videoSize.height) return null;
+    const effectiveFovY = useCalibrationFov ? calibration.fov : manualFovYDeg;
+    const vw = videoSize.width;
+    const vh = videoSize.height;
+    const aspect = vw / vh;
+    const cam = new THREE.PerspectiveCamera(effectiveFovY, aspect, 0.1, 500);
+    cam.position.set(...calibration.position);
+    cam.lookAt(new THREE.Vector3(...calibration.lookAt));
+    cam.updateMatrixWorld();
+    cam.updateProjectionMatrix();
+
+    const detectedKps = currentCourtEntry?.keypoints ?? null;
+    const errors: number[] = [];
+    if (detectedKps) {
+      for (let i = 0; i < COURT_KEYPOINTS_3D.length; i++) {
+        const kp2d = detectedKps[i];
+        if (!kp2d) continue;
+        const [wx, wy, wz] = COURT_KEYPOINTS_3D[i];
+        const proj = new THREE.Vector3(wx, wy, wz).project(cam);
+        const projNx = (proj.x + 1) / 2;
+        const projNy = (1 - proj.y) / 2;
+        const dx = (projNx - kp2d[0]) * vw;
+        const dy = (projNy - kp2d[1]) * vh;
+        errors.push(Math.hypot(dx, dy));
+      }
+    }
+    const avgKpErr = errors.length > 0 ? errors.reduce((s, e) => s + e, 0) / errors.length : null;
+    const maxKpErr = errors.length > 0 ? Math.max(...errors) : null;
+    return {
+      fovY: effectiveFovY,
+      position: calibration.position,
+      lookAt: calibration.lookAt,
+      courtKpErrors: errors,
+      avgKpErr,
+      maxKpErr,
+    };
+  }, [calibration, videoSize, useCalibrationFov, manualFovYDeg, currentCourtEntry]);
+
+  const handleSelectVideo = useCallback(async () => {
+    setOpenError(null);
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "Video", extensions: ["mp4", "avi", "mov", "mkv"] }],
+      });
+
+      if (selected) {
+        setVideoPath(selected as string);
+        startAnalysis(selected as string);
+      }
+    } catch (e) {
+      // The dialog plugin only exists inside the Tauri runtime. Opened in a
+      // plain browser (`npm run dev` alone) this rejects and the button would
+      // otherwise appear to do nothing at all.
+      console.error("Failed to open video picker:", e);
+      const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+      setOpenError(
+        inTauri
+          ? `Could not open the file picker: ${String(e)}`
+          : "The file picker needs the desktop app. Start it with `npm run tauri dev` " +
+            "instead of opening the Vite URL in a browser."
+      );
     }
   }, [startAnalysis]);
 
@@ -655,6 +757,13 @@ function App() {
           </div>
         )}
 
+        {openError && (
+          <div className="error-panel">
+            <h2>Cannot Open Video</h2>
+            <p className="error-message">{openError}</p>
+          </div>
+        )}
+
         {status === "error" && (
           <div className="error-panel">
             <h2>Analysis Error</h2>
@@ -700,11 +809,12 @@ function App() {
                     ref={setSplitVideoEl}
                     style={{
                       overflow: "hidden",
-                      cursor: !showCalibration && videoZoomTransform.zoom > 1 ? "grab" : undefined,
+                      cursor: correctionMode ? "crosshair" : (!showCalibration && videoZoomTransform.zoom > 1 ? "grab" : undefined),
                     }}
                     onMouseMove={handleVideoDragMove}
                     onMouseUp={handleVideoDragEnd}
                     onMouseLeave={handleVideoDragEnd}
+                    onClick={handleVideoPaneClick}
                   >
                     <div
                       ref={setVideoZoomEl}
@@ -742,6 +852,15 @@ function App() {
                           containerEl={videoZoomEl}
                         />
                       )}
+                      {/* ── Manual ball correction overlay ──────────── */}
+                      {correctionMode && videoElRef.current && videoZoomEl && (
+                        <BallCorrectionOverlay
+                          videoEl={videoElRef.current}
+                          containerEl={videoZoomEl}
+                          corrections={manualBallCorrections}
+                          currentFrame={currentFrame}
+                        />
+                      )}
                       {showCalibration && splitVideoSize.width > 0 && splitVideoSize.height > 0 && (
                         <CourtCalibration
                           width={splitVideoSize.width}
@@ -752,7 +871,6 @@ function App() {
                           onViewTransformChange={setCalibrationViewTransform}
                           onCalibrated={(cal) => {
                             setCalibration(cal);
-                            prevCalibrationRef.current = cal;
                             setManualCalibrationLocked(true);
                             setShowCalibration(false);
                           }}
@@ -770,9 +888,8 @@ function App() {
                       courtData={courtData}
                       isRealVideo={isRealVideo}
                       resetViewTrigger={resetViewTrigger}
-                      rawBboxPoints={rawBboxPoints}
                       trajectoryMode={trajectoryMode}
-                      rejectedArcSegments={rejectedArcSegments}
+                      touches={ballTouches}
                     />
                     <button
                       className="reset-view-btn"
@@ -809,9 +926,8 @@ function App() {
                       courtData={courtData}
                       isRealVideo={isRealVideo}
                       overlayVideoAspect={videoAspect}
-                      rawBboxPoints={rawBboxPoints}
                       trajectoryMode={trajectoryMode}
-                      rejectedArcSegments={rejectedArcSegments}
+                      touches={ballTouches}
                     />
                   </div>
                   {currentKeypoints && (
@@ -877,44 +993,12 @@ function App() {
                 <>
                   {/* ── Solver controls ──────────────────────────────── */}
                   <div className="ball-solver-controls">
-                    <div className="control-row">
-                      <label htmlFor="traj-mode-select">Trajectory mode</label>
-                      <select
-                        id="traj-mode-select"
-                        value={trajectoryMode}
-                        onChange={(e) => setTrajectoryMode(e.target.value as TrajectoryMode)}
-                      >
-                        <option value="raw-bbox-depth">Raw bbox-depth</option>
-                        <option value="smoothed-bbox-depth">Smoothed bbox-depth</option>
-                        <option value="physics-reprojection">Physics reprojection</option>
-                      </select>
-                    </div>
-                    <div className="control-row">
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={useCalibrationFov}
-                          onChange={(e) => setUseCalibrationFov(e.target.checked)}
-                        />
-                        {" "}Use calibration FoV{calibration ? ` (${calibration.fov.toFixed(1)}°)` : ""}
-                      </label>
-                    </div>
-                    {!useCalibrationFov && (
-                      <div className="control-row fov-row">
-                        <label htmlFor="fov-range">Manual FoV: {manualFovYDeg.toFixed(1)}°</label>
-                        <input
-                          id="fov-range"
-                          type="range" min={3} max={90} step={0.5}
-                          value={manualFovYDeg}
-                          onChange={(e) => setManualFovYDeg(Number(e.target.value))}
-                        />
-                        <div className="fov-presets">
-                          {[8.78, 15, 30, 45, 60].map((p) => (
-                            <button key={p} onClick={() => setManualFovYDeg(p)}>{p}°</button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
+                    {/* One reconstruction path: fit a ballistic arc whose 2D
+                        reprojection matches the tracked ball. The bbox-depth
+                        modes are kept in the solver for diagnostics but are not
+                        offered here — apparent ball size is too noisy at this
+                        range to place the ball in depth, so exposing them only
+                        invited picking a mode that cannot work. */}
                     <div className="control-row">
                       <label htmlFor="conf-range">
                         Min confidence: {minBallConfidence.toFixed(2)}
@@ -926,7 +1010,80 @@ function App() {
                         onChange={(e) => setMinBallConfidence(Number(e.target.value))}
                       />
                     </div>
+                    {/* ── Manual 2D correction mode ─────────────────── */}
+                    <div className="control-row">
+                      <button
+                        className={`btn ${correctionMode ? "btn-danger" : "btn-secondary"}`}
+                        style={{ fontSize: 12 }}
+                        onClick={() => setCorrectionMode((v) => !v)}
+                      >
+                        {correctionMode ? "Exit Correction Mode" : "Manual Ball Correction"}
+                      </button>
+                      {correctionMode && (
+                        <span style={{ fontSize: 11, color: "#aaa", marginLeft: 6 }}>
+                          Click video to set ball centre for frame {currentFrame}
+                        </span>
+                      )}
+                    </div>
+                    {manualBallCorrections.size > 0 && (
+                      <div className="control-row" style={{ flexWrap: "wrap", gap: 4 }}>
+                        <span style={{ fontSize: 11, color: "#ccc" }}>
+                          {manualBallCorrections.size} correction(s)
+                        </span>
+                        <button
+                          className="btn btn-secondary"
+                          style={{ fontSize: 11, padding: "2px 6px" }}
+                          onClick={() => {
+                            setManualBallCorrections((prev) => {
+                              const next = new Map(prev);
+                              next.delete(currentFrame);
+                              return next;
+                            });
+                          }}
+                        >Clear this frame</button>
+                        <button
+                          className="btn btn-secondary"
+                          style={{ fontSize: 11, padding: "2px 6px" }}
+                          onClick={() => setManualBallCorrections(new Map())}
+                        >Clear all</button>
+                      </div>
+                    )}
                   </div>
+                  {/* ── Calibration log ──────────────────────────────── */}
+                  {calibrationLog && (
+                    <div className="calibration-log">
+                      <div className="calibration-log-title">Calibration</div>
+                      <div className="calibration-log-row">
+                        <span>FoV Y</span>
+                        <span>{calibrationLog.fovY.toFixed(2)}°</span>
+                      </div>
+                      <div className="calibration-log-row">
+                        <span>Camera pos</span>
+                        <span>[{calibrationLog.position.map((v) => v.toFixed(2)).join(", ")}]</span>
+                      </div>
+                      <div className="calibration-log-row">
+                        <span>LookAt</span>
+                        <span>[{calibrationLog.lookAt.map((v) => v.toFixed(2)).join(", ")}]</span>
+                      </div>
+                      {calibrationLog.avgKpErr != null && (
+                        <div className="calibration-log-row">
+                          <span>Court kp err</span>
+                          <span>avg {calibrationLog.avgKpErr.toFixed(1)} px / max {calibrationLog.maxKpErr?.toFixed(1)} px ({calibrationLog.courtKpErrors.length} pts)</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {/* A planar court calibrates to a few px when the detected
+                      corners are right. Tens of px means the court itself is
+                      wrong, and every 3D position downstream inherits that. */}
+                  {calibrationLog?.avgKpErr != null && calibrationLog.avgKpErr > 25 && (
+                    <div className="physics-failed-warning">
+                      ⚠ Court calibration is unreliable ({calibrationLog.avgKpErr.toFixed(0)} px error).
+                      The auto-detected court does not match a real camera, so 3D ball
+                      positions cannot be trusted. Fix the court corners with{" "}
+                      <strong>Align Court</strong> and re-check.
+                    </div>
+                  )}
                   {physicsFailedWarning && (
                     <div className="physics-failed-warning">
                       ⚠ Physics reprojection failed — no arc could be fitted from the detected ball positions.
@@ -943,34 +1100,58 @@ function App() {
                     videoAspect={videoAspect}
                     ball3dDebug={ball3dDebug}
                   />
-                  {ball3dMap.size > 0 && (
+                  {(ball3dMap.size > 0 || (physicsDebug && physicsDebug.length > 0)) && (
                     <div className="trajectory-export">
+                      {/* One export. Previously five overlapping files that had
+                          to be cross-referenced by hand; this is a single
+                          document containing calibration, the solved
+                          trajectory, per-frame records and every arc. */}
                       <button
                         className="btn btn-secondary"
-                        onClick={() => exportBallTrajectory(solvedFrames)}
+                        onClick={() => {
+                          const report = {
+                            generatedAt: new Date().toISOString(),
+                            video: { path: videoPath, width: videoSize.width, height: videoSize.height },
+                            calibration: calibrationLog
+                              ? {
+                                  fovY: calibrationLog.fovY,
+                                  position: calibrationLog.position,
+                                  lookAt: calibrationLog.lookAt,
+                                  courtKeypointErrorPx: {
+                                    avg: calibrationLog.avgKpErr,
+                                    max: calibrationLog.maxKpErr,
+                                    perPoint: calibrationLog.courtKpErrors,
+                                  },
+                                  trustworthy: (calibrationLog.avgKpErr ?? 0) <= 25,
+                                }
+                              : null,
+                            detection: {
+                              framesAnalysed: frames.length,
+                              detected: frames.filter((f) => f.ball_img_pos && !f.ball_interpolated).length,
+                              interpolated: frames.filter((f) => f.ball_interpolated).length,
+                              solved3d: ball3dMap.size,
+                            },
+                            trajectory: solvedFrames.map((f) => ({
+                              frame: f.frame,
+                              timestamp: f.timestamp,
+                              imagePos: f.ball_img_pos,
+                              interpolated: f.ball_interpolated ?? false,
+                              conf: f.ball_conf,
+                              pos3d: f.ball_3d_pos,
+                              method: f.ball_3d_method,
+                            })),
+                            perFrameDebug: ball3dDebug,
+                            arcs: physicsDebug ?? [],
+                          };
+                          const json = JSON.stringify(report, null, 2);
+                          void save({
+                            defaultPath: "ball_debug_report.json",
+                            filters: [{ name: "JSON", extensions: ["json"] }],
+                          }).then((path) => path ? invoke("write_text_file", { path, content: json }) : undefined);
+                        }}
                       >
-                        Export Trajectory JSON ({ball3dMap.size} frames)
+                        Export Debug Report ({ball3dMap.size} solved / {ball3dDebug.length} records)
                       </button>
-                      <button
-                        className="btn btn-secondary"
-                        onClick={() => exportDebugJSON(ball3dDebug)}
-                        style={{ marginTop: 4 }}
-                      >
-                        Export Debug JSON ({ball3dDebug.length} records)
-                      </button>
-                      {physicsDebug && physicsDebug.length > 0 && (
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() => {
-                            const json = JSON.stringify(physicsDebug, null, 2);
-                            void save({ defaultPath: "physics_reprojection_debug.json", filters: [{ name: "JSON", extensions: ["json"] }] })
-                              .then((path) => path ? invoke("write_text_file", { path, content: json }) : undefined);
-                          }}
-                          style={{ marginTop: 4 }}
-                        >
-                          Export Physics Debug JSON ({physicsDebug.length} records)
-                        </button>
-                      )}
                     </div>
                   )}
                 </>

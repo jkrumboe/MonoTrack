@@ -34,6 +34,16 @@ export interface FrameData {
   /** Normalised [x1,y1,x2,y2] bounding box from YOLO (absent when interpolated). */
   ball_bbox?: [number, number, number, number];
   /**
+   * Apparent ball diameter (px) measured from the ball's colour in the frame.
+   * TrackNet only; absent when interpolated or the ball could not be segmented.
+   */
+  ball_diameter_px?: number;
+  /**
+   * Person boxes near the ball, normalised [x1, y1, x2, y2, conf]. Used to
+   * anchor each touch to the player who made it. Detected frames only.
+   */
+  players_near_ball?: number[][];
+  /**
    * Relative depth at ball centre from Depth Anything V2 [0,1] (0=near, 1=far).
    * Present only for YOLO-detected (non-interpolated) frames when the depth model is available.
    */

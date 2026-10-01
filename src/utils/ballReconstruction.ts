@@ -20,7 +20,8 @@ export type DiameterMode = "width" | "height" | "min-side" | "max-side" | "avera
 export type TrajectoryMode =
   | "raw-bbox-depth"        // per-frame, raw apparent-size depth
   | "smoothed-bbox-depth"   // per-frame, median-smoothed bbox diameter
-  | "physics-reprojection"; // ballistic arc fit minimising 2D reprojection error
+  | "physics-reprojection"  // ballistic arc fit minimising 2D reprojection error
+  | "short-arc-debug";      // single arc over a manually selected frame range
 
 export interface BallReconstructionOptions {
   /** Real-world ball diameter in metres. Default: 0.21 (FIVB volleyball). */
@@ -71,6 +72,22 @@ export interface BallReconstructionOptions {
    * depth / arc fitting. Default: 0.6.
    */
   minBallConfidence?: number;
+  /**
+   * First frame index (inclusive) to use in short-arc-debug mode.
+   * Only detections with frame >= arcStartFrame are used for arc fitting.
+   */
+  arcStartFrame?: number;
+  /**
+   * Last frame index (inclusive) to use in short-arc-debug mode.
+   * Only detections with frame <= arcEndFrame are used for arc fitting.
+   */
+  arcEndFrame?: number;
+  /**
+   * When true, zeros out the bbox-depth soft prior in the arc solver so the
+   * reprojection objective is driven purely by 2D observations.
+   * Default: false.
+   */
+  disableBboxDepthPrior?: boolean;
 }
 
 export interface ReconstructionStats {
@@ -188,8 +205,22 @@ export interface BallTrajectoryResult {
   stats: ReconstructionStats;
   /** Per-frame debug records for all detected (non-interpolated) ball frames. */
   debugRecords: BallFrameDebug[];
-  /** Physics-reprojection mode diagnostic (only present when trajectoryMode = "physics-reprojection"). */
+  /** Physics-reprojection / short-arc-debug mode diagnostic. */
   physicsDebug?: PhysicsReprojectionDebug[];
+  /** Whether the single arc fitted in short-arc-debug mode was accepted. */
+  shortArcAccepted?: boolean;
+  /** Rejection reason for the short-arc-debug arc, or null when accepted. */
+  shortArcRejectReason?: string | null;
+  /** Player touches found by the rally solver (physics-reprojection mode). */
+  touches?: BallTouch[];
+}
+
+/** One touch of the ball in a rally, as placed by the rally solver. */
+export interface BallTouch {
+  frame: number;
+  position: [number, number, number];
+  /** "toss" | "serve" | "reception" | "set" | "attack" | "block" | "touch". */
+  label: string;
 }
 
 export interface BallWorldEstimate {
@@ -519,8 +550,26 @@ const MAX_FRAME_GAP = 3;
 const MAX_2D_JUMP_NDC = 0.3;
 /** Split when bbox camera-ray depth changes by more than this fraction. */
 const MAX_DEPTH_CHANGE_FRAC = 0.3;
-/** Weight of the soft camera-depth prior in the arc solver objective. */
-const DEPTH_PRIOR_WEIGHT = 2e-3;
+/**
+ * Weight of the soft camera-depth prior (from apparent ball size) in the arc
+ * solver objective.
+ *
+ * Disabled. On broadcast footage the ball spans ~25 px under a ~9 deg FoV, so
+ * depth-from-apparent-size carries noise of the same order as the signal and
+ * drags the fit far off the true arc. Gravity already supplies the metric
+ * scale that makes a ballistic arc observable from 2D reprojection alone.
+ * Measured over 8 noise seeds against a known ground-truth arc, mean 3D error:
+ *
+ *   weight   dense    noisy    sparse
+ *   2e-3     3.18m    7.19m    3.78m
+ *   5e-4     2.17m    3.49m    2.18m
+ *   1e-4     0.97m    1.39m    1.04m
+ *   0        0.35m    1.59m    0.66m   <- selected
+ *
+ * The bbox depth is still used to seed the initial guess, where its noise is
+ * harmless because the multi-seed fit refines from there.
+ */
+const DEPTH_PRIOR_WEIGHT = 0;
 /** Pixel error threshold for iterative outlier rejection. */
 const OUTLIER_ERR_PX = 30;
 /** Minimum inlier observations after outlier rejection to attempt fitting. */
@@ -537,6 +586,16 @@ const MIN_FIT_Y_M = -0.1;
 const MAX_FIT_Y_M = 6.0;
 /** Z-axis soft bound: >20% of points outside this triggers rejection. */
 const COURT_Z_SOFT_M = 11;
+
+// ── Short-arc-debug mode: stricter validation bounds ─────────────────────────
+/** Hard X bound for short-arc-debug mode (m). */
+const SAD_MAX_X_M = 6;
+/** Hard Z bound for short-arc-debug mode (m). */
+const SAD_MAX_Z_M = 11;
+/** Maximum average reprojection error for short-arc-debug acceptance (px). */
+const SAD_MAX_AVG_ERR_PX = 20;
+/** Maximum single-frame reprojection error for short-arc-debug acceptance (px). */
+const SAD_MAX_MAX_ERR_PX = 40;
 /** Z-axis hard bound: any single point outside this triggers rejection. */
 const COURT_Z_HARD_M = 14;
 
@@ -743,7 +802,7 @@ function splitIntoArcs(obs: ArcObs[]): ArcObs[][] {
  * Stricter arc splitter for the physics-reprojection path.
  * Splits on time gap, arc duration, frame-index gap, 2D NDC jump, or depth discontinuity.
  */
-function splitArcsEx(obs: ArcObsEx[]): ArcObsEx[][] {
+function splitArcsEx(obs: ArcObsEx[], videoWidth?: number, videoHeight?: number): ArcObsEx[][] {
   if (obs.length === 0) return [];
   const arcs: ArcObsEx[][] = [];
   let arc: ArcObsEx[] = [obs[0]];
@@ -772,7 +831,785 @@ function splitArcsEx(obs: ArcObsEx[]): ArcObsEx[][] {
     }
   }
   arcs.push(arc);
-  return arcs;
+  if (videoWidth == null || videoHeight == null) return arcs;
+  return arcs.flatMap((a) => splitAtTouches(a, videoWidth, videoHeight));
+}
+
+/** Least-squares fit of y = c0 + c1·t + c2·t², returning [c0, c1, c2]. */
+function _fitQuadratic(ts: number[], ys: number[]): [number, number, number] {
+  // Normal equations on the 3×3 moment matrix, solved by Cramer's rule.
+  let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, b0 = 0, b1 = 0, b2 = 0;
+  for (let i = 0; i < ts.length; i++) {
+    const t = ts[i], t2 = t * t;
+    s0 += 1; s1 += t; s2 += t2; s3 += t2 * t; s4 += t2 * t2;
+    b0 += ys[i]; b1 += ys[i] * t; b2 += ys[i] * t2;
+  }
+  const det3 = (m: number[]) =>
+    m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+  const A = [s0, s1, s2, s1, s2, s3, s2, s3, s4];
+  const D = det3(A);
+  if (Math.abs(D) < 1e-12) return [ys[0], 0, 0];
+  return [
+    det3([b0, s1, s2, b1, s2, s3, b2, s3, s4]) / D,
+    det3([s0, b0, s2, s1, b1, s3, s2, b2, s4]) / D,
+    det3([s0, s1, b0, s1, s2, b1, s2, s3, b2]) / D,
+  ];
+}
+
+/** Image-space deviation (px) that marks a player touch. */
+const TOUCH_SPLIT_PX = 10;
+/** Observations a segment needs before touch detection can split it. */
+const TOUCH_MIN_SEG = 5;
+
+/**
+ * Split a continuous ball track at player touches.
+ *
+ * Between touches the ball is in free flight, and under a broadcast lens its
+ * image path is very nearly a parabola in time. A touch (dig, set, attack)
+ * breaks that: the next positions leave the parabola fitted to the points so
+ * far. Without this, a whole rally becomes one "arc" that no single ballistic
+ * trajectory can explain, so the solver rejects it. Two consecutive points
+ * must both deviate, so a single noisy detection does not cut an arc.
+ */
+function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number): ArcObsEx[][] {
+  if (obs.length < 2 * TOUCH_MIN_SEG) return [obs];
+  const hw = videoWidth / 2, hh = videoHeight / 2;
+  const out: ArcObsEx[][] = [];
+  let start = 0;
+  let i = start + TOUCH_MIN_SEG;
+  while (i < obs.length - 1) {
+    const seg = obs.slice(start, i);
+    const t0 = seg[0].t;
+    const ts = seg.map((o) => o.t - t0);
+    const cu = _fitQuadratic(ts, seg.map((o) => o.u));
+    const cv = _fitQuadratic(ts, seg.map((o) => o.v));
+    const devPx = (o: ArcObsEx) => {
+      const t = o.t - t0;
+      return Math.hypot(
+        (cu[0] + cu[1] * t + cu[2] * t * t - o.u) * hw,
+        (cv[0] + cv[1] * t + cv[2] * t * t - o.v) * hh,
+      );
+    };
+    if (devPx(obs[i]) > TOUCH_SPLIT_PX && devPx(obs[i + 1]) > TOUCH_SPLIT_PX) {
+      out.push(obs.slice(start, i));
+      start = i;
+      i = start + TOUCH_MIN_SEG;
+    } else {
+      i++;
+    }
+  }
+  out.push(obs.slice(start));
+  return out;
+}
+
+// ─── Rally solver: connected ballistic segments ──────────────────────────────
+//
+// Fitting each segment between touches on its own leaves its depth almost
+// unobservable: from a camera behind the baseline, depth runs along the court,
+// and a short arc has too little visible gravity drop to fix the scale. The
+// result was arcs flying off at 100+ m/s or sitting 12 m behind a baseline.
+//
+// A rally is one continuous ball path: between touches it is in free flight,
+// and at each touch the path is continuous in position (only the velocity
+// jumps). So the whole rally is parameterised by the ball's 3D position at
+// each touch ("knots"); a segment's trajectory is the unique ballistic arc
+// joining its two knots in the time between them. Long, well-curved segments
+// pin the depth of their knots, and continuity carries that to the short ones.
+// A split where there was no real touch costs nothing: the knot simply lands
+// on the arc.
+
+/** Max seconds between segments for them to belong to the same rally. */
+const RALLY_MAX_GAP_S = 0.5;
+/** Touches happen at player height. Soft bound on knot height (m). */
+const KNOT_MIN_Y_M = 0;
+const KNOT_MAX_Y_M = 4.5;
+/** Soft bounds on where the ball can be (m): court plus free zone. */
+const RALLY_MAX_ABS_X_M = COURT_HALF_W + 5;
+const RALLY_MAX_ABS_Z_M = COURT_HALF_L + 8;
+/** Speeds above this (m/s) are penalised; a hard men's jump serve is ~30 m/s. */
+const RALLY_SOFT_MAX_SPEED_MPS = 30;
+/** Residual px per m/s of velocity change at a knot (see touch impulse prior). */
+const TOUCH_IMPULSE_WEIGHT = 0.3;
+/**
+ * Residual px per unit of log-depth error for the apparent-size prior. Size is
+ * measured to roughly ±15% per frame, so this makes a typical size error cost
+ * about as much as a 3 px reprojection error.
+ */
+const SIZE_DEPTH_WEIGHT = 10;
+/** |log depth error| beyond which a size measurement is discarded (~35%). */
+const SIZE_DEPTH_OUTLIER = 0.3;
+/**
+ * Bounds on each segment's effective downward acceleration (m/s²). Pure
+ * gravity is wrong for a volleyball: topspin on a jump serve or spike adds
+ * Magnus force and can roughly double the drop, and a float serve sags under
+ * drag. Forcing exactly g made the solver explain a spinning serve's extra
+ * curvature as "closer to the camera", pulling it onto the wrong side of the
+ * net. Within these bounds curvature no longer overrides the size cue.
+ */
+const ACCEL_MIN = 0.8 * GRAVITY;
+const ACCEL_MAX = 2.2 * GRAVITY;
+/**
+ * Weight of a touch point's own image position (per px). Below 1 because in a
+ * gap it comes from the analyzer's straight-line fill, which cuts the corner
+ * of the turn by a few px.
+ */
+const KNOT_IMAGE_WEIGHT = 0.4;
+/** Rejected segments up to this many samples between accepted ones are bridged. */
+const BRIDGE_MAX_FRAMES = 6;
+/** Scale (px) of the robust reprojection loss in the rally solver. */
+const ROBUST_REPROJ_PX = 5;
+/** Reprojection error (px) above which an observation is treated as an outlier. */
+const RALLY_OUTLIER_PX = 25;
+/** Per-segment acceptance limits. */
+// Median, not mean: TrackNet occasionally sits ~15 px off the ball for a few
+// frames (seen mid-set on broadcast footage), which says nothing about the arc.
+// Under a broadcast lens (f ~ 6600 px at 45-55 m) 10 px is ~7 cm at the ball.
+const SEG_MAX_MEDIAN_ERR_PX = 10;
+/** Share of a segment's samples that must lie within RALLY_OUTLIER_PX. */
+const SEG_MIN_INLIER_FRAC = 0.7;
+const SEG_MAX_Y_M = 10;
+
+/** Combined projection, precomputed for speed: world (x,y,z) -> NDC (u,v). */
+function _makeProjector(cam: THREE.PerspectiveCamera) {
+  const m = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse).elements;
+  return (x: number, y: number, z: number): [number, number] => {
+    const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+    return [(m[0] * x + m[4] * y + m[8] * z + m[12]) / w,
+            (m[1] * x + m[5] * y + m[9] * z + m[13]) / w];
+  };
+}
+
+/** Solve A·x = b by Gaussian elimination with partial pivoting. */
+function _solveLinear(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    if (Math.abs(M[piv][c]) < 1e-12) return null;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    for (let r = c + 1; r < n; r++) {
+      const f = M[r][c] / M[c][c];
+      if (f === 0) continue;
+      for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const x = new Array<number>(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = M[r][n];
+    for (let k = r + 1; k < n; k++) s -= M[r][k] * x[k];
+    x[r] = s / M[r][r];
+  }
+  return x;
+}
+
+/** Levenberg-Marquardt on a residual vector, numeric Jacobian. */
+function _levenbergMarquardt(p0: number[], residuals: (p: number[]) => number[], maxIter = 100): number[] {
+  let p = p0.slice();
+  let r = residuals(p);
+  let cost = r.reduce((s, v) => s + v * v, 0);
+  let lambda = 1e-2;
+  const m = p.length;
+  for (let iter = 0; iter < maxIter; iter++) {
+    const J: number[][] = [];
+    for (let j = 0; j < m; j++) {
+      const h = 1e-4;
+      const pj = p.slice();
+      pj[j] += h;
+      const rj = residuals(pj);
+      J.push(rj.map((v, i) => (v - r[i]) / h));
+    }
+    // Normal equations: (JᵀJ + λ·diag) δ = −Jᵀr
+    const JTJ = Array.from({ length: m }, () => new Array<number>(m).fill(0));
+    const JTr = new Array<number>(m).fill(0);
+    for (let a = 0; a < m; a++) {
+      for (let i = 0; i < r.length; i++) JTr[a] += J[a][i] * r[i];
+      for (let b = a; b < m; b++) {
+        let s = 0;
+        for (let i = 0; i < r.length; i++) s += J[a][i] * J[b][i];
+        JTJ[a][b] = s;
+        JTJ[b][a] = s;
+      }
+    }
+    let improved = false;
+    for (let tries = 0; tries < 10; tries++) {
+      const A = JTJ.map((row, a) => row.map((v, b) => (a === b ? v * (1 + lambda) + 1e-9 : v)));
+      const delta = _solveLinear(A, JTr.map((v) => -v));
+      if (!delta) { lambda *= 10; continue; }
+      const pn = p.map((v, k) => v + delta[k]);
+      const rn = residuals(pn);
+      const cn = rn.reduce((s, v) => s + v * v, 0);
+      if (cn < cost) {
+        const rel = (cost - cn) / Math.max(cost, 1e-12);
+        p = pn; r = rn; cost = cn;
+        lambda = Math.max(1e-7, lambda / 10);
+        improved = true;
+        if (rel < 1e-9) return p;
+        break;
+      }
+      lambda *= 10;
+    }
+    if (!improved) break;
+  }
+  return p;
+}
+
+interface RallySegmentResult {
+  obs: ArcObsEx[];
+  /** Knot times bounding this segment (s). */
+  tStart: number;
+  tEnd: number;
+  /** Position at time t (s, absolute), valid on [tStart, tEnd]. */
+  posAt: (t: number) => [number, number, number];
+  /** Launch speed (m/s) at tStart. */
+  speedMps: number;
+  accepted: boolean;
+  rejectReason: string | null;
+  errPx: number[];
+  outlier: boolean[];
+}
+
+/** Group touch-split segments into rallies (chains separated by short gaps). */
+function groupIntoRallies(segments: ArcObsEx[][]): ArcObsEx[][][] {
+  const rallies: ArcObsEx[][][] = [];
+  for (const seg of segments) {
+    if (seg.length === 0) continue;
+    const cur = rallies[rallies.length - 1];
+    const prevSeg = cur?.[cur.length - 1];
+    if (prevSeg && seg[0].t - prevSeg[prevSeg.length - 1].t <= RALLY_MAX_GAP_S) cur.push(seg);
+    else rallies.push([seg]);
+  }
+  return rallies;
+}
+
+// ─── Player anchors ──────────────────────────────────────────────────────────
+//
+// Every touch happens at a player, and a player's feet stand on the
+// calibrated floor, so the touching player fixes the knot's position on the
+// court - the one thing the ball alone cannot pin down from behind the
+// baseline. From this camera the ball overlaps far-side players in the image
+// almost all the time, so "ball inside a box" cannot say who touched it. Each
+// knot instead gets every plausible player as a candidate, and the solver is
+// pulled to the nearest one: ball size, gravity and continuity decide which.
+
+/** Normalised person box [x1, y1, x2, y2, conf] from the analyzer. */
+type PlayerBox = number[];
+/** A possible toucher's position on the court: [x, z]. */
+type TouchCandidate = [number, number];
+/** Frames either side searched for a player's lowest feet (take-off spot). */
+const PLAYER_TRACK_FRAMES = 10;
+/** Residual px per metre between a knot and its nearest candidate player. */
+const ANCHOR_WEIGHT = 12;
+/** Distance (m) beyond which the anchor pull stops growing (robust). */
+const ANCHOR_ROBUST_M = 3;
+/** Ball must clear the net tape by this much when it crosses (m). */
+const NET_CLEAR_M = 2.43 + 0.1;
+
+function _groundPointOf(cam: THREE.PerspectiveCamera, xn: number, yn: number): [number, number] | null {
+  const { origin, dir } = rayFromImagePos(cam, [xn, yn]);
+  if (dir.y > -1e-6) return null;
+  const t = -origin.y / dir.y;
+  return [origin.x + dir.x * t, origin.z + dir.z * t];
+}
+
+function _boxIou(a: PlayerBox, b: PlayerBox): number {
+  const ix = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+  const iy = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+  const inter = ix * iy;
+  const union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+/** Court positions of players who could have touched the ball at frame `fi`. */
+function touchCandidates(
+  fi: number,
+  ball: [number, number],
+  playersByFrame: Map<number, PlayerBox[]>,
+  cam: THREE.PerspectiveCamera,
+): TouchCandidate[] {
+  const boxes = playersByFrame.get(fi);
+  if (!boxes) return [];
+  const [bx, by] = ball;
+  const out: TouchCandidate[] = [];
+  for (const [x1, y1, x2, y2] of boxes) {
+    const w = x2 - x1, h = y2 - y1;
+    // Ball within reach: beside the body or above it (arms, jumps), never
+    // below the feet.
+    if (bx < x1 - 0.5 * w || bx > x2 + 0.5 * w) continue;
+    if (by < y1 - 0.8 * h || by > y2) continue;
+    // A jumping server or attacker has their feet off the floor, which would
+    // place them metres too deep. Use the lowest feet of the same player over
+    // nearby frames: the take-off spot. "Same player" must be followed frame
+    // to frame by overlap - from behind the baseline, far-side players and
+    // near-net players share image columns and sizes, so matching on column
+    // alone grabbed someone else's feet.
+    const cx = (x1 + x2) / 2;
+    let feetY = y2;
+    for (const step of [-1, 1]) {
+      let cur: PlayerBox = [x1, y1, x2, y2];
+      for (let d = step; Math.abs(d) <= PLAYER_TRACK_FRAMES; d += step) {
+        let next: PlayerBox | null = null;
+        let bestIou = 0.5;
+        for (const c of playersByFrame.get(fi + d) ?? []) {
+          const iou = _boxIou(cur, c);
+          if (iou > bestIou) { bestIou = iou; next = c; }
+        }
+        if (!next) break;
+        cur = next;
+        feetY = Math.max(feetY, cur[3]);
+      }
+    }
+    const g = _groundPointOf(cam, cx, feetY);
+    if (!g || Math.abs(g[0]) > RALLY_MAX_ABS_X_M || Math.abs(g[1]) > RALLY_MAX_ABS_Z_M) continue;
+    out.push(g);
+  }
+  return out;
+}
+
+/** Candidates for a touch between two consecutive observations. */
+function boundaryCandidates(
+  a: ArcObsEx,
+  b: ArcObsEx,
+  playersByFrame: Map<number, PlayerBox[]>,
+  cam: THREE.PerspectiveCamera,
+): TouchCandidate[] {
+  const toImg = (o: ArcObsEx): [number, number] => [(o.u + 1) / 2, (1 - o.v) / 2];
+  return [
+    ...touchCandidates(a.fi, toImg(a), playersByFrame, cam),
+    ...touchCandidates(b.fi, toImg(b), playersByFrame, cam),
+  ];
+}
+
+/**
+ * Minimum jump in image velocity (px/s) for a split to count as a touch.
+ * Measured on broadcast 1080p: real touches (serve contact, reception, set,
+ * attack) change it by ~950-1900 px/s; spurious splits from detection jitter,
+ * perspective or the slow top of a serve toss by ~70-420 px/s.
+ */
+const TOUCH_MIN_DV_PX_S = 500;
+
+/** Image velocity jump (px/s) at the boundary between two pieces of track. */
+function _velocityJumpPx(before: ArcObsEx[], after: ArcObsEx[], hw: number, hh: number): number {
+  const a = before.slice(-6), b = after.slice(0, 6);
+  if (a.length < 3 || b.length < 3) return Infinity; // too short to judge: keep
+  const tb = 0.5 * (a[a.length - 1].t + b[0].t);
+  // Local quadratic fits either side; perspective is smooth over ~0.2 s.
+  const velAt = (obs: ArcObsEx[]) => {
+    const ts = obs.map((o) => o.t - tb);
+    const cu = _fitQuadratic(ts, obs.map((o) => o.u));
+    const cv = _fitQuadratic(ts, obs.map((o) => o.v));
+    return [cu[1] * hw, cv[1] * hh]; // derivative at t = tb
+  };
+  const [ua, va] = velAt(a);
+  const [ub, vb] = velAt(b);
+  return Math.hypot(ub - ua, vb - va);
+}
+
+/**
+ * Drop touch splits that are not real touches. Each split adds a knot, and
+ * unexplained knots are what made the path wobble. A split is kept only if a
+ * player could have touched the ball there AND the path really changes: from
+ * this camera players overlap the ball in the image all the time, so a
+ * candidate alone would pin a ball still in flight to whoever is behind it.
+ */
+function mergeUntouchedSplits(
+  arcs: ArcObsEx[][],
+  playersByFrame: Map<number, PlayerBox[]>,
+  cam: THREE.PerspectiveCamera,
+  hw: number,
+  hh: number,
+): ArcObsEx[][] {
+  const out: ArcObsEx[][] = [];
+  for (const arc of arcs) {
+    const prev = out[out.length - 1];
+    if (prev && arc.length > 0) {
+      const last = prev[prev.length - 1];
+      const sameRally = arc[0].t - last.t <= RALLY_MAX_GAP_S;
+      if (sameRally && (
+        boundaryCandidates(last, arc[0], playersByFrame, cam).length === 0 ||
+        _velocityJumpPx(prev, arc, hw, hh) < TOUCH_MIN_DV_PX_S
+      )) {
+        out[out.length - 1] = [...prev, ...arc];
+        continue;
+      }
+    }
+    out.push(arc);
+  }
+  return out;
+}
+
+/** Where a touch must happen: on which side, and how far from the net (m). */
+interface KnotZone {
+  label: string;
+  /** +1 / -1: the half of the court (sign of z) the touch is on. */
+  side: number;
+  minAbsZ: number;
+  maxAbsZ: number;
+  /** Contact height range (m). */
+  minY: number;
+  maxY: number;
+  /**
+   * Effective downward acceleration (multiples of g) of the flight that this
+   * touch starts. Only serves and attacks carry heavy topspin; a toss, pass
+   * or set falls at about g, and letting those drop faster makes them short
+   * and flat instead of the high arcs they are.
+   */
+  minG: number;
+  maxG: number;
+}
+
+/** A player beyond this |z| (m) at the start of a rally is serving. */
+const SERVER_MIN_ABS_Z_M = COURT_HALF_L - 1;
+
+/**
+ * Volleyball rules for one rally: which touch is which, and where it can be.
+ *
+ * A rally that starts with a player behind a baseline is a serve, and then
+ * the order is fixed: toss and contact by the server, reception on the other
+ * side (in the back court - even a short serve lands 3-4 m from the net, the
+ * players at the net are blockers and the setter), set near the net on the
+ * same side, attack on that side (front or back row), then a block at the net
+ * by the serving team. Receptions and sets can both be overhead, so hand
+ * height is not used. Later touches are left free.
+ *
+ * These matter because the ball alone cannot say how deep it is from behind
+ * the baseline, and players overlap the ball in the image all the time: ball
+ * size is biased while the ball passes the crowd, and without the rules a
+ * serve gets "received" by whoever stands under it at the net.
+ *
+ * Returns one zone per knot (null = no rule) and filters `anchors` in place
+ * to the candidates that satisfy their zone.
+ */
+function applyRallyRules(anchors: TouchCandidate[][]): (KnotZone | null)[] {
+  const zones: (KnotZone | null)[] = anchors.map(() => null);
+  const servers = (anchors[0] ?? []).filter(([, z]) => Math.abs(z) >= SERVER_MIN_ABS_Z_M);
+  if (servers.length === 0) return zones;
+  const S = Math.sign(servers[0][1]);
+  const L = COURT_HALF_L;
+  const plan: KnotZone[] = [
+    // Heights: the toss leaves the hand at ~1-2.5 m; a jump serve, set and
+    // attack are struck above the head; a reception can be anything from a
+    // low dig to an overhead pass; a block is above the net tape.
+    { label: "toss",      side: S,  minAbsZ: L - 1, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 1.0, maxY: 2.6, minG: 0.9, maxG: 1.15 },
+    { label: "serve",     side: S,  minAbsZ: L - 2, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 2.4, maxY: 3.8, minG: 0.8, maxG: 2.2 },
+    { label: "reception", side: -S, minAbsZ: 2,     maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 0.2, maxY: 3.0, minG: 0.9, maxG: 1.15 },
+    { label: "set",       side: -S, minAbsZ: 0,     maxAbsZ: 4,   minY: 2.2, maxY: 3.4, minG: 0.9, maxG: 1.15 },
+    // Front-row attacks are hit ~0.5-1 m from the net. The attacker is
+    // often hidden behind the block (no player anchor), and from behind the
+    // baseline the set's end depth is nearly unobservable: on broadcast
+    // footage, ending it 1 m or 3 m from the net differed by ~3 px. This
+    // bound keeps the set travelling along the net to the hitter. Known
+    // limit: a back-row attack (contact ~2-3 m out) is drawn too close.
+    { label: "attack",    side: -S, minAbsZ: 0,     maxAbsZ: 1.0, minY: 2.9, maxY: 3.8, minG: 0.8, maxG: 2.2 },
+    { label: "block",     side: S,  minAbsZ: 0,     maxAbsZ: 1.5, minY: 2.4, maxY: 3.6, minG: 0.8, maxG: 1.5 },
+  ];
+  // The last knot is where the ball leaves view, not a touch.
+  for (let k = 0; k < Math.min(plan.length, anchors.length - 1); k++) {
+    const zone = plan[k];
+    zones[k] = zone;
+    const kept = anchors[k].filter(([, z]) => {
+      const into = zone.side * z;
+      return into >= zone.minAbsZ - 0.5 && into <= zone.maxAbsZ + 0.5;
+    });
+    // No candidate fits: the toucher was not detected (an attacker hidden
+    // behind the block, say). Use the zone alone rather than pull the knot
+    // to someone who cannot have played the ball.
+    anchors[k] = kept;
+  }
+  return zones;
+}
+
+/**
+ * Fit one rally as connected ballistic segments (see block comment above).
+ * Knot k is the ball position at time tau[k]; segment k runs from knot k to k+1.
+ */
+function solveRally(
+  segs: ArcObsEx[][],
+  cam: THREE.PerspectiveCamera,
+  videoWidth: number,
+  videoHeight: number,
+  /** Per knot (n+1 entries): court (x, z) of players who could have touched it. */
+  anchors: TouchCandidate[][] = [],
+  /** Per knot: volleyball-rule zone (side of the net, distance from it). */
+  zones: (KnotZone | null)[] = [],
+  /** Ball image position (NDC) at a time, incl. gap-filled frames, if known. */
+  imageAt: (t: number) => [number, number] | null = () => null,
+): RallySegmentResult[] {
+  const hw = videoWidth / 2, hh = videoHeight / 2;
+  const project = _makeProjector(cam);
+  const n = segs.length;
+
+  // Touch time = midway between the last sample of one segment and the first
+  // of the next; the rally starts/ends at its first/last sample.
+  const tau: number[] = [segs[0][0].t];
+  for (let k = 1; k < n; k++) tau.push(0.5 * (segs[k - 1][segs[k - 1].length - 1].t + segs[k][0].t));
+  const lastSeg = segs[n - 1];
+  tau.push(lastSeg[lastSeg.length - 1].t);
+  // A one-sample segment would have zero duration; give it a frame.
+  for (let k = 1; k <= n; k++) if (tau[k] - tau[k - 1] < 1e-3) tau[k] = tau[k - 1] + 1 / 30;
+
+  // Parameter layout: 3 per knot, then one effective downward acceleration
+  // per segment (see ACCEL_*), then the size log-scale when sizes exist.
+  const GK = 3 * (n + 1);
+  const segPos = (p: number[], k: number, t: number): [number, number, number] => {
+    const T = tau[k + 1] - tau[k];
+    const s = t - tau[k];
+    const [x0, y0, z0] = [p[3 * k], p[3 * k + 1], p[3 * k + 2]];
+    const [x1, y1, z1] = [p[3 * k + 3], p[3 * k + 4], p[3 * k + 5]];
+    // Ballistic arc through both knots: linear in x/z, plus gravity sag in y.
+    const a = s / T;
+    return [x0 + (x1 - x0) * a, y0 + (y1 - y0) * a + 0.5 * p[GK + k] * s * (T - s), z0 + (z1 - z0) * a];
+  };
+
+  const allObs = segs.flatMap((seg, k) => seg.map((o) => ({ o, k })));
+  const active = allObs.map(() => true);
+  const knotTargets = tau.map((t) => imageAt(t));
+  // Size-depth terms are rejected separately: a bad segmentation (ball merged
+  // with a yellow shirt, say) should not also throw away a good 2D position.
+  // Size fixes absolute depth; it is the only cue that does, since gravity's
+  // scale is unreliable for a spinning ball (see ACCEL_*).
+  const sizeActive = allObs.map(({ o }) => o.sizeDepth != null && o.sizeDepth > 0);
+  const hasSize = sizeActive.some(Boolean);
+  const camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+  const camDepthOf = (x: number, y: number, z: number) =>
+    (x - cam.position.x) * camFwd.x + (y - cam.position.y) * camFwd.y + (z - cam.position.z) * camFwd.z;
+  const sizeResidual = (p: number[], i: number): number | null => {
+    const { o, k } = allObs[i];
+    const [x, y, z] = segPos(p, k, o.t);
+    const d = camDepthOf(x, y, z);
+    if (!(d > 0.5)) return null;
+    return Math.log(d) - Math.log(o.sizeDepth!);
+  };
+
+  const residuals = (p: number[]): number[] => {
+    const r: number[] = [];
+    allObs.forEach(({ o, k }, i) => {
+      if (!active[i]) return;
+      const [x, y, z] = segPos(p, k, o.t);
+      const [pu, pv] = project(x, y, z);
+      const w = Math.sqrt(Math.max(0.1, o.conf));
+      const du = (pu - o.u) * hw, dv = (pv - o.v) * hh;
+      // Pseudo-Huber: quadratic up to ~ROBUST_REPROJ_PX, linear beyond. A
+      // messy stretch (a deflection off a block) has 20+ px errors, and with
+      // a plain square those few samples dominate the whole rally and drag
+      // well-anchored touches off their players.
+      const e = Math.hypot(du, dv);
+      const sc = e > 1e-9
+        ? Math.sqrt(2 * ROBUST_REPROJ_PX ** 2 * (Math.sqrt(1 + (e / ROBUST_REPROJ_PX) ** 2) - 1)) / e
+        : 1;
+      r.push(w * du * sc, w * dv * sc);
+    });
+    // Apparent-size depth prior (log depth, so it is scale-free).
+    if (hasSize) {
+      for (let i = 0; i < allObs.length; i++) {
+        if (!sizeActive[i]) continue;
+        const e = sizeResidual(p, i);
+        r.push(e == null ? SIZE_DEPTH_WEIGHT : SIZE_DEPTH_WEIGHT * e);
+      }
+    }
+    // Soft priors on the knots, in "pixels per metre of violation". They only
+    // bite outside the plausible region, so they select among depths that fit
+    // the image equally well rather than fighting the observations.
+    const PRIOR = 20;
+    for (let k = 0; k <= n; k++) {
+      const [x, y, z] = [p[3 * k], p[3 * k + 1], p[3 * k + 2]];
+      r.push(PRIOR * Math.max(0, KNOT_MIN_Y_M - y, y - KNOT_MAX_Y_M));
+      r.push(PRIOR * Math.max(0, Math.abs(x) - RALLY_MAX_ABS_X_M));
+      r.push(PRIOR * Math.max(0, Math.abs(z) - RALLY_MAX_ABS_Z_M));
+    }
+    // Effective gravity stays within what spin and drag can produce.
+    for (let k = 0; k < n; k++) {
+      const lo = zones[k] ? zones[k]!.minG * GRAVITY : ACCEL_MIN;
+      const hi = zones[k] ? zones[k]!.maxG * GRAVITY : ACCEL_MAX;
+      r.push(PRIOR * Math.max(0, lo - p[GK + k], p[GK + k] - hi));
+    }
+    // Speed prior. Depth along the viewing ray is the weakly observed
+    // direction, and without this the knots zig-zag in depth (z = 17, 5, 17...)
+    // with segments flying at 50-160 m/s, which still projects onto the image
+    // track. Nothing in volleyball moves faster than a hard jump serve.
+    for (let k = 0; k < n; k++) {
+      const T = tau[k + 1] - tau[k];
+      const vx = (p[3 * k + 3] - p[3 * k]) / T;
+      const vz = (p[3 * k + 5] - p[3 * k + 2]) / T;
+      const vyMid = (p[3 * k + 4] - p[3 * k + 1]) / T;
+      // Fastest point of the arc is one of its ends: vy = vyMid ± g·T/2.
+      const vEnd = Math.hypot(vx, Math.abs(vyMid) + 0.5 * p[GK + k] * T, vz);
+      r.push(PRIOR * Math.max(0, vEnd - RALLY_SOFT_MAX_SPEED_MPS));
+    }
+    // Touch impulse prior. Measured on broadcast footage, the reprojection
+    // error of a short (<0.4 s) segment changes by ~0.1 px across 30 m of
+    // depth: the image simply does not say where it is. A weak preference for
+    // small velocity changes at knots lets such segments follow their
+    // well-determined neighbours instead of zig-zagging, while a real touch
+    // (10-40 m/s of change) is still far cheaper than misfitting its samples.
+    for (let k = 1; k < n; k++) {
+      const Ta = tau[k] - tau[k - 1];
+      const Tb = tau[k + 1] - tau[k];
+      for (let c = 0; c < 3; c++) {
+        let vIn = (p[3 * k + c] - p[3 * (k - 1) + c]) / Ta;
+        let vOut = (p[3 * (k + 1) + c] - p[3 * k + c]) / Tb;
+        if (c === 1) { vIn -= 0.5 * p[GK + k - 1] * Ta; vOut += 0.5 * p[GK + k] * Tb; }
+        r.push(TOUCH_IMPULSE_WEIGHT * (vOut - vIn));
+      }
+    }
+    // Player anchors: pull each knot towards the nearest candidate toucher.
+    for (let k = 0; k <= n; k++) {
+      const cands = anchors[k] ?? [];
+      if (cands.length === 0) { r.push(0); continue; }
+      let d = Infinity;
+      for (const [ax, az] of cands) d = Math.min(d, Math.hypot(p[3 * k] - ax, p[3 * k + 2] - az));
+      r.push(ANCHOR_WEIGHT * d / Math.sqrt(1 + (d / ANCHOR_ROBUST_M) ** 2));
+    }
+    // Touch points must project onto the ball. A touch often falls in a short
+    // detection gap (the ball is hidden by the player playing it), and without
+    // this the two arcs meet wherever their extrapolations cross: at a set
+    // that was a 0.4 m dip below the net tape, 50 px off the ball.
+    for (let k = 0; k <= n; k++) {
+      const target = knotTargets[k];
+      if (!target) { r.push(0, 0); continue; }
+      const [pu, pv] = project(p[3 * k], p[3 * k + 1], p[3 * k + 2]);
+      r.push(KNOT_IMAGE_WEIGHT * (pu - target[0]) * hw, KNOT_IMAGE_WEIGHT * (pv - target[1]) * hh);
+    }
+    // Rule zones: the side of the net and distance from it for known touches.
+    for (let k = 0; k <= n; k++) {
+      const zone = zones[k];
+      if (!zone) { r.push(0, 0); continue; }
+      const into = zone.side * p[3 * k + 2];
+      const y = p[3 * k + 1];
+      r.push(PRIOR * Math.max(0, zone.minAbsZ - into, into - zone.maxAbsZ));
+      r.push(PRIOR * Math.max(0, zone.minY - y, y - zone.maxY));
+    }
+    // Net: a segment crossing the net plane between the antennae must clear it.
+    for (let k = 0; k < n; k++) {
+      const z0 = p[3 * k + 2], z1 = p[3 * k + 5];
+      let viol = 0;
+      if (z0 * z1 < 0) {
+        const tc = tau[k] + (z0 / (z0 - z1)) * (tau[k + 1] - tau[k]);
+        const [xc, yc] = segPos(p, k, tc);
+        if (Math.abs(xc) <= COURT_HALF_W + 0.5) viol = Math.max(0, NET_CLEAR_M - yc);
+      }
+      r.push(PRIOR * viol);
+    }
+    return r;
+  };
+
+  // Image position at each knot time, from the nearest sample.
+  const knotUV = tau.map((t) => {
+    let best = allObs[0].o;
+    for (const { o } of allObs) if (Math.abs(o.t - t) < Math.abs(best.t - t)) best = o;
+    return [best.u, best.v];
+  });
+  // Seed: every knot on its viewing ray at a common touch height. Several
+  // heights are tried because the depth along the ray is the unknown.
+  const seedAtHeight = (h: number): number[] => [...knotUV.flatMap(([u, v]) => {
+    const d = new THREE.Vector3(u, v, 0.5).unproject(cam).sub(cam.position).normalize();
+    let t = Math.abs(d.y) > 1e-6 ? (h - cam.position.y) / d.y : 50;
+    if (!(t > 0)) t = 50;
+    const p = cam.position.clone().addScaledVector(d, t);
+    // Keep the seed inside the playing area.
+    const s = Math.min(1, RALLY_MAX_ABS_Z_M / Math.max(1e-6, Math.abs(p.z)));
+    if (s < 1) p.copy(cam.position.clone().addScaledVector(d, t * s));
+    return [p.x, p.y, p.z];
+  }), ...new Array<number>(n).fill(GRAVITY)];
+
+  const cost = (p: number[]) => residuals(p).reduce((s, v) => s + v * v, 0);
+  let best: number[] | null = null;
+  let bestCost = Infinity;
+  // Anchored seed: each touch starts where its most likely player stands, on
+  // the knot's viewing ray. The anchor pull is capped (robust), so from a
+  // height seed metres away it is too weak to drag the knot across.
+  const anchoredSeed = (): number[] | null => {
+    if (!anchors.some((a) => a.length > 0)) return null;
+    const base = seedAtHeight(2.0);
+    knotUV.forEach(([u, v], k) => {
+      const cands = anchors[k] ?? [];
+      if (cands.length === 0) return;
+      const d = new THREE.Vector3(u, v, 0.5).unproject(cam).sub(cam.position).normalize();
+      // Candidate closest to the ray in the floor plane; the knot goes to the
+      // point of the ray above that player.
+      let bestP: THREE.Vector3 | null = null;
+      let bestD = Infinity;
+      for (const [ax, az] of cands) {
+        if (Math.abs(d.z) < 1e-6) continue;
+        const t = (az - cam.position.z) / d.z;
+        if (!(t > 0)) continue;
+        const q = cam.position.clone().addScaledVector(d, t);
+        const off = Math.abs(q.x - ax);
+        if (off < bestD) { bestD = off; bestP = q; }
+      }
+      if (bestP) {
+        base[3 * k] = bestP.x;
+        base[3 * k + 1] = Math.min(KNOT_MAX_Y_M, Math.max(0.2, bestP.y));
+        base[3 * k + 2] = bestP.z;
+      }
+    });
+    return base;
+  };
+  const seeds = [0.5, 1.5, 2.5, 3.5].map(seedAtHeight);
+  const anchored = anchoredSeed();
+  if (anchored) seeds.push(anchored);
+  for (const seed of seeds) {
+    const sol = _levenbergMarquardt(seed, residuals);
+    const c = cost(sol);
+    if (c < bestCost) { bestCost = c; best = sol; }
+  }
+  let sol = best!;
+
+  // One round of outlier rejection, then refine from the current solution.
+  const errOf = (p: number[], o: ArcObsEx, k: number) => {
+    const [x, y, z] = segPos(p, k, o.t);
+    const [pu, pv] = project(x, y, z);
+    return Math.hypot((pu - o.u) * hw, (pv - o.v) * hh);
+  };
+  let anyOutlier = false;
+  allObs.forEach(({ o, k }, i) => {
+    if (errOf(sol, o, k) > RALLY_OUTLIER_PX) { active[i] = false; anyOutlier = true; }
+    if (sizeActive[i]) {
+      const e = sizeResidual(sol, i);
+      if (e == null || Math.abs(e) > SIZE_DEPTH_OUTLIER) { sizeActive[i] = false; anyOutlier = true; }
+    }
+  });
+  if (anyOutlier) sol = _levenbergMarquardt(sol, residuals);
+  if (hasSize) {
+    const used = sizeActive.filter(Boolean).length;
+    console.log(`[physicsReproj] rally size-depth: ${used}/${allObs.length} sizes used`);
+  }
+
+  // Per-segment results and physical validation.
+  let idx = 0;
+  return segs.map((seg, k) => {
+    const T = tau[k + 1] - tau[k];
+    const [x0, y0, z0] = [sol[3 * k], sol[3 * k + 1], sol[3 * k + 2]];
+    const [x1, y1, z1] = [sol[3 * k + 3], sol[3 * k + 4], sol[3 * k + 5]];
+    const v0 = [(x1 - x0) / T, (y1 - y0) / T + 0.5 * sol[GK + k] * T, (z1 - z0) / T];
+    const speedMps = Math.hypot(v0[0], v0[1], v0[2]);
+    const errPx = seg.map((o) => errOf(sol, o, k));
+    const outlier = seg.map(() => !active[idx++]);
+    const inl = errPx.filter((_, i) => !outlier[i]);
+    const medErr = inl.length ? _median(inl) : Infinity;
+    const inlierFrac = inl.length / Math.max(1, seg.length);
+    // Sample the arc to check its extent, apex included.
+    const samples = Array.from({ length: 11 }, (_, i) => segPos(sol, k, tau[k] + (T * i) / 10));
+    const ys = samples.map((q) => q[1]);
+    const maxAbsX = Math.max(...samples.map((q) => Math.abs(q[0])));
+    const maxAbsZ = Math.max(...samples.map((q) => Math.abs(q[2])));
+
+    let rejectReason: string | null = null;
+    if (inl.length < 2)                           rejectReason = `too-few-inliers (${inl.length})`;
+    else if (Math.min(...ys) < MIN_FIT_Y_M - 0.2) rejectReason = `y-below-ground (min=${Math.min(...ys).toFixed(2)}m)`;
+    else if (Math.max(...ys) > SEG_MAX_Y_M)       rejectReason = `y-too-high (max=${Math.max(...ys).toFixed(2)}m)`;
+    else if (maxAbsX > RALLY_MAX_ABS_X_M + 1)     rejectReason = `x-out-of-bounds (${maxAbsX.toFixed(1)}m)`;
+    else if (maxAbsZ > RALLY_MAX_ABS_Z_M + 1)     rejectReason = `z-out-of-bounds (${maxAbsZ.toFixed(1)}m)`;
+    else if (speedMps > MAX_BALL_SPEED_MPS)       rejectReason = `speed-too-high (${speedMps.toFixed(1)} m/s)`;
+    else if (medErr > SEG_MAX_MEDIAN_ERR_PX)      rejectReason = `median-err-too-high (${medErr.toFixed(1)}px)`;
+    else if (inlierFrac < SEG_MIN_INLIER_FRAC)    rejectReason = `too-many-outliers (${(100 * inlierFrac).toFixed(0)}% inliers)`;
+
+    return {
+      obs: seg, tStart: tau[k], tEnd: tau[k + 1],
+      posAt: (t: number) => segPos(sol, k, Math.min(tau[k + 1], Math.max(tau[k], t))),
+      speedMps, accepted: rejectReason === null, rejectReason, errPx, outlier,
+    };
+  });
 }
 
 // ─── Physics-reprojection arc solver ─────────────────────────────────────────
@@ -781,6 +1618,12 @@ function splitArcsEx(obs: ArcObsEx[]): ArcObsEx[][] {
 interface ArcObsEx extends ArcObs {
   conf: number;
   depthZ: number | null;
+  /**
+   * Camera depth (m) implied by the measured ball diameter, up to a per-rally
+   * scale. Kept apart from depthZ, which drives arc splitting and is too
+   * noisy per frame for that.
+   */
+  sizeDepth?: number | null;
 }
 
 /** Per-observation output from the arc solver (includes outliers). */
@@ -892,9 +1735,28 @@ function solveArcReprojection(
         const wx = x0 + vx * t;
         const wy = y0 + vy * t - 0.5 * GRAVITY * t * t;
         const wz = z0 + vz * t;
-        // Soft physical bounds
-        if (wy < -0.5 || wy > MAX_BALL_HEIGHT_M + 2) err += 20;
-        if (Math.abs(wx) > COURT_HALF_W + 8 || Math.abs(wz) > COURT_HALF_L + 12) err += 10;
+        // Soft physical bounds.
+        //
+        // These were flat constants, which give the optimiser no gradient: a
+        // solution 3 m out of court paid exactly the same as one 30 m out, so
+        // nothing pulled it back. Under a long lens depth is only weakly
+        // observable and many depths fit the 2D track about equally well, so
+        // this prior is what selects the physically plausible one. Penalties
+        // are quadratic in the violation and scaled to be comparable with the
+        // reprojection term (a few px is ~1e-5 in NDC²).
+        // 3 m past the baseline is the FIVB minimum free zone and about as far
+        // back as a server stands, so it is a real physical bound rather than a
+        // tuning knob. It matters most for flat, fast arcs: gravity only fixes
+        // the depth scale when the trajectory visibly curves, so a near-straight
+        // serve is under-determined from one camera and this prior is what keeps
+        // it on the court.
+        const OUT_W = 2e-3;
+        if (wy < 0) err += OUT_W * 4 * wy * wy;
+        else if (wy > MAX_BALL_HEIGHT_M) err += OUT_W * (wy - MAX_BALL_HEIGHT_M) ** 2;
+        const xOver = Math.abs(wx) - (COURT_HALF_W + 3);
+        if (xOver > 0) err += OUT_W * xOver * xOver;
+        const zOver = Math.abs(wz) - (COURT_HALF_L + 3);
+        if (zOver > 0) err += OUT_W * zOver * zOver;
         // Confidence-weighted reprojection error
         const [pu, pv] = projectToNDC(cam, wx, wy, wz);
         const du = pu - activeObs[i].u;
@@ -926,14 +1788,62 @@ function solveArcReprojection(
     if (prevSol) {
       tryP(prevSol);
     } else {
+      // Depth multi-start anchored to court geometry.
+      //
+      // A single seed taken from apparent ball size is not usable: with
+      // TrackNet the box is the heatmap blob rather than the ball's
+      // silhouette, so the implied depth is meaningless. Under a long lens the
+      // projection is close to orthographic, the cost surface is nearly flat
+      // along depth, and one bad starting depth leaves the optimiser in a
+      // local minimum hundreds of pixels away from the observations.
+      //
+      // Instead, walk the viewing ray of the first observation. Its ground
+      // intersection bounds how far the ball can be — a ball in the air is
+      // always nearer along that ray than the point where the ray meets the
+      // floor — so seeding fractions of that distance brackets the true depth.
+      const first = activeObs[0];
+      const last = activeObs[activeObs.length - 1];
+      const dur = Math.max(1e-3, last.t - first.t);
+
+      const rayDir = (o: ArcObsEx) =>
+        new THREE.Vector3(o.u, o.v, 0.5).unproject(cam).sub(cam.position).normalize();
+      const groundT = (d: THREE.Vector3) =>
+        (d.y < -1e-6 ? -cam.position.y / d.y : NaN);
+
+      const d0 = rayDir(first);
+      const dN = rayDir(last);
+      const t0Ground = groundT(d0);
+      const tNGround = groundT(dN);
+
+      const seeded: number[][] = [];
+      if (Number.isFinite(t0Ground) && Number.isFinite(tNGround) &&
+          t0Ground > 0 && tNGround > 0) {
+        for (const frac of [0.5, 0.65, 0.78, 0.88, 0.96, 1.0]) {
+          const p0 = cam.position.clone().addScaledVector(d0, frac * t0Ground);
+          const pN = cam.position.clone().addScaledVector(dN, frac * tNGround);
+          if (p0.y < -1 || p0.y > MAX_BALL_HEIGHT_M + 2) continue;
+          // Straight-line velocity between the two seeded endpoints, with the
+          // gravity drop added back so the seed is a plausible arc.
+          const vxs = (pN.x - p0.x) / dur;
+          const vys = (pN.y - p0.y) / dur + 0.5 * GRAVITY * dur;
+          const vzs = (pN.z - p0.z) / dur;
+          seeded.push([p0.x, Math.max(0.05, p0.y), p0.z,
+                       vxs / VSCALE, vys / VSCALE, vzs / VSCALE]);
+        }
+      }
+
+      // Keep the original bbox-depth seed and generic velocity fans as
+      // additional starts; the best fit across all of them wins.
       for (const [sivx, sivy, sivz] of [
         [0,  0.4, -0.5],
         [0,  0.4,  0.5],
         [0, -0.5, -0.5],
         [initVx / VSCALE, initVy / VSCALE, initVz / VSCALE],
       ] as [number, number, number][]) {
-        tryP([initX, initY, initZ, sivx, sivy, sivz]);
+        seeded.push([initX, initY, initZ, sivx, sivy, sivz]);
       }
+
+      for (const sp of seeded) tryP(sp);
     }
     return best ?? [initX, initY, initZ, 0, 0.4, -0.5];
   };
@@ -1194,7 +2104,7 @@ function _processArcs(
 }
 
 export function solveBallTrajectories(
-  frames: Pick<FrameData, "frame" | "timestamp" | "ball_img_pos" | "ball_bbox" | "ball_interpolated" | "ball_conf">[],
+  frames: Pick<FrameData, "frame" | "timestamp" | "ball_img_pos" | "ball_bbox" | "ball_interpolated" | "ball_conf" | "ball_diameter_px" | "players_near_ball">[],
   calibration: CalibrationResult,
   aspect: number,
   options?: BallReconstructionOptions,
@@ -1347,7 +2257,7 @@ export function solveBallTrajectories(
         accepted,
         rejectedReason,
         cameraPosition:     calibration.position,
-        usedInFit:          trajectoryMode !== "physics-reprojection"
+        usedInFit:          (trajectoryMode !== "physics-reprojection" && trajectoryMode !== "short-arc-debug")
           ? accepted
           : false, // updated below after arc solver
         projectedU:         null,
@@ -1385,22 +2295,59 @@ export function solveBallTrajectories(
 
     // ── Physics-reprojection arc solver (post-loop) ──────────────────────────
     const physicsDebug: PhysicsReprojectionDebug[] = [];
+    const touches: BallTouch[] = [];
 
     if (trajectoryMode === "physics-reprojection") {
-      // Use a lower confidence threshold for 2D fitting observations.
-      const minFitConf = 0.25;
+      // Detections reaching here have already passed the analyzer's motion
+      // gate (_BallTracker), which is stronger evidence that a point is the
+      // ball than a raw YOLO score is — a fast, blurred ball scores low but
+      // tracks perfectly. Measured on broadcast footage, genuine tracked
+      // detections land at conf 0.09-0.13, i.e. below the detector's own
+      // _BALL_CONF_FLOOR of 0.08 plus a hair. Anything above that floor was
+      // already validated, so keep it: the objective below weights each
+      // residual by confidence, which down-weights weak points without
+      // discarding them. A stricter gate here starves the solver and it
+      // rejects every arc.
+      const minFitConf = 0.05;
       const obsEx: ArcObsEx[] = detectedList
-        .map((f, i) => ({
+        .map((f) => ({
           t:      f.timestamp,
           u:      f.ball_img_pos[0] * 2 - 1,
           v:      1 - f.ball_img_pos[1] * 2,
           fi:     f.frame,
           conf:   f.ball_conf ?? 0,
-          depthZ: smoothedZFromDiam[i],
+          // Depth from apparent ball size is deliberately not supplied.
+          // The detector reports a heatmap blob, not the ball's silhouette:
+          // on real footage those boxes quantise to the 512-wide heatmap grid
+          // and imply depths of 230-577 m for a ball on an 18 m court. Feeding
+          // that in only corrupts the seed and splits arcs on noise.
+          depthZ: null,
+          // The real ball size, segmented by colour in the analyzer, does carry
+          // depth: it is used as a soft prior by the rally solver.
+          sizeDepth: f.ball_diameter_px && f.ball_diameter_px > 0
+            ? fyPx * ballDiameterM / f.ball_diameter_px
+            : null,
         }))
         .filter((o) => o.conf >= minFitConf);
 
-      const arcs = splitArcsEx(obsEx);
+      // Ball image position at any time, including the analyzer's gap fill.
+      const ballTrack = frames
+        .filter((f) => f.ball_img_pos)
+        .map((f) => ({ t: f.timestamp, u: f.ball_img_pos![0] * 2 - 1, v: 1 - f.ball_img_pos![1] * 2 }));
+      const frameDt = frames.length > 1 ? Math.max(1e-3, frames[1].timestamp - frames[0].timestamp) : 1 / 30;
+      const imageAt = (t: number): [number, number] | null => {
+        let best: { t: number; u: number; v: number } | null = null;
+        for (const b of ballTrack) if (!best || Math.abs(b.t - t) < Math.abs(best.t - t)) best = b;
+        return best && Math.abs(best.t - t) <= 0.6 * frameDt ? [best.u, best.v] : null;
+      };
+      const playersByFrame = new Map<number, PlayerBox[]>();
+      for (const f of frames) if (f.players_near_ball) playersByFrame.set(f.frame, f.players_near_ball);
+      const hasPlayers = playersByFrame.size > 0;
+      const splitArcs = splitArcsEx(obsEx, vW, vH);
+      const arcs = hasPlayers ? mergeUntouchedSplits(splitArcs, playersByFrame, cam, vW / 2, vH / 2) : splitArcs;
+      if (hasPlayers) {
+        console.log(`[physicsReproj] touch splits: ${splitArcs.length} -> ${arcs.length} after dropping ones with no player`);
+      }
 
       console.log(
         `[physicsReproj] mode=physics-reprojection` +
@@ -1419,99 +2366,146 @@ export function solveBallTrajectories(
       let totalFittedArcs = 0;
       const allErrPx: number[] = [];
 
-      for (let ai = 0; ai < arcs.length; ai++) {
-        const arc = arcs[ai];
-        const solved = solveArcReprojection(arc, cam, vW, vH, ai);
-
-        if (!solved) {
-          // Arc has fewer than MIN_ARC_FRAMES — add minimal debug records
-          for (const o of arc) {
-            const origIdx = detectedList.findIndex((df) => df.frame === o.fi);
-            physicsDebug.push({
-              frame: o.fi,
-              observedU: o.u, observedV: o.v,
-              projectedU: null, projectedV: null, reprojectionErrorPx: null,
-              fittedX: null, fittedY: null, fittedZ: null,
-              rawBboxDepthZ:      origIdx >= 0 ? rawZFromDiam[origIdx]      : null,
-              smoothedBboxDepthZ: origIdx >= 0 ? smoothedZFromDiam[origIdx] : null,
-              confidence: o.conf, usedInFit: false,
-              arcId: ai, arcAccepted: false, arcRejectReason: "too-few-observations",
-              speedMps: null, cameraDepthFitted: null, depthPriorError: null, isOutlier: false,
-            });
+      // Segments shorter than two samples cannot carry a touch-to-touch arc on
+      // their own, but they still constrain the rally they sit in.
+      const rallies = groupIntoRallies(arcs);
+      let segId = 0;
+      for (const rally of rallies) {
+        const nObs = rally.reduce((s, a) => s + a.length, 0);
+        if (nObs < MIN_ARC_FRAMES) {
+          for (const arc of rally) {
+            for (const o of arc) {
+              const origIdx = detectedList.findIndex((df) => df.frame === o.fi);
+              physicsDebug.push({
+                frame: o.fi,
+                observedU: o.u, observedV: o.v,
+                projectedU: null, projectedV: null, reprojectionErrorPx: null,
+                fittedX: null, fittedY: null, fittedZ: null,
+                rawBboxDepthZ:      origIdx >= 0 ? rawZFromDiam[origIdx]      : null,
+                smoothedBboxDepthZ: origIdx >= 0 ? smoothedZFromDiam[origIdx] : null,
+                confidence: o.conf, usedInFit: false,
+                arcId: segId, arcAccepted: false, arcRejectReason: "too-few-observations",
+                speedMps: null, cameraDepthFitted: null, depthPriorError: null, isOutlier: false,
+              });
+            }
+            segId++;
           }
           continue;
         }
 
-        const { arcParams, t0: arcT0, accepted, rejectReason, observations: solvedObs } = solved;
-        const [ax0, ay0, az0, avx, avy, avz] = arcParams;
-
-        if (accepted) {
-          totalFittedArcs++;
-          const arcStartT = arc[0].t;
-          const arcEndT   = arc[arc.length - 1].t;
-          let filledCount = 0;
-          for (const fr of frames) {
-            if (fr.timestamp < arcStartT - 1e-6 || fr.timestamp > arcEndT + 1e-6) continue;
-            if (positions.has(fr.frame)) continue;
-            const t  = fr.timestamp - arcT0;
-            const wx = ax0 + avx * t;
-            const wy = ay0 + avy * t - 0.5 * GRAVITY * t * t; // NOT clamped
-            const wz = az0 + avz * t;
-            positions.set(fr.frame, [wx, wy, wz]);
-            methods.set(fr.frame, "physics-reprojection");
-            filledCount++;
+        // Candidate touchers per knot: the rally's first sample (ball in the
+        // server's hands) and every touch between segments. The last knot is
+        // where the ball leaves view, not a touch.
+        const anchors: TouchCandidate[][] = [];
+        if (hasPlayers) {
+          const first = rally[0];
+          anchors.push(boundaryCandidates(first[0], first[Math.min(1, first.length - 1)], playersByFrame, cam));
+          for (let k = 1; k < rally.length; k++) {
+            const prevSeg = rally[k - 1];
+            anchors.push(boundaryCandidates(prevSeg[prevSeg.length - 1], rally[k][0], playersByFrame, cam));
           }
-          console.log(
-            `[physicsReproj] arc[${ai}] ACCEPTED filled=${filledCount} frames`,
-          );
+          anchors.push([]);
         }
-
-        // Emit physicsDebug for ALL observations (accepted + rejected, inliers + outliers)
-        for (const { fi, pos, projU, projV, errPx, speedMps, cameraDepthFitted,
-                     depthPriorError, isOutlier, obsRef } of solvedObs) {
-          if (!isOutlier) allErrPx.push(errPx);
-
-          if (accepted && !isOutlier) {
-            const rec = debugRecords.find((d) => d.frame === fi);
-            if (rec) {
-              rec.fittedPosition      = pos;
-              rec.projectedU          = projU;
-              rec.projectedV          = projV;
-              rec.reprojectionErrorPx = errPx;
-              rec.worldPosition       = pos;
-              rec.accepted            = true;
-              rec.rejectedReason      = null;
-              rec.method              = "physics-reprojection";
-              rec.usedInFit           = true;
+        const zones = hasPlayers ? applyRallyRules(anchors) : [];
+        const results = solveRally(rally, cam, vW, vH, anchors, zones, imageAt);
+        results.forEach((seg, k) => {
+          if (!seg.accepted && !(k > 0 && results[k - 1].accepted)) return;
+          touches.push({ frame: seg.obs[0].fi, position: seg.posAt(seg.tStart), label: zones[k]?.label ?? "touch" });
+        });
+        console.log(
+          "[rally] " + results.map((seg, k) => {
+            const [x, y, z] = seg.posAt(seg.tStart);
+            return `${zones[k]?.label ?? "touch"} f${seg.obs[0].fi} (${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)})` +
+              ` cands=${(anchors[k] ?? []).map(([ax, az]) => `${ax.toFixed(1)}/${az.toFixed(1)}`).join(" ")} -> ${seg.speedMps.toFixed(0)}m/s`;
+          }).join("  |  "),
+        );
+        const camFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion);
+        for (const seg of results) {
+          const ai = segId++;
+          console.log(
+            `[physicsReproj] seg[${ai}] frames ${seg.obs[0].fi}–${seg.obs[seg.obs.length - 1].fi}` +
+            ` n=${seg.obs.length} speed=${seg.speedMps.toFixed(1)}m/s` +
+            ` start=[${seg.posAt(seg.tStart).map((v) => v.toFixed(1)).join(",")}]` +
+            ` end=[${seg.posAt(seg.tEnd).map((v) => v.toFixed(1)).join(",")}]` +
+            ` ${seg.accepted ? "ACCEPTED" : `REJECTED: ${seg.rejectReason}`}`,
+          );
+          // A rejected sliver between two touches (attack straight into the
+          // block: two touches in five frames) is drawn as a straight line
+          // between its touch points, so the path does not break there.
+          const segIdx = results.indexOf(seg);
+          const bridge = !seg.accepted && seg.obs.length <= BRIDGE_MAX_FRAMES &&
+            segIdx > 0 && segIdx < results.length - 1 &&
+            results[segIdx - 1].accepted && results[segIdx + 1].accepted;
+          if (bridge) {
+            const a = seg.posAt(seg.tStart), b = seg.posAt(seg.tEnd);
+            const T = Math.max(1e-6, seg.tEnd - seg.tStart);
+            for (const fr of frames) {
+              if (fr.timestamp < seg.tStart - 1e-6 || fr.timestamp > seg.tEnd + 1e-6) continue;
+              if (positions.has(fr.frame)) continue;
+              const w = (fr.timestamp - seg.tStart) / T;
+              positions.set(fr.frame, [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w, a[2] + (b[2] - a[2]) * w]);
+              methods.set(fr.frame, "physics-reprojection");
             }
           }
-
-          const origIdx = detectedList.findIndex((df) => df.frame === fi);
-          physicsDebug.push({
-            frame:               fi,
-            observedU:           obsRef.u,
-            observedV:           obsRef.v,
-            projectedU:          projU,
-            projectedV:          projV,
-            reprojectionErrorPx: errPx,
-            fittedX:             pos[0],
-            fittedY:             pos[1],
-            fittedZ:             pos[2],
-            rawBboxDepthZ:       origIdx >= 0 ? rawZFromDiam[origIdx]      : null,
-            smoothedBboxDepthZ:  origIdx >= 0 ? smoothedZFromDiam[origIdx] : null,
-            confidence:          obsRef.conf,
-            usedInFit:           accepted && !isOutlier,
-            arcId:               ai,
-            arcAccepted:         accepted,
-            arcRejectReason:     accepted ? null : rejectReason,
-            speedMps,
-            cameraDepthFitted,
-            depthPriorError,
-            isOutlier,
+          if (seg.accepted) {
+            totalFittedArcs++;
+            for (const fr of frames) {
+              if (fr.timestamp < seg.tStart - 1e-6 || fr.timestamp > seg.tEnd + 1e-6) continue;
+              if (positions.has(fr.frame)) continue;
+              positions.set(fr.frame, seg.posAt(fr.timestamp));
+              methods.set(fr.frame, "physics-reprojection");
+            }
+          }
+          const project = _makeProjector(cam);
+          seg.obs.forEach((o, i) => {
+            const pos = seg.posAt(o.t);
+            const [projU, projV] = project(...pos);
+            const isOutlier = seg.outlier[i];
+            if (!isOutlier) allErrPx.push(seg.errPx[i]);
+            if (seg.accepted && !isOutlier) {
+              const rec = debugRecords.find((d) => d.frame === o.fi);
+              if (rec) {
+                rec.fittedPosition      = pos;
+                rec.projectedU          = projU;
+                rec.projectedV          = projV;
+                rec.reprojectionErrorPx = seg.errPx[i];
+                rec.worldPosition       = pos;
+                rec.accepted            = true;
+                rec.rejectedReason      = null;
+                rec.method              = "physics-reprojection";
+                rec.usedInFit           = true;
+              }
+            }
+            const origIdx = detectedList.findIndex((df) => df.frame === o.fi);
+            const cameraDepthFitted =
+              (pos[0] - cam.position.x) * camFwd.x +
+              (pos[1] - cam.position.y) * camFwd.y +
+              (pos[2] - cam.position.z) * camFwd.z;
+            physicsDebug.push({
+              frame:               o.fi,
+              observedU:           o.u,
+              observedV:           o.v,
+              projectedU:          projU,
+              projectedV:          projV,
+              reprojectionErrorPx: seg.errPx[i],
+              fittedX:             pos[0],
+              fittedY:             pos[1],
+              fittedZ:             pos[2],
+              rawBboxDepthZ:       origIdx >= 0 ? rawZFromDiam[origIdx]      : null,
+              smoothedBboxDepthZ:  origIdx >= 0 ? smoothedZFromDiam[origIdx] : null,
+              confidence:          o.conf,
+              usedInFit:           seg.accepted && !isOutlier,
+              arcId:               ai,
+              arcAccepted:         seg.accepted,
+              arcRejectReason:     seg.rejectReason,
+              speedMps:            seg.speedMps,
+              cameraDepthFitted,
+              depthPriorError:     null,
+              isOutlier,
+            });
           });
         }
       }
-
       // Emit physicsDebug records for detected frames NOT covered by any arc
       // (low-confidence detections filtered out before arc splitting)
       const processedFrames = new Set(physicsDebug.map((d) => d.frame));
@@ -1566,9 +2560,153 @@ export function solveBallTrajectories(
 
     _printConsoleSummary(debugRecords, positions);
 
+    // ── Short-arc-debug arc solver (post-loop) ────────────────────────────────
+    if (trajectoryMode === "short-arc-debug") {
+      const arcStart      = options?.arcStartFrame ?? 0;
+      const arcEnd        = options?.arcEndFrame   ?? Number.MAX_SAFE_INTEGER;
+      const disableDepth  = options?.disableBboxDepthPrior ?? false;
+      const minFitConf    = 0.0; // accept all detections in range for short-arc mode
+
+      const sadObsEx: ArcObsEx[] = detectedList
+        .map((f, i) => ({
+          t:      f.timestamp,
+          u:      f.ball_img_pos[0] * 2 - 1,
+          v:      1 - f.ball_img_pos[1] * 2,
+          fi:     f.frame,
+          conf:   Math.max(f.ball_conf ?? 0, 0.01), // treat 0 as 0.01 so it's not filtered
+          depthZ: disableDepth ? null : smoothedZFromDiam[i],
+        }))
+        .filter((o) => o.fi >= arcStart && o.fi <= arcEnd && o.conf >= minFitConf);
+
+      const sadPhysicsDebug: PhysicsReprojectionDebug[] = [];
+      let shortArcAccepted = false;
+      let shortArcRejectReason: string | null = "no-observations-in-range";
+
+      if (sadObsEx.length < MIN_ARC_FRAMES) {
+        shortArcRejectReason = `too-few-observations (${sadObsEx.length} < ${MIN_ARC_FRAMES})`;
+        console.warn(`[shortArcDebug] ${shortArcRejectReason}`);
+      } else {
+        const solved = solveArcReprojection(sadObsEx, cam, vW, vH, 0);
+
+        if (!solved) {
+          shortArcRejectReason = `solver-returned-null`;
+        } else {
+          const { arcParams, t0: arcT0, observations: solvedObs } = solved;
+          const [ax0, ay0, az0, avx, avy, avz] = arcParams;
+
+          const inlierObs   = solvedObs.filter((o) => !o.isOutlier);
+          const allX        = solvedObs.map((o) => o.pos[0]);
+          const allZ        = solvedObs.map((o) => o.pos[2]);
+          const allY        = solvedObs.map((o) => o.pos[1]);
+          const inlierErrs  = inlierObs.map((o) => o.errPx);
+          const avgErrPx    = inlierErrs.length > 0
+            ? inlierErrs.reduce((s, e) => s + e, 0) / inlierErrs.length : Infinity;
+          const maxErrPx    = inlierErrs.length > 0 ? Math.max(...inlierErrs) : Infinity;
+          const maxSpeed    = Math.max(0, ...solvedObs.map((o) => o.speedMps));
+
+          // Stricter short-arc validation
+          let sadRejectReason: string | null = null;
+          if (allX.some((x) => Math.abs(x) > SAD_MAX_X_M))
+            sadRejectReason = `x-out-of-bounds (max|x|=${Math.max(...allX.map(Math.abs)).toFixed(2)}m > ${SAD_MAX_X_M}m)`;
+          else if (allZ.some((z) => Math.abs(z) > SAD_MAX_Z_M))
+            sadRejectReason = `z-out-of-bounds (max|z|=${Math.max(...allZ.map(Math.abs)).toFixed(2)}m > ${SAD_MAX_Z_M}m)`;
+          else if (allY.some((y) => y < 0))
+            sadRejectReason = `y-below-zero (min=${Math.min(...allY).toFixed(2)}m)`;
+          else if (allY.some((y) => y > 6))
+            sadRejectReason = `y-too-high (max=${Math.max(...allY).toFixed(2)}m > 6m)`;
+          else if (avgErrPx > SAD_MAX_AVG_ERR_PX)
+            sadRejectReason = `avg-reprojection-err-${avgErrPx.toFixed(1)}px > ${SAD_MAX_AVG_ERR_PX}px`;
+          else if (maxErrPx > SAD_MAX_MAX_ERR_PX)
+            sadRejectReason = `max-reprojection-err-${maxErrPx.toFixed(1)}px > ${SAD_MAX_MAX_ERR_PX}px`;
+          else if (maxSpeed > MAX_BALL_SPEED_MPS)
+            sadRejectReason = `speed-${maxSpeed.toFixed(1)}m/s > ${MAX_BALL_SPEED_MPS}m/s`;
+
+          shortArcAccepted    = sadRejectReason === null;
+          shortArcRejectReason = sadRejectReason;
+
+          console.log(
+            `[shortArcDebug] frames ${arcStart}–${arcEnd}` +
+            ` obs=${sadObsEx.length} inliers=${inlierObs.length}` +
+            ` avgErr=${avgErrPx.toFixed(1)}px maxErr=${maxErrPx.toFixed(1)}px` +
+            ` yRange=[${Math.min(...allY).toFixed(2)},${Math.max(...allY).toFixed(2)}]` +
+            ` maxSpeed=${maxSpeed.toFixed(1)}m/s` +
+            ` ${shortArcAccepted ? "ACCEPTED" : `REJECTED: ${shortArcRejectReason}`}`,
+          );
+
+          // Only populate positions for accepted arc — rejected arc stays out of yellow path
+          if (shortArcAccepted) {
+            for (const f of detectedList) {
+              if (f.frame < arcStart || f.frame > arcEnd) continue;
+              const t  = f.timestamp - arcT0;
+              const wx = ax0 + avx * t;
+              const wy = ay0 + avy * t - 0.5 * GRAVITY * t * t;
+              const wz = az0 + avz * t;
+              positions.set(f.frame, [wx, wy, wz]);
+              methods.set(f.frame, "physics-reprojection");
+            }
+          }
+
+          // Build physicsDebug records for this arc
+          for (const { fi, pos, projU, projV, errPx, speedMps, cameraDepthFitted,
+                       depthPriorError, isOutlier, obsRef } of solvedObs) {
+            if (shortArcAccepted && !isOutlier) {
+              const rec = debugRecords.find((d) => d.frame === fi);
+              if (rec) {
+                rec.fittedPosition      = pos;
+                rec.projectedU          = projU;
+                rec.projectedV          = projV;
+                rec.reprojectionErrorPx = errPx;
+                rec.worldPosition       = pos;
+                rec.accepted            = true;
+                rec.rejectedReason      = null;
+                rec.method              = "physics-reprojection";
+                rec.usedInFit           = true;
+              }
+            }
+            sadPhysicsDebug.push({
+              frame:               fi,
+              observedU:           obsRef.u,
+              observedV:           obsRef.v,
+              projectedU:          projU,
+              projectedV:          projV,
+              reprojectionErrorPx: errPx,
+              fittedX:             pos[0],
+              fittedY:             pos[1],
+              fittedZ:             pos[2],
+              rawBboxDepthZ:       null,
+              smoothedBboxDepthZ:  null,
+              confidence:          obsRef.conf,
+              usedInFit:           shortArcAccepted && !isOutlier,
+              arcId:               0,
+              arcAccepted:         shortArcAccepted,
+              arcRejectReason:     shortArcRejectReason,
+              speedMps,
+              cameraDepthFitted,
+              depthPriorError,
+              isOutlier,
+            });
+          }
+        }
+      }
+
+      const solved3dFrms = positions.size;
+      const rejectedFrms = debugRecords.filter((d) => !d.accepted).length;
+      const mCounts: Partial<Record<BallReconstructionMethod, number>> = {};
+      for (const m of methods.values()) mCounts[m] = (mCounts[m] ?? 0) + 1;
+
+      return {
+        positions, methods, debugRecords,
+        physicsDebug: sadPhysicsDebug.length > 0 ? sadPhysicsDebug : undefined,
+        shortArcAccepted,
+        shortArcRejectReason,
+        stats: { detectedFrames, solved3dFrames: solved3dFrms, rejectedFrames: rejectedFrms, methodCounts: mCounts, avgConf },
+      };
+    }
+
     return {
       positions, methods, debugRecords,
       physicsDebug: physicsDebug.length > 0 ? physicsDebug : undefined,
+      touches: touches.length > 0 ? touches : undefined,
       stats: { detectedFrames, solved3dFrames, rejectedFrames, methodCounts, avgConf },
     };
   }

@@ -123,8 +123,11 @@ def _get_yolo_model():
         print(f"[yolo] Script dir: {script_dir}", file=sys.stderr)
         print(f"[yolo] Model candidates: {candidates}", file=sys.stderr)
         if model_path is None:
-            print("[yolo] yolov8m.pt not found — ball detection disabled", file=sys.stderr)
-            return None
+            # No local weights: let ultralytics fetch them into the project root.
+            # Without this the whole ball pipeline silently no-ops.
+            model_path = project_root_model
+            print(f"[yolo] No local weights found — downloading yolov8m.pt to {model_path}",
+                  file=sys.stderr)
 
         print(f"[yolo] Loading model from {model_path}...", file=sys.stderr)
         _yolo_model = YOLO(model_path)
@@ -139,6 +142,29 @@ def _get_yolo_model():
 
 # COCO class index for "sports ball" (includes volleyball)
 _SPORTS_BALL_CLASS = 32
+
+_tracknet_detector = None
+_tracknet_tried = False
+
+
+def _get_tracknet_detector():
+    """Lazy-load the TrackNetV2 volleyball ball detector. Returns None if unavailable.
+
+    Preferred over YOLO: it sees 3 frames at once, so a fast, blurred ball is
+    found by its motion instead of its (very weak) single-frame appearance.
+    """
+    global _tracknet_detector, _tracknet_tried
+    if _tracknet_detector is not None or _tracknet_tried:
+        return _tracknet_detector
+    _tracknet_tried = True
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from ball_tracknet import TrackNetBallDetector
+        _tracknet_detector = TrackNetBallDetector()
+        return _tracknet_detector
+    except Exception as e:
+        print(f"[tracknet] Unavailable ({e}) — falling back to YOLO", file=sys.stderr)
+        return None
 
 
 def _estimate_depth_at_ball(frame_bgr, cx_norm: float, cy_norm: float) -> float | None:
@@ -211,46 +237,344 @@ def _estimate_depth_batch(frames_and_balls: list[tuple]) -> dict[int, float]:
     return results
 
 
-def _detect_ball_yolo(frame, model, conf_thresh=0.20):
-    """Detect sports ball in a frame using YOLOv8.
+# ─── Ball tracking tuning ────────────────────────────────────────────────
+# A volleyball is small and motion-blurred, so it needs a high inference
+# resolution and a low confidence floor. The floor is only safe because the
+# tracker below rejects candidates inconsistent with the ball's recent motion,
+# rather than trusting raw confidence.
+_BALL_IMGSZ = 1280          # 640 loses the ball entirely on 1080p+ footage
+_BALL_CONF_FLOOR = 0.08     # weak detections are rescued by motion gating
+_BALL_CONF_TRUST = 0.35     # above this a detection may start/restart a track
+# Max plausible frame-to-frame travel as a fraction of frame width. A 25 m/s
+# spike at 30 fps across a ~20 m field of view is roughly 0.04, so 0.18 leaves
+# generous headroom for fast serves and camera pans.
+_BALL_MAX_STEP = 0.18
+_BALL_COAST_FRAMES = 12     # how long to keep predicting through a dropout
 
-    Returns [cx_norm, cy_norm, conf, x1_norm, y1_norm, x2_norm, y2_norm]
-    (all normalised 0–1) or None if no ball found.
-    If multiple balls are detected the highest-confidence one is returned.
+
+def _detect_ball_candidates(frame, model, conf_thresh=_BALL_CONF_FLOOR):
+    """Detect every plausible sports-ball candidate in a frame.
+
+    Returns a list of [cx_norm, cy_norm, conf, x1_norm, y1_norm, x2_norm, y2_norm]
+    (all normalised 0-1) sorted by descending confidence, empty if none found.
+
+    Choosing among candidates is left to the caller so it can use temporal
+    context; picking the highest-confidence box per frame independently makes
+    the track jump to whichever distractor happens to score best.
     """
     try:
         results = model.predict(frame, classes=[_SPORTS_BALL_CLASS], conf=conf_thresh,
-                                verbose=False, imgsz=640)
-        if not results or not results[0].boxes or len(results[0].boxes) == 0:
-            return None
+                                verbose=False, imgsz=_BALL_IMGSZ)
+        if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+            return []
         boxes = results[0].boxes
-        best_idx = int(boxes.conf.argmax())
-        x1, y1, x2, y2 = boxes.xyxy[best_idx].tolist()
-        conf = float(boxes.conf[best_idx])
         h, w = frame.shape[:2]
-        cx = (x1 + x2) / 2.0 / w
-        cy = (y1 + y2) / 2.0 / h
-        return [round(cx, 6), round(cy, 6), round(conf, 4),
-                round(x1 / w, 6), round(y1 / h, 6), round(x2 / w, 6), round(y2 / h, 6)]
+        out = []
+        for i in range(len(boxes)):
+            x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+            conf = float(boxes.conf[i])
+            bw = (x2 - x1) / w
+            bh = (y2 - y1) / h
+            if bw <= 0 or bh <= 0:
+                continue
+            # A ball is round and small; drop boxes that are neither.
+            aspect = bw / bh
+            if aspect < 0.45 or aspect > 2.2:
+                continue
+            if bw > 0.25 or bh > 0.25:
+                continue
+            cx = (x1 + x2) / 2.0 / w
+            cy = (y1 + y2) / 2.0 / h
+            out.append([round(cx, 6), round(cy, 6), round(conf, 4),
+                        round(x1 / w, 6), round(y1 / h, 6),
+                        round(x2 / w, 6), round(y2 / h, 6)])
+        out.sort(key=lambda d: -d[2])
+        return out
     except Exception as e:
         print(f"[yolo-predict] Exception: {e}", file=sys.stderr)
         raise
 
 
+_PERSON_CLASS = 0
+# A touch happens at a player, so only people this close to the ball matter
+# (normalised by frame width; ~300 px on 1080p).
+_PLAYER_NEAR_BALL = 0.16
+
+
+def _detect_players_near_ball(frame, model, cx_norm, cy_norm):
+    """Person boxes near the ball, as [x1, y1, x2, y2, conf] normalised.
+
+    The 3D solver anchors each touch to the player who made it: their feet
+    are on the calibrated floor, which fixes depth where the ball alone
+    cannot (see solveRally in ballReconstruction.ts).
+    """
+    h, w = frame.shape[:2]
+    results = model.predict(frame, classes=[_PERSON_CLASS], conf=0.25,
+                            verbose=False, imgsz=_BALL_IMGSZ)
+    out = []
+    for box in results[0].boxes:
+        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
+        x1n, y1n, x2n, y2n = x1 / w, y1 / h, x2 / w, y2 / h
+        # Distance from the ball to the box (0 when inside), in width units.
+        dx = max(x1n - cx_norm, 0.0, cx_norm - x2n)
+        dy = max(y1n - cy_norm, 0.0, cy_norm - y2n) * h / w
+        if math.hypot(dx, dy) <= _PLAYER_NEAR_BALL:
+            out.append([round(x1n, 5), round(y1n, 5), round(x2n, 5), round(y2n, 5),
+                        round(float(box.conf[0]), 3)])
+    return out
+
+
+def _detect_ball_yolo(frame, model, conf_thresh=0.20):
+    """Backwards-compatible single-best-ball detection."""
+    cands = _detect_ball_candidates(frame, model, conf_thresh)
+    return cands[0] if cands else None
+
+
+class _BallTracker:
+    """Picks one ball candidate per frame using constant-velocity prediction.
+
+    Keeps a short-lived track (last position + velocity) and scores candidates
+    by agreement with the predicted position, breaking ties with detector
+    confidence. Candidates requiring an implausible jump are rejected outright,
+    which is what keeps heads, line judges and background balls out of the
+    trajectory.
+    """
+
+    def __init__(self):
+        self.pos = None          # (x, y) normalised
+        self.vel = (0.0, 0.0)
+        self.last_frame = None
+        self.misses = 0
+        # Recent accepted points, for constant-acceleration prediction.
+        self.history = []
+
+    def _predict(self, frame_idx):
+        if self.pos is None or self.last_frame is None:
+            return None
+        dt = frame_idx - self.last_frame
+        if dt <= 0 or dt > _BALL_COAST_FRAMES:
+            return None
+        # Constant-acceleration extrapolation, as in WASB-SBDT's OnlineTracker:
+        # with three consecutive past points the second difference gives the
+        # acceleration, which matters because a ball falls under gravity.
+        if len(self.history) >= 3:
+            (f1, p1), (f2, p2), (f3, p3) = self.history[-1], self.history[-2], self.history[-3]
+            if f1 - f2 == 1 and f2 - f3 == 1:
+                ax = (p1[0] - p2[0]) - (p2[0] - p3[0])
+                ay = (p1[1] - p2[1]) - (p2[1] - p3[1])
+                # Velocity *at* the last sample. WASB uses (p1-p2)+acc, which
+                # is a half-step ahead and overshoots; the backward difference
+                # (p1-p2) equals v(t1) - acc/2, so add half the acceleration.
+                # This makes the extrapolation exact for constant acceleration.
+                vx = (p1[0] - p2[0]) + 0.5 * ax
+                vy = (p1[1] - p2[1]) + 0.5 * ay
+                # Advance dt steps from the last observation.
+                return (p1[0] + vx * dt + 0.5 * ax * dt * dt,
+                        p1[1] + vy * dt + 0.5 * ay * dt * dt)
+        return (self.pos[0] + self.vel[0] * dt, self.pos[1] + self.vel[1] * dt)
+
+    def _drop_if_stale(self):
+        self.misses += 1
+        if self.misses > _BALL_COAST_FRAMES:
+            self.pos = None
+            self.vel = (0.0, 0.0)
+            self.last_frame = None
+            self.history = []
+
+    def update(self, frame_idx, candidates):
+        """Return the accepted detection for this frame, or None."""
+        if not candidates:
+            self._drop_if_stale()
+            return None
+
+        pred = self._predict(frame_idx)
+        dt = 1 if self.last_frame is None else max(1, frame_idx - self.last_frame)
+        budget = _BALL_MAX_STEP * dt
+
+        best, best_score = None, None
+        for c in candidates:
+            cx, cy, conf = c[0], c[1], c[2]
+            if pred is not None:
+                dist = math.hypot(cx - pred[0], cy - pred[1])
+                if dist > budget:
+                    continue  # implausible jump - almost certainly a distractor
+                score = (1.0 - dist / budget) + 0.35 * conf
+            else:
+                # No live track: only a confident detection may seed one.
+                if conf < _BALL_CONF_TRUST:
+                    continue
+                score = conf
+            if best_score is None or score > best_score:
+                best, best_score = c, score
+
+        if best is None:
+            self._drop_if_stale()
+            return None
+
+        new_pos = (best[0], best[1])
+        if self.pos is not None and self.last_frame is not None:
+            gap = max(1, frame_idx - self.last_frame)
+            raw_v = ((new_pos[0] - self.pos[0]) / gap, (new_pos[1] - self.pos[1]) / gap)
+            # Smooth velocity so one noisy detection cannot slew the gate.
+            self.vel = (0.5 * self.vel[0] + 0.5 * raw_v[0],
+                        0.5 * self.vel[1] + 0.5 * raw_v[1])
+        self.pos = new_pos
+        self.last_frame = frame_idx
+        self.misses = 0
+        self.history.append((frame_idx, new_pos))
+        if len(self.history) > 4:
+            self.history.pop(0)
+        return best
+
+def _reject_ball_outliers(raw_detections):
+    """Drop detections that disagree with both of their temporal neighbours.
+
+    The motion gate in _BallTracker only compares against the past, so a
+    distractor picked up right after a dropout can still slip through. Here we
+    have the whole sequence, so a point that sits far off the straight line
+    between its neighbours - while those neighbours agree with each other - is
+    removed before it can anchor the interpolation.
+    """
+    frames = sorted(raw_detections.keys())
+    if len(frames) < 3:
+        return dict(raw_detections)
+
+    kept = dict(raw_detections)
+    for i in range(1, len(frames) - 1):
+        fp, fc, fn = frames[i - 1], frames[i], frames[i + 1]
+        if fn - fp > 2 * _BALL_COAST_FRAMES:
+            continue
+        pp, pc, pn = raw_detections[fp], raw_detections[fc], raw_detections[fn]
+        span = fn - fp
+        if span <= 0:
+            continue
+        t = (fc - fp) / span
+        # Where the point should sit if it lay on the neighbours' chord.
+        ex = pp[0] + t * (pn[0] - pp[0])
+        ey = pp[1] + t * (pn[1] - pp[1])
+        residual = math.hypot(pc[0] - ex, pc[1] - ey)
+        neighbour_dist = math.hypot(pn[0] - pp[0], pn[1] - pp[1])
+        # Allow real curvature (the ball arcs), but not excursions that dwarf
+        # the neighbours' own separation.
+        tolerance = max(0.04, 0.6 * neighbour_dist)
+        if residual > tolerance:
+            kept.pop(fc, None)
+
+    # The loop above never tests the first or last anchor, but a track seeded
+    # on a static distractor puts the bad point exactly there. Trim the ends by
+    # extrapolating from the two neighbours just inside them.
+    kept = _trim_ball_endpoints(kept)
+
+    dropped = len(raw_detections) - len(kept)
+    if dropped:
+        print(f"[yolo] Rejected {dropped} outlier detection(s)", file=sys.stderr)
+    return kept
+
+
+def _trim_ball_endpoints(dets, max_trim=3):
+    """Drop leading/trailing detections that the adjacent pair does not predict."""
+    for _ in range(max_trim):
+        frames = sorted(dets.keys())
+        if len(frames) < 3:
+            break
+        changed = False
+        for end in ("head", "tail"):
+            frames = sorted(dets.keys())
+            if len(frames) < 3:
+                break
+            if end == "head":
+                f_out, f_a, f_b = frames[0], frames[1], frames[2]
+            else:
+                f_out, f_a, f_b = frames[-1], frames[-2], frames[-3]
+            if abs(f_out - f_a) > _BALL_COAST_FRAMES:
+                continue
+            pa, pb = dets[f_a], dets[f_b]
+            span = f_a - f_b
+            if span == 0:
+                continue
+            # Linear extrapolation from the inner pair out to f_out.
+            t = (f_out - f_b) / span
+            ex = pb[0] + t * (pa[0] - pb[0])
+            ey = pb[1] + t * (pa[1] - pb[1])
+            po = dets[f_out]
+            residual = math.hypot(po[0] - ex, po[1] - ey)
+            inner_dist = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+            if residual > max(0.06, 1.5 * inner_dist):
+                dets.pop(f_out, None)
+                changed = True
+        if not changed:
+            break
+    return dets
+
+
+def _keep_long_subtracks(dets, max_gap, min_track):
+    """Split the detection sequence at long gaps and drop short fragments.
+
+    Follows split_track() in yastrebksv/TrackNet: a run of detections is only
+    trusted as a real trajectory if it is long enough. Short islands, typically
+    a couple of frames locked onto a distractor, are removed rather than
+    interpolated across.
+    """
+    frames = sorted(dets.keys())
+    if not frames:
+        return dets
+
+    subtracks, current = [], [frames[0]]
+    for prev, curr in zip(frames, frames[1:]):
+        if curr - prev > max_gap:
+            subtracks.append(current)
+            current = [curr]
+        else:
+            current.append(curr)
+    subtracks.append(current)
+
+    kept = {}
+    dropped = 0
+    for st in subtracks:
+        if len(st) >= min_track:
+            for f in st:
+                kept[f] = dets[f]
+        else:
+            dropped += len(st)
+    if dropped:
+        print(f"[ball] Dropped {dropped} detection(s) in fragments shorter than "
+              f"{min_track} frames", file=sys.stderr)
+    return kept
+
+
 def _interpolate_ball_path(raw_detections):
     """Fill in ball positions for frames where YOLO missed a detection.
 
-    Uses cubic spline interpolation (scipy) when ≥4 anchors are available,
-    otherwise falls back to linear interpolation between consecutive detections.
-    Gaps larger than MAX_GAP frames are left empty (ball likely out of frame
-    or mid-rally break).
+    Interpolation is strictly local: each gap is filled from the anchors
+    immediately around it (PCHIP through up to 4 nearby anchors, linear as a
+    fallback). A single spline fitted across every detection in the video -
+    the previous behaviour - lets noise at one end of a rally ring through the
+    whole trajectory, which is what made the output unusable.
 
-    raw_detections: dict {frame_idx: [cx_norm, cy_norm, conf]}
+    Gaps longer than MAX_GAP frames are left empty (ball out of frame or a
+    break between rallies). Callers should pass detections that have already
+    been through _reject_ball_outliers.
 
-    Returns dict {frame_idx: {'pos': [cx, cy], 'conf': float, 'interpolated': bool}}
+    raw_detections: dict {frame_idx: [cx_norm, cy_norm, conf, ...bbox]}
+
+    Returns dict {frame_idx: {'pos': [cx, cy], 'conf': float,
+                              'bbox': list|None, 'interpolated': bool}}
     """
-    MAX_GAP = 60  # ~2 s at 30 fps — don't interpolate across a rally break
+    MAX_GAP = 18  # ~0.6 s at 30 fps - beyond this a guess is worse than a hole
+    # Discard fragments shorter than this; isolated specks are almost always
+    # false positives and, being too short to fit an arc, only add noise
+    # downstream. Mirrors split_track(min_track=5) in yastrebksv/TrackNet.
+    MIN_TRACK = 5
+    # Gap that ends a subtrack. Deliberately much smaller than MAX_GAP: this
+    # decides what counts as one continuous sighting of the ball, whereas
+    # MAX_GAP decides how far interpolation may reach. Using MAX_GAP here would
+    # glue a stray 2-frame island onto a genuine run and keep it.
+    SPLIT_GAP = 6
 
+    if not raw_detections:
+        return {}
+
+    raw_detections = _keep_long_subtracks(raw_detections, SPLIT_GAP, MIN_TRACK)
     if not raw_detections:
         return {}
 
@@ -263,59 +587,56 @@ def _interpolate_ball_path(raw_detections):
                      'bbox': [det[3], det[4], det[5], det[6]] if len(det) >= 7 else None,
                      'interpolated': False}
 
-    # Build spline over all detected frames if scipy is available
-    spline_done = False
-    if len(frames_with_ball) >= 4:
-        try:
-            from scipy.interpolate import CubicSpline
-            fi = [float(f) for f in frames_with_ball]
-            xs = [raw_detections[f][0] for f in frames_with_ball]
-            ys = [raw_detections[f][1] for f in frames_with_ball]
-            cs_x = CubicSpline(fi, xs, extrapolate=False)
-            cs_y = CubicSpline(fi, ys, extrapolate=False)
+    try:
+        from scipy.interpolate import PchipInterpolator
+        have_pchip = True
+    except Exception:
+        have_pchip = False
 
-            for i in range(len(frames_with_ball) - 1):
-                f_start = frames_with_ball[i]
-                f_end = frames_with_ball[i + 1]
-                gap = f_end - f_start
-                if gap <= 1 or gap > MAX_GAP:
-                    continue
-                for f in range(f_start + 1, f_end):
-                    cx = float(cs_x(f))
-                    cy = float(cs_y(f))
-                    result[f] = {
-                        'pos': [round(max(0.0, min(1.0, cx)), 6),
-                                round(max(0.0, min(1.0, cy)), 6)],
-                        'conf': 0.0,
-                        'bbox': None,
-                        'interpolated': True,
-                    }
-            spline_done = True
-        except Exception:
-            pass
+    for i in range(len(frames_with_ball) - 1):
+        f_start = frames_with_ball[i]
+        f_end = frames_with_ball[i + 1]
+        gap = f_end - f_start
+        if gap <= 1 or gap > MAX_GAP:
+            continue
 
-    if not spline_done:
-        # Linear interpolation between consecutive anchor frames
-        for i in range(len(frames_with_ball) - 1):
-            f_start = frames_with_ball[i]
-            f_end = frames_with_ball[i + 1]
-            gap = f_end - f_start
-            if gap <= 1 or gap > MAX_GAP:
-                continue
-            p_s = raw_detections[f_start]
-            p_e = raw_detections[f_end]
-            for f in range(f_start + 1, f_end):
+        # Local support: up to two anchors either side of the gap.
+        lo = max(0, i - 1)
+        hi = min(len(frames_with_ball), i + 3)
+        support = frames_with_ball[lo:hi]
+
+        interp = None
+        if have_pchip and len(support) >= 3:
+            try:
+                fi = [float(f) for f in support]
+                # PCHIP is shape-preserving: it will not overshoot between
+                # anchors the way a natural cubic spline does.
+                px = PchipInterpolator(fi, [raw_detections[f][0] for f in support])
+                py = PchipInterpolator(fi, [raw_detections[f][1] for f in support])
+                interp = (px, py)
+            except Exception:
+                interp = None
+
+        p_s = raw_detections[f_start]
+        p_e = raw_detections[f_end]
+        for f in range(f_start + 1, f_end):
+            if interp is not None:
+                cx = float(interp[0](f))
+                cy = float(interp[1](f))
+            else:
                 t = (f - f_start) / gap
                 cx = p_s[0] + t * (p_e[0] - p_s[0])
                 cy = p_s[1] + t * (p_e[1] - p_s[1])
-                result[f] = {
-                    'pos': [round(cx, 6), round(cy, 6)],
-                    'conf': 0.0,
-                    'bbox': None,
-                    'interpolated': True,
-                }
+            result[f] = {
+                'pos': [round(max(0.0, min(1.0, cx)), 6),
+                        round(max(0.0, min(1.0, cy)), 6)],
+                'conf': 0.0,
+                'bbox': None,
+                'interpolated': True,
+            }
 
     return result
+
 
 
 # ─── Volleyball Court Model (FIVB Standard) ─────────────────────────────
@@ -365,6 +686,140 @@ _CORNERS_PHYSICAL = [
     [COURT_WIDTH, COURT_LENGTH],
     [0, COURT_LENGTH],
 ]
+
+
+def _court_camera_focal(corners_norm, img_h, img_w):
+    """Focal length (px) implied by a detected court quad, or None if impossible.
+
+    The court is a known 18x9 rectangle, so the quad determines a homography.
+    A real camera with square pixels and a centred principal point imposes two
+    constraints on that homography (the first two columns of K^-1 H must be
+    orthogonal and equal length); each yields an estimate of f^2. If they are
+    negative or wildly inconsistent, the quad is simply not a perspective view
+    of a rectangle and no camera can explain it — which is exactly the case
+    that was producing 300+ px calibration error downstream.
+
+    Returning a focal length also lets candidate detections be ranked, instead
+    of blindly trusting whatever the first frame happened to produce.
+    """
+    try:
+        src = np.array(_CORNERS_PHYSICAL, dtype=np.float64)
+        dst = np.array([[c[0] * img_w, c[1] * img_h] for c in corners_norm], dtype=np.float64)
+        H, _ = cv2.findHomography(src, dst)
+        if H is None:
+            return None
+
+        cx, cy = img_w / 2.0, img_h / 2.0
+        h = H.copy()
+        h[0, :] -= cx * h[2, :]
+        h[1, :] -= cy * h[2, :]
+
+        h11, h12 = h[0, 0], h[0, 1]
+        h21, h22 = h[1, 0], h[1, 1]
+        h31, h32 = h[2, 0], h[2, 1]
+
+        cands = []
+        denA = h31 * h32
+        if abs(denA) > 1e-14:
+            cands.append(-(h11 * h12 + h21 * h22) / denA)
+        denB = h32 * h32 - h31 * h31
+        if abs(denB) > 1e-14:
+            cands.append(((h11 * h11 + h21 * h21) - (h12 * h12 + h22 * h22)) / denB)
+
+        cands = [c for c in cands if np.isfinite(c) and c > 1.0]
+        if not cands:
+            return None
+        f = float(np.sqrt(min(cands) if len(cands) == 1 else float(np.mean(cands))))
+        if not np.isfinite(f) or f <= 0:
+            return None
+        # Plausible broadcast range: roughly 3-90 degrees vertical FoV.
+        fov_y = 2 * np.degrees(np.arctan(img_h / (2 * f)))
+        if fov_y < 3.0 or fov_y > 90.0:
+            return None
+        return f
+    except Exception:
+        return None
+
+
+def _court_camera_from_corners(corners_norm, img_h, img_w):
+    """Full camera (focal px, centre in world metres) implied by a court quad.
+
+    Returns (f, C) or None. C is in the court frame used by the 3D view:
+    origin at court centre, x across, y up, z along the length.
+    """
+    f = _court_camera_focal(corners_norm, img_h, img_w)
+    if f is None:
+        return None
+    try:
+        src = np.array(_CORNERS_PHYSICAL, dtype=np.float64)
+        dst = np.array([[c[0] * img_w, c[1] * img_h] for c in corners_norm], dtype=np.float64)
+        H, _ = cv2.findHomography(src, dst)
+        if H is None:
+            return None
+        # Court-local (0..9, 0..18) -> centred (x, z) metres.
+        T = np.array([[1.0, 0.0, COURT_WIDTH / 2.0],
+                      [0.0, 1.0, COURT_LENGTH / 2.0],
+                      [0.0, 0.0, 1.0]])
+        Hc = H @ T
+        K = np.array([[f, 0, img_w / 2.0], [0, f, img_h / 2.0], [0, 0, 1.0]])
+        M = np.linalg.inv(K) @ Hc
+        n1 = np.linalg.norm(M[:, 0])
+        n2 = np.linalg.norm(M[:, 1])
+        if n1 < 1e-12 or n2 < 1e-12:
+            return None
+        lam = 2.0 / (n1 + n2)
+        r1 = M[:, 0] * lam
+        r3 = M[:, 1] * lam       # court "y" axis is world z
+        t = M[:, 2] * lam
+        if t[2] < 0:
+            r1, r3, t = -r1, -r3, -t
+        r2 = np.cross(r3, r1)
+        R = np.stack([r1, r2, r3], axis=1)
+        U, _, Vt = np.linalg.svd(R)
+        R = U @ Vt
+        C = -R.T @ t
+        if not np.all(np.isfinite(C)):
+            return None
+        return f, C
+    except Exception:
+        return None
+
+
+def _court_quad_score(corners_norm, img_h, img_w):
+    """Reject court quads that no plausible broadcast camera could produce.
+
+    Returns the implied camera centre (used later for cross-frame consensus)
+    or None. Deliberately NOT scored by quad area: a large arbitrary
+    quadrilateral usually still decomposes to some in-range focal length, so
+    area alone ranks a random blob above a real court.
+    """
+    cam = _court_camera_from_corners(corners_norm, img_h, img_w)
+    if cam is None:
+        return None
+    _f, C = cam
+
+    height = C[1]
+    dist = float(np.linalg.norm(C))
+    # A broadcast camera is above and outside the court, not underground and
+    # not kilometres away.
+    if not (2.0 <= height <= 45.0):
+        return None
+    if not (8.0 <= dist <= 160.0):
+        return None
+    # It should be roughly behind/above an end or side, not inside the court.
+    if abs(C[0]) > 60.0 or abs(C[2]) > 140.0:
+        return None
+
+    pts = np.array(corners_norm, dtype=np.float64)
+    area = 0.0
+    for i in range(4):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % 4]
+        area += x1 * y2 - x2 * y1
+    if abs(area) / 2.0 < 0.02:
+        return None
+
+    return C
 
 
 def _reproject_keypoints_from_corners(corners_norm, img_h, img_w):
@@ -1532,18 +1987,36 @@ def analyze_video_cv(video_path: str):
     _last_court_keypoints = None
 
     # Load YOLO model once (optional — ball detection gracefully disabled if unavailable)
-    yolo_model = _get_yolo_model()
+    tracknet = _get_tracknet_detector()
+    yolo_model = None if tracknet is not None else _get_yolo_model()
+    person_model = None
+    if tracknet is not None:
+        from ball_tracknet import measure_ball_diameter
+        person_model = _get_yolo_model()
+    ball_players = {}  # frame_idx -> person boxes near the ball
     ball_raw = {}   # frame_idx -> [cx_norm, cy_norm, conf, x1_norm, y1_norm, x2_norm, y2_norm]
+    ball_tracker = _BallTracker()
+    ball_diam = {}  # frame_idx -> apparent ball diameter (px), TrackNet only
+    n_ball_candidates = 0
+    # TrackNet consumes non-overlapping 3-frame windows, so frames are buffered
+    # here and the whole window is detected at once.
+    tn_buf, tn_idx = [], []
+    detector_name = "tracknet" if tracknet is not None else "yolo"
     
-    if yolo_model is None:
-        print("[yolo] No model available — skipping ball detection", file=sys.stderr)
+    if tracknet is None and yolo_model is None:
+        print("[ball] No detector available — skipping ball detection", file=sys.stderr)
     else:
-        print("[yolo] Model loaded, starting frame processing", file=sys.stderr)
+        print(f"[ball] Detector={detector_name}, starting frame processing", file=sys.stderr)
 
     # ── Pass 1: court + ball detection ────────────────────────────────────────────
     all_frame_data = []   # per-frame lightweight dicts (no raw pixels kept)
     court_data = []
     court_detected_once = False  # stop re-running court detection after first success
+    # Court-detection search: sample every Nth frame up to this frame, score each
+    # candidate, and keep the best one instead of the first.
+    COURT_SEARCH_STRIDE = 10
+    COURT_SEARCH_LAST_FRAME = 300
+    court_candidates = []  # (score, frame_idx, timestamp, corners)
     frame_idx = 0
 
     while True:
@@ -1556,30 +2029,67 @@ def analyze_video_cv(video_path: str):
 
         frame_court_corners = None
         frame_court_keypoints = None
-        if not court_detected_once:
+        # Sample several frames rather than trusting whichever quad frame 0
+        # happened to produce: a single bad detection there poisons the
+        # calibration and therefore every 3D position in the clip.
+        if not court_detected_once and frame_idx <= COURT_SEARCH_LAST_FRAME                 and frame_idx % COURT_SEARCH_STRIDE == 0:
             try:
-                corners = _detect_court_hough_fast(frame)
+                corners = None
+                try:
+                    from court_detect import detect_court_corners
+                    corners, cinfo = detect_court_corners(frame)
+                    if corners is None and frame_idx % 60 == 0:
+                        print(f"[court] Frame {frame_idx}: {cinfo}", file=sys.stderr)
+                    elif corners is not None and frame_idx % 60 == 0:
+                        print(f"[court] Frame {frame_idx}: {cinfo['hypothesis']} "
+                              f"score={cinfo['score']} lines={cinfo['lines']}", file=sys.stderr)
+                except Exception as ce:
+                    print(f"[court] colour detector failed ({ce}); using Hough", file=sys.stderr)
+                if corners is None:
+                    # Fall back to the old line-based detector.
+                    corners = _detect_court_hough_fast(frame)
                 if corners is not None:
-                    frame_court_corners = corners
-                    court_detected_once = True
-                    kps_reproj = _reproject_keypoints_from_corners(corners, fh, fw)
-                    if kps_reproj is not None:
-                        frame_court_keypoints = kps_reproj
-                        _last_court_keypoints = kps_reproj
-                    court_data.append({
-                        "frame": frame_idx,
-                        "timestamp": timestamp,
-                        "corners": corners,
-                        "keypoints": kps_reproj,
-                    })
-                    print(f"[court] Detected at frame {frame_idx}, stopping re-detection", file=sys.stderr)
+                    camC = _court_quad_score(corners, fh, fw)
+                    if camC is None:
+                        print(f"[court] Frame {frame_idx}: quad rejected "
+                              f"(no plausible camera)", file=sys.stderr)
+                    else:
+                        court_candidates.append((camC, frame_idx, timestamp, corners))
+                        print(f"[court] Frame {frame_idx}: candidate cam="
+                              f"[{camC[0]:.1f}, {camC[1]:.1f}, {camC[2]:.1f}]", file=sys.stderr)
             except Exception as e:
                 print(f"[court] Frame {frame_idx} error: {e}", file=sys.stderr)
 
-        # ── Ball detection (every frame) ─────────────────────────────────
-        if yolo_model is not None:
+        # ── Ball detection ───────────────────────────────────────────────
+        if tracknet is not None:
+            tn_buf.append(frame)
+            tn_idx.append(frame_idx)
+            if len(tn_buf) == 3:
+                try:
+                    per_frame = tracknet.detect_window(tn_buf)
+                    for fi_w, cands, frm in zip(tn_idx, per_frame, tn_buf):
+                        n_ball_candidates += len(cands)
+                        det = ball_tracker.update(fi_w, cands)
+                        if det is not None:
+                            ball_raw[fi_w] = det
+                            d_px = measure_ball_diameter(frm, det[0], det[1])
+                            if d_px is not None:
+                                ball_diam[fi_w] = d_px
+                            if person_model is not None:
+                                ball_players[fi_w] = _detect_players_near_ball(frm, person_model, det[0], det[1])
+                            if fi_w < 3 or fi_w % 50 == 0:
+                                print(f"[tracknet] Frame {fi_w}: ball at {det[0]:.3f}, {det[1]:.3f} conf={det[2]:.3f}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[tracknet] Window at frame {frame_idx} error: {e}", file=sys.stderr)
+                    if frame_idx < 6:
+                        import traceback
+                        traceback.print_exc(file=sys.stderr)
+                tn_buf, tn_idx = [], []
+        elif yolo_model is not None:
             try:
-                det = _detect_ball_yolo(frame, yolo_model)
+                cands = _detect_ball_candidates(frame, yolo_model)
+                n_ball_candidates += len(cands)
+                det = ball_tracker.update(frame_idx, cands)
                 if det is not None:
                     ball_raw[frame_idx] = det
                     if frame_idx < 3 or frame_idx % 50 == 0:
@@ -1605,13 +2115,115 @@ def analyze_video_cv(video_path: str):
             )
         frame_idx += 1
 
+    if tracknet is not None and tn_buf:
+        # Pad the trailing partial window with its last frame so the final
+        # 1-2 frames still get detections; only the real indices are consumed.
+        pad = list(tn_buf) + [tn_buf[-1]] * (3 - len(tn_buf))
+        try:
+            per_frame = tracknet.detect_window(pad)
+            for fi_w, cands, frm in zip(tn_idx, per_frame[:len(tn_idx)], tn_buf):
+                n_ball_candidates += len(cands)
+                det = ball_tracker.update(fi_w, cands)
+                if det is not None:
+                    ball_raw[fi_w] = det
+                    d_px = measure_ball_diameter(frm, det[0], det[1])
+                    if d_px is not None:
+                        ball_diam[fi_w] = d_px
+                    if person_model is not None:
+                        ball_players[fi_w] = _detect_players_near_ball(frm, person_model, det[0], det[1])
+        except Exception as e:
+            print(f"[tracknet] Tail window error: {e}", file=sys.stderr)
+        tn_buf, tn_idx = [], []
+
+    # ── Pick the best-scoring court detection across the sampled frames ────
+    if court_candidates:
+        # Consensus: a genuine court gives a similar camera on every frame it
+        # is found, while spurious quads scatter. Pick the candidate agreeing
+        # with the most others, so one lucky bad frame cannot win.
+        def _agreement(i):
+            Ci = court_candidates[i][0]
+            n = 0
+            for j, (Cj, _fj, _tj, _cj) in enumerate(court_candidates):
+                if i == j:
+                    continue
+                if np.linalg.norm(Ci - Cj) <= max(3.0, 0.15 * np.linalg.norm(Ci)):
+                    n += 1
+            return n
+
+        agreements = [_agreement(i) for i in range(len(court_candidates))]
+        best_i = int(np.argmax(agreements))
+        best_score = agreements[best_i]
+        _bc, best_fi, best_ts, best_corners = court_candidates[best_i]
+        print(f"[court] Consensus: candidate from frame {best_fi} agrees with "
+              f"{best_score}/{len(court_candidates) - 1} others", file=sys.stderr)
+        kps_reproj = _reproject_keypoints_from_corners(best_corners, fh, fw)
+        court_data.append({
+            "frame": best_fi,
+            "timestamp": best_ts,
+            "corners": best_corners,
+            "keypoints": kps_reproj,
+        })
+        _last_court_keypoints = kps_reproj
+        focal = _court_camera_focal(best_corners, fh, fw)
+        fov_y = 2 * np.degrees(np.arctan(fh / (2 * focal))) if focal else float("nan")
+        print(f"[court] Chose frame {best_fi} from {len(court_candidates)} candidate(s), "
+              f"implied fovY={fov_y:.2f} deg", file=sys.stderr)
+        # Attach to the frame it came from so the UI can draw it.
+        for fd in all_frame_data:
+            if fd['frame'] == best_fi:
+                fd['corners'] = best_corners
+                fd['keypoints'] = kps_reproj
+                break
+    else:
+        print("[court] No valid court detected in any sampled frame — "
+              "manual Align Court will be required", file=sys.stderr)
+
     cap.release()
 
+    # ── Safety net: fall back to YOLO if TrackNet found almost nothing ─────
+    # TrackNet is trained on real broadcast volleyball; if this footage is far
+    # enough outside that distribution that it fires on almost nothing, a
+    # weaker detector is still much better than an empty trajectory.
+    if tracknet is not None and frame_idx > 0:
+        coverage = len(ball_raw) / frame_idx
+        print(f"[tracknet] Peak heatmap response over the clip: "
+              f"{getattr(tracknet, 'max_peak', 0.0):.3f} "
+              f"(detection threshold {0.5})", file=sys.stderr)
+        if coverage < 0.05:
+            print(f"[ball] TrackNet covered only {coverage*100:.1f}% of frames — "
+                  f"retrying with YOLO", file=sys.stderr)
+            yolo_model = _get_yolo_model()
+            if yolo_model is not None:
+                ball_raw = {}
+                ball_diam = {}
+                ball_players = {}
+                ball_tracker = _BallTracker()
+                n_ball_candidates = 0
+                detector_name = "yolo (tracknet fallback)"
+                cap2 = cv2.VideoCapture(video_path)
+                fi2 = 0
+                while True:
+                    ret2, frame2 = cap2.read()
+                    if not ret2:
+                        break
+                    try:
+                        cands = _detect_ball_candidates(frame2, yolo_model)
+                        n_ball_candidates += len(cands)
+                        det = ball_tracker.update(fi2, cands)
+                        if det is not None:
+                            ball_raw[fi2] = det
+                    except Exception as e:
+                        print(f"[yolo] Frame {fi2} error: {e}", file=sys.stderr)
+                    fi2 += 1
+                cap2.release()
+
     # ── Interpolate ball trajectory for frames with no detection ──────────
+    # Reject outliers before the depth pass so both stages see the same points.
+    ball_raw = _reject_ball_outliers(ball_raw)
     ball_path = _interpolate_ball_path(ball_raw)
     n_ball_detected = len(ball_raw)
     n_ball_total = len(ball_path)
-    print(f"[yolo] Ball: {n_ball_detected} raw detections, "
+    print(f"[ball] {detector_name}: {n_ball_candidates} candidates -> {n_ball_detected} tracked, "
           f"{n_ball_total - n_ball_detected} interpolated, "
           f"{n_ball_total} total", file=sys.stderr)
 
@@ -1670,6 +2282,10 @@ def analyze_video_cv(video_path: str):
             frame_msg["ball_conf"] = bd['conf']
             if bd['bbox'] is not None:
                 frame_msg["ball_bbox"] = bd['bbox']
+            if not bd['interpolated'] and fi in ball_diam:
+                frame_msg["ball_diameter_px"] = ball_diam[fi]
+            if not bd['interpolated'] and fi in ball_players:
+                frame_msg["players_near_ball"] = ball_players[fi]
             # Depth estimate available only for YOLO-detected (non-interpolated) frames
             if fi in ball_depth:
                 frame_msg["ball_depth_estimate"] = ball_depth[fi]

@@ -249,10 +249,13 @@ function reprojectionError(
   worldPoints: { x: number; y: number; z: number }[]
 ): number {
   const [cx, cy, cz, lx, ly, lz, fov] = params;
-  if (cy < 1 || cy > 40) return 1e9;
-  if (fov < 5 || fov > 80) return 1e9;
-  if (cz < 5 || cz > 80) return 1e9;
-  if (Math.abs(cx) > 20) return 1e9;
+  // Bounds only exclude physically absurd cameras. They were previously tight
+  // enough that solutions came back sitting exactly on the cz limit, which is a
+  // sign the optimiser was pinned rather than converged.
+  if (cy < 1 || cy > 60) return 1e9;
+  if (fov < 3 || fov > 90) return 1e9;
+  if (cz < 5 || cz > 200) return 1e9;
+  if (Math.abs(cx) > 40) return 1e9;
 
   const camPos = new THREE.Vector3(cx, cy, cz);
   const lookAt = new THREE.Vector3(lx, ly, lz);
@@ -321,6 +324,184 @@ function nelderMead(
 // Public API
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Planar (homography) calibration
+//
+// Every court keypoint lies on the ground plane y=0. DLT for a full 3x4
+// projection matrix is degenerate for coplanar points — the linear system is
+// rank-deficient, so it returns an arbitrary member of a family of solutions.
+// That is what produced calibrations like fov=5.2deg at z=80m with a 141px
+// reprojection error. For a planar target the correct route is a 3x3
+// homography plus Zhang-style decomposition, which is well conditioned.
+// ---------------------------------------------------------------------------
+
+/** Estimate the 3x3 homography mapping world (x, z) on plane y=0 to image pixels. */
+function homographyFromPlanar(ptsWorldXZ: number[][], pts2d: number[][]): number[][] | null {
+  const n = ptsWorldXZ.length;
+  if (n < 4) return null;
+
+  // Isotropic normalisation of both point sets (Hartley), for conditioning.
+  const norm = (pts: number[][]) => {
+    let mx = 0, my = 0;
+    for (const [a, b] of pts) { mx += a; my += b; }
+    mx /= pts.length; my /= pts.length;
+    let d = 0;
+    for (const [a, b] of pts) d += Math.hypot(a - mx, b - my);
+    d /= pts.length;
+    const sc = d > 1e-12 ? Math.SQRT2 / d : 1;
+    return {
+      sc, mx, my,
+      out: pts.map(([a, b]) => [(a - mx) * sc, (b - my) * sc]),
+    };
+  };
+
+  const W = norm(ptsWorldXZ);
+  const I = norm(pts2d);
+
+  const A: number[][] = [];
+  for (let i = 0; i < n; i++) {
+    const [X, Y] = W.out[i];
+    const [u, v] = I.out[i];
+    A.push([-X, -Y, -1, 0, 0, 0, u * X, u * Y, u]);
+    A.push([0, 0, 0, -X, -Y, -1, v * X, v * Y, v]);
+  }
+
+  const h = svdNullVector(A);
+  if (!h || h.length !== 9) return null;
+
+  const Hn = [
+    [h[0], h[1], h[2]],
+    [h[3], h[4], h[5]],
+    [h[6], h[7], h[8]],
+  ];
+
+  // Undo normalisation: H = Ti^-1 * Hn * Tw
+  const Tw = [[W.sc, 0, -W.sc * W.mx], [0, W.sc, -W.sc * W.my], [0, 0, 1]];
+  const TiInv = [[1 / I.sc, 0, I.mx], [0, 1 / I.sc, I.my], [0, 0, 1]];
+  const mul = (a: number[][], b: number[][]) => {
+    const r = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++)
+        for (let k = 0; k < 3; k++) r[i][j] += a[i][k] * b[k][j];
+    return r;
+  };
+  return mul(TiInv, mul(Hn, Tw));
+}
+
+/**
+ * Decompose a planar homography into camera pose and focal length.
+ *
+ * Assumes square pixels and a centred principal point, leaving focal length as
+ * the only intrinsic unknown. The two orthonormality constraints on the first
+ * two columns of K^-1 H each yield an estimate of f^2; whichever is better
+ * conditioned is used.
+ */
+function calibrationFromHomography(
+  H: number[][],
+  imgW: number,
+  imgH: number,
+): CalibrationResult | null {
+  // Move the principal point to the image centre.
+  const cx = imgW / 2, cy = imgH / 2;
+  const h = [
+    [H[0][0] - cx * H[2][0], H[0][1] - cx * H[2][1], H[0][2] - cx * H[2][2]],
+    [H[1][0] - cy * H[2][0], H[1][1] - cy * H[2][1], H[1][2] - cy * H[2][2]],
+    [H[2][0], H[2][1], H[2][2]],
+  ];
+
+  const h11 = h[0][0], h12 = h[0][1];
+  const h21 = h[1][0], h22 = h[1][1];
+  const h31 = h[2][0], h32 = h[2][1];
+
+  // r1 . r2 = 0  ->  f^2 = -(h11*h12 + h21*h22) / (h31*h32)
+  const denA = h31 * h32;
+  const f2a = Math.abs(denA) > 1e-14 ? -(h11 * h12 + h21 * h22) / denA : NaN;
+  // |r1| = |r2|  ->  f^2 = ((h11^2+h21^2) - (h12^2+h22^2)) / (h32^2 - h31^2)
+  const denB = h32 * h32 - h31 * h31;
+  const f2b = Math.abs(denB) > 1e-14
+    ? ((h11 * h11 + h21 * h21) - (h12 * h12 + h22 * h22)) / denB
+    : NaN;
+
+  const cands = [f2a, f2b].filter((v) => Number.isFinite(v) && v > 1);
+  if (cands.length === 0) return null;
+  // Prefer the better-conditioned constraint; average when both agree.
+  let f2: number;
+  if (cands.length === 2 && Math.abs(cands[0] - cands[1]) / Math.max(...cands) < 0.5) {
+    f2 = (cands[0] + cands[1]) / 2;
+  } else {
+    f2 = Math.abs(denA) > Math.abs(denB) ? cands[0] : cands[cands.length - 1];
+  }
+  const f = Math.sqrt(f2);
+  if (!Number.isFinite(f) || f <= 0) return null;
+
+  // K^-1 applied to the columns of h.
+  const kinv = (c: number[]) => [c[0] / f, c[1] / f, c[2]];
+  const c1 = kinv([h[0][0], h[1][0], h[2][0]]);
+  const c2 = kinv([h[0][1], h[1][1], h[2][1]]);
+  const c3 = kinv([h[0][2], h[1][2], h[2][2]]);
+
+  const n1 = Math.hypot(c1[0], c1[1], c1[2]);
+  const n2 = Math.hypot(c2[0], c2[1], c2[2]);
+  if (n1 < 1e-12 || n2 < 1e-12) return null;
+  let lambda = 2 / (n1 + n2);   // average the two scale estimates
+
+  // World y=0, so H's columns correspond to the world x and z axes.
+  let r1 = c1.map((v) => v * lambda);
+  let r3 = c2.map((v) => v * lambda);
+  let t  = c3.map((v) => v * lambda);
+
+  // The court must be in front of the camera; flip the sign if not.
+  if (t[2] < 0) {
+    lambda = -lambda;
+    r1 = c1.map((v) => v * lambda);
+    r3 = c2.map((v) => v * lambda);
+    t  = c3.map((v) => v * lambda);
+  }
+
+  // Right-handed frame: columns are (world x, world y, world z).
+  const r2: number[] = [
+    r3[1] * r1[2] - r3[2] * r1[1],
+    r3[2] * r1[0] - r3[0] * r1[2],
+    r3[0] * r1[1] - r3[1] * r1[0],
+  ];
+
+  // Re-orthonormalise R = [r1, r2, r3] (columns) via Gram-Schmidt.
+  const sub = (a: number[], b: number[], k: number) => a.map((v, i) => v - k * b[i]);
+  const nrm = (a: number[]) => { const m = Math.hypot(a[0], a[1], a[2]); return a.map((v) => v / m); };
+  const e1 = nrm(r1);
+  const e2 = nrm(sub(r2, e1, r2[0] * e1[0] + r2[1] * e1[1] + r2[2] * e1[2]));
+  const e3n = sub(sub(r3, e1, r3[0] * e1[0] + r3[1] * e1[1] + r3[2] * e1[2]), e2,
+                  r3[0] * e2[0] + r3[1] * e2[1] + r3[2] * e2[2]);
+  const e3 = nrm(e3n);
+  // R has columns e1,e2,e3 -> R[row][col]
+  const R = [
+    [e1[0], e2[0], e3[0]],
+    [e1[1], e2[1], e3[1]],
+    [e1[2], e2[2], e3[2]],
+  ];
+
+  // Camera centre C = -R^T t
+  const C: [number, number, number] = [
+    -(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]),
+    -(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]),
+    -(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]),
+  ];
+  if (!C.every(Number.isFinite)) return null;
+
+  // Camera looks along +z_cam, which in world coords is the third row of R.
+  const lookDir = [R[2][0], R[2][1], R[2][2]];
+  const lookAt: [number, number, number] = [
+    C[0] + lookDir[0] * 10,
+    C[1] + lookDir[1] * 10,
+    C[2] + lookDir[2] * 10,
+  ];
+
+  const fov = (2 * Math.atan(imgH / (2 * f)) * 180) / Math.PI;
+  if (!Number.isFinite(fov) || fov <= 0) return null;
+
+  return { fov, position: C, lookAt };
+}
+
 export function solveCameraIterative(
   ndcPoints: { x: number; y: number }[],
   aspect: number,
@@ -342,17 +523,35 @@ export function solveCameraIterative(
   ]);
   const pts3d = modelPoints.map(c => [c.x, c.y, c.z]);
 
-  // Step 1: DLT analytical seed
+  // Step 1: analytical seed.
+  // The court is planar, so a homography is the well-conditioned route; the
+  // 3x4 DLT below is only a fallback for the (unused) non-coplanar case.
   let dltSeed: number[] | null = null;
-  const P = dltSolveP(pts3d, pts2d);
-  if (P) {
-    const decomp = decomposeP(P, imgH);
-    if (decomp) {
-      const { fov, position, lookAt } = decomp;
-      if (fov >= 5 && fov <= 80 && position[1] >= 1 && position[1] <= 40 &&
-          position[2] >= 5 && position[2] <= 80 && Math.abs(position[0]) <= 20) {
-        dltSeed = [position[0], position[1], position[2], lookAt[0], lookAt[1], lookAt[2], fov];
-        log.push(`DLT seed: fov=${fov.toFixed(1)}°, pos=[${position.map(v => (+v).toFixed(2)).join(", ")}]`);
+  const coplanar = modelPoints.every((p) => Math.abs(p.y) < 1e-6);
+
+  if (coplanar) {
+    const H = homographyFromPlanar(modelPoints.map((p) => [p.x, p.z]), pts2d);
+    const hCal = H ? calibrationFromHomography(H, imgW, imgH) : null;
+    if (hCal) {
+      const { fov, position, lookAt } = hCal;
+      dltSeed = [position[0], position[1], position[2], lookAt[0], lookAt[1], lookAt[2], fov];
+      log.push(
+        `Homography seed: fov=${fov.toFixed(1)}°, pos=[${position.map((v) => (+v).toFixed(2)).join(", ")}]`,
+      );
+    } else {
+      log.push("Homography seed failed — falling back to search");
+    }
+  } else {
+    const P = dltSolveP(pts3d, pts2d);
+    if (P) {
+      const decomp = decomposeP(P, imgH);
+      if (decomp) {
+        const { fov, position, lookAt } = decomp;
+        if (fov >= 5 && fov <= 80 && position[1] >= 1 && position[1] <= 40 &&
+            position[2] >= 5 && position[2] <= 80 && Math.abs(position[0]) <= 20) {
+          dltSeed = [position[0], position[1], position[2], lookAt[0], lookAt[1], lookAt[2], fov];
+          log.push(`DLT seed: fov=${fov.toFixed(1)}°, pos=[${position.map(v => (+v).toFixed(2)).join(", ")}]`);
+        }
       }
     }
   }
@@ -394,6 +593,37 @@ export function solveCameraIterative(
     const params = nelderMead(cost, s, scales);
     const c = cost(params);
     if (c < bestCost) { bestCost = c; bestParams = params; }
+  }
+
+  // The analytic homography solution is exact for a planar target, so it is
+  // the reference. Free refinement of all 7 parameters can wander down the
+  // focal-length/distance ambiguity valley — a distant camera with a narrow
+  // lens looks almost identical to a nearer one with a wide lens — and end up
+  // sitting on a bound (observed: fov pinned at 3 deg with the camera 136 m
+  // out). Keep the refinement only when it genuinely fits better.
+  if (dltSeed) {
+    const seedCost = cost(dltSeed);
+    const atBound =
+      bestParams[6] <= 3.05 || bestParams[6] >= 89.5 ||
+      bestParams[2] >= 199 || bestParams[1] >= 59.5;
+    if (atBound || !(bestCost < seedCost)) {
+      log.push(
+        `Refinement rejected (${atBound ? "hit a parameter bound" : "no improvement"}); ` +
+        `keeping analytic homography solution.`,
+      );
+      bestParams = dltSeed;
+      bestCost = seedCost;
+    }
+  }
+
+  // Report the fit in pixels — far more interpretable than the raw NDC cost.
+  const avgPxErr = Math.sqrt(bestCost / Math.max(1, ndcPoints.length)) * (imgH / 2);
+  log.push(`Reprojection error: ~${avgPxErr.toFixed(1)} px/point over ${ndcPoints.length} points`);
+  if (avgPxErr > 25) {
+    log.push(
+      `WARNING: court keypoints do not fit any physical camera (${avgPxErr.toFixed(0)} px). ` +
+      `The detected court is probably wrong — recalibrate the court manually.`,
+    );
   }
 
   const [cx, cy, cz, lx, ly, lz, fov] = bestParams;

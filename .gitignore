@@ -17,6 +17,8 @@ runs/
 # Model files (too large for GitHub)
 *.pt
 *.pth
+*.pth.tar
+python/models/
 *.onnx
 *.task
 
