@@ -1,0 +1,252 @@
+{
+  "clip": "usa_jap_r2",
+  "touches": [
+    {
+      "frame": 54,
+      "type": "toss",
+      "feet": [
+        0.10938,
+        0.5875
+      ]
+    },
+    {
+      "frame": 93,
+      "type": "serve",
+      "feet": [
+        0.18828,
+        0.53472
+      ]
+    },
+    {
+      "frame": 109,
+      "type": "reception",
+      "feet": [
+        0.81016,
+        0.59861
+      ]
+    },
+    {
+      "frame": 163,
+      "type": "set",
+      "feet": [
+        0.60859,
+        0.46806
+      ]
+    },
+    {
+      "frame": 188,
+      "type": "attack",
+      "feet": [
+        0.75234,
+        0.42361
+      ]
+    },
+    {
+      "frame": 195,
+      "type": "dig",
+      "feet": [
+        0.30391,
+        0.49861
+      ]
+    },
+    {
+      "frame": 238,
+      "type": "set",
+      "feet": [
+        0.54375,
+        0.64444
+      ]
+    },
+    {
+      "frame": 266,
+      "type": "attack",
+      "feet": [
+        0.31016,
+        0.70556
+      ]
+    },
+    {
+      "frame": 275,
+      "type": "dig",
+      "feet": [
+        0.725,
+        0.52639
+      ]
+    },
+    {
+      "frame": 316,
+      "type": "set",
+      "feet": [
+        0.84219,
+        0.78333
+      ]
+    },
+    {
+      "frame": 375,
+      "type": "attack",
+      "feet": [
+        0.74844,
+        0.45694
+      ]
+    },
+    {
+      "frame": 391,
+      "type": "dig",
+      "feet": [
+        0.23984,
+        0.55278
+      ]
+    },
+    {
+      "frame": 431,
+      "type": "set",
+      "feet": [
+        0.45312,
+        0.69583
+      ]
+    },
+    {
+      "frame": 453,
+      "type": "attack",
+      "feet": [
+        0.31328,
+        0.52222
+      ]
+    }
+  ],
+  "court": {
+    "view": "side",
+    "points": [
+      {
+        "id": 0,
+        "name": "far sideline, left end",
+        "world": [
+          4.5,
+          -9
+        ],
+        "frame": 0,
+        "pt": [
+          0.29922,
+          0.5375
+        ]
+      },
+      {
+        "id": 1,
+        "name": "far sideline, left 3 m line",
+        "world": [
+          4.5,
+          -3
+        ],
+        "frame": 0,
+        "pt": [
+          0.49062,
+          0.54722
+        ]
+      },
+      {
+        "id": 2,
+        "name": "far sideline, centre line",
+        "world": [
+          4.5,
+          0
+        ],
+        "frame": 0,
+        "pt": [
+          0.58828,
+          0.54861
+        ]
+      },
+      {
+        "id": 3,
+        "name": "far sideline, right 3 m line",
+        "world": [
+          4.5,
+          3
+        ],
+        "frame": 0,
+        "pt": [
+          0.68672,
+          0.55417
+        ]
+      },
+      {
+        "id": 4,
+        "name": "far sideline, right end",
+        "world": [
+          4.5,
+          9
+        ],
+        "frame": 0,
+        "pt": [
+          0.89141,
+          0.55972
+        ]
+      },
+      {
+        "id": 5,
+        "name": "near sideline, left end",
+        "world": [
+          -4.5,
+          -9
+        ],
+        "frame": 0,
+        "pt": [
+          0.20859,
+          0.73611
+        ]
+      },
+      {
+        "id": 6,
+        "name": "near sideline, left 3 m line",
+        "world": [
+          -4.5,
+          -3
+        ],
+        "frame": 0,
+        "pt": [
+          0.45859,
+          0.74861
+        ]
+      },
+      {
+        "id": 7,
+        "name": "near sideline, centre line",
+        "world": [
+          -4.5,
+          0
+        ],
+        "frame": 0,
+        "pt": [
+          0.58594,
+          0.75417
+        ]
+      },
+      {
+        "id": 8,
+        "name": "near sideline, right 3 m line",
+        "world": [
+          -4.5,
+          3
+        ],
+        "frame": 0,
+        "pt": [
+          0.71016,
+          0.76389
+        ]
+      },
+      {
+        "id": 9,
+        "name": "near sideline, right end",
+        "world": [
+          -4.5,
+          9
+        ],
+        "frame": 0,
+        "pt": [
+          0.98438,
+          0.77917
+        ]
+      }
+    ]
+  }
+}

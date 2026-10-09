@@ -32,3 +32,18 @@ python/models/
 *.njsproj
 *.sln
 *.sw?
+
+# Eval outputs (regenerate with npm run eval / npm run tune)
+eval/report.html
+eval/last.json
+eval/tuned-params.json
+eval/tune-report.json
+
+# Downloaded eval clips (rebuild with python python/fetch_clip.py --list eval/clip_sources.json)
+eval/videos/
+
+# Python bytecode
+__pycache__/
+
+# Generated court check images (python/propagate_court.py)
+eval/labels/court_checks/

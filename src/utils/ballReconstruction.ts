@@ -88,6 +88,11 @@ export interface BallReconstructionOptions {
    * Default: false.
    */
   disableBboxDepthPrior?: boolean;
+  /**
+   * Overrides for the rally solver's tuned numbers (physics-reprojection
+   * mode). Unset fields keep DEFAULT_RALLY_PARAMS; `rules` merges per touch.
+   */
+  rallyParams?: Partial<Omit<RallyParams, "rules">> & { rules?: Partial<RallyParams["rules"]> };
 }
 
 export interface ReconstructionStats {
@@ -213,6 +218,8 @@ export interface BallTrajectoryResult {
   shortArcRejectReason?: string | null;
   /** Player touches found by the rally solver (physics-reprojection mode). */
   touches?: BallTouch[];
+  /** Every candidate touch split and the decision on it (diagnostics). */
+  touchSplits?: TouchSplitDecision[];
 }
 
 /** One touch of the ball in a rally, as placed by the rally solver. */
@@ -856,10 +863,6 @@ function _fitQuadratic(ts: number[], ys: number[]): [number, number, number] {
   ];
 }
 
-/** Image-space deviation (px) that marks a player touch. */
-const TOUCH_SPLIT_PX = 10;
-/** Observations a segment needs before touch detection can split it. */
-const TOUCH_MIN_SEG = 5;
 
 /**
  * Split a continuous ball track at player touches.
@@ -872,11 +875,11 @@ const TOUCH_MIN_SEG = 5;
  * must both deviate, so a single noisy detection does not cut an arc.
  */
 function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number): ArcObsEx[][] {
-  if (obs.length < 2 * TOUCH_MIN_SEG) return [obs];
+  if (obs.length < 2 * P.touchMinSeg) return [obs];
   const hw = videoWidth / 2, hh = videoHeight / 2;
   const out: ArcObsEx[][] = [];
   let start = 0;
-  let i = start + TOUCH_MIN_SEG;
+  let i = start + P.touchMinSeg;
   while (i < obs.length - 1) {
     const seg = obs.slice(start, i);
     const t0 = seg[0].t;
@@ -890,10 +893,11 @@ function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number
         (cv[0] + cv[1] * t + cv[2] * t * t - o.v) * hh,
       );
     };
-    if (devPx(obs[i]) > TOUCH_SPLIT_PX && devPx(obs[i + 1]) > TOUCH_SPLIT_PX) {
+    const splitPx = Math.max(TOUCH_SPLIT_MIN_PX, P.touchSplitM / courtMetresPerPx);
+    if (devPx(obs[i]) > splitPx && devPx(obs[i + 1]) > splitPx) {
       out.push(obs.slice(start, i));
       start = i;
-      i = start + TOUCH_MIN_SEG;
+      i = start + P.touchMinSeg;
     } else {
       i++;
     }
@@ -918,56 +922,191 @@ function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number
 // A split where there was no real touch costs nothing: the knot simply lands
 // on the arc.
 
-/** Max seconds between segments for them to belong to the same rally. */
-const RALLY_MAX_GAP_S = 0.5;
-/** Touches happen at player height. Soft bound on knot height (m). */
+/**
+ * A knot this low (ball centre, m) is the ball on the floor: the play is over
+ * and later knots are bounces or catches, not touches. A ball resting on the
+ * floor has its centre at 0.105 m; real digs are played well above that.
+ */
+const FLOOR_CONTACT_Y_M = 0.3;
+/** A flight whose arc gets this low (ball centre, m) has reached the floor. */
+const FLOOR_ARC_Y_M = 0.15;
+/** Touches happen at player height: floor of the soft bound on knot height (m). */
 const KNOT_MIN_Y_M = 0;
-const KNOT_MAX_Y_M = 4.5;
 /** Soft bounds on where the ball can be (m): court plus free zone. */
 const RALLY_MAX_ABS_X_M = COURT_HALF_W + 5;
 const RALLY_MAX_ABS_Z_M = COURT_HALF_L + 8;
-/** Speeds above this (m/s) are penalised; a hard men's jump serve is ~30 m/s. */
-const RALLY_SOFT_MAX_SPEED_MPS = 30;
-/** Residual px per m/s of velocity change at a knot (see touch impulse prior). */
-const TOUCH_IMPULSE_WEIGHT = 0.3;
-/**
- * Residual px per unit of log-depth error for the apparent-size prior. Size is
- * measured to roughly ±15% per frame, so this makes a typical size error cost
- * about as much as a 3 px reprojection error.
- */
-const SIZE_DEPTH_WEIGHT = 10;
-/** |log depth error| beyond which a size measurement is discarded (~35%). */
-const SIZE_DEPTH_OUTLIER = 0.3;
-/**
- * Bounds on each segment's effective downward acceleration (m/s²). Pure
- * gravity is wrong for a volleyball: topspin on a jump serve or spike adds
- * Magnus force and can roughly double the drop, and a float serve sags under
- * drag. Forcing exactly g made the solver explain a spinning serve's extra
- * curvature as "closer to the camera", pulling it onto the wrong side of the
- * net. Within these bounds curvature no longer overrides the size cue.
- */
-const ACCEL_MIN = 0.8 * GRAVITY;
-const ACCEL_MAX = 2.2 * GRAVITY;
-/**
- * Weight of a touch point's own image position (per px). Below 1 because in a
- * gap it comes from the analyzer's straight-line fill, which cuts the corner
- * of the turn by a few px.
- */
-const KNOT_IMAGE_WEIGHT = 0.4;
-/** Rejected segments up to this many samples between accepted ones are bridged. */
-const BRIDGE_MAX_FRAMES = 6;
-/** Scale (px) of the robust reprojection loss in the rally solver. */
-const ROBUST_REPROJ_PX = 5;
-/** Reprojection error (px) above which an observation is treated as an outlier. */
-const RALLY_OUTLIER_PX = 25;
-/** Per-segment acceptance limits. */
-// Median, not mean: TrackNet occasionally sits ~15 px off the ball for a few
-// frames (seen mid-set on broadcast footage), which says nothing about the arc.
-// Under a broadcast lens (f ~ 6600 px at 45-55 m) 10 px is ~7 cm at the ball.
-const SEG_MAX_MEDIAN_ERR_PX = 10;
-/** Share of a segment's samples that must lie within RALLY_OUTLIER_PX. */
-const SEG_MIN_INLIER_FRAC = 0.7;
 const SEG_MAX_Y_M = 10;
+
+/**
+ * Where one type of touch can happen (see applyRallyRules). The side of the
+ * net is derived from who served; these are the distances and heights.
+ */
+export interface TouchRule {
+  /** Distance from the net (m), measured into the touching team's half. */
+  minAbsZ: number;
+  maxAbsZ: number;
+  /** Contact height range (m). */
+  minY: number;
+  maxY: number;
+  /**
+   * Effective downward acceleration (multiples of g) of the flight that this
+   * touch starts. Only serves and attacks carry heavy topspin; a toss, pass
+   * or set falls at about g, and letting those drop faster makes them short
+   * and flat instead of the high arcs they are.
+   */
+  minG: number;
+  maxG: number;
+}
+
+/**
+ * Every tuned number of the rally solver, in one place, so tests and the
+ * tuner (src/eval) can vary them without editing code. Defaults were set on
+ * broadcast 1080p footage (France vs Japan); see each field for why.
+ */
+export interface RallyParams {
+  /**
+   * Deviation from a smooth curve that marks a candidate touch split, in
+   * metres at the court (converted to pixels per clip; see courtMetresPerPx).
+   * 0.071 m is 10 px on the France vs Japan broadcast camera.
+   */
+  touchSplitM: number;
+  /** Observations a segment needs before touch detection can split it. */
+  touchMinSeg: number;
+  /**
+   * Minimum jump in the ball's image velocity for a split to count as a
+   * touch, in m/s at the court (converted per clip, so zoom and camera
+   * distance don't change it). Measured on the France vs Japan broadcast
+   * camera, where 1 px is ~7 mm: real touches (serve contact, reception, set,
+   * attack) change it by ~950-1900 px/s (6.7-13 m/s); spurious splits from
+   * detection jitter, perspective or the slow top of a serve toss by
+   * ~70-420 px/s (0.5-3 m/s).
+   */
+  touchMinDvMps: number;
+  /**
+   * Max seconds without the ball for two pieces of track to belong to the
+   * same rally. Real side-view broadcasts lose a fast serve for 0.5-1 s; at
+   * 0.5 the reception started a "new rally" and was labelled a serve. Real
+   * rallies are seconds apart. 1.0 scored best on the labelled real clips.
+   */
+  rallyMaxGapS: number;
+  /** Ceiling of the soft bound on knot (touch) height (m). */
+  knotMaxY: number;
+  /** Speeds above this (m/s) are penalised; a hard men's jump serve is ~30 m/s. */
+  softMaxSpeed: number;
+  /** Residual px per m/s of velocity change at a knot (touch impulse prior). */
+  touchImpulseWeight: number;
+  /**
+   * Residual px per unit of log-depth error for the apparent-size prior. Size
+   * is measured to roughly ±15% per frame and is biased in front of the crowd.
+   */
+  sizeDepthWeight: number;
+  /** |log depth error| beyond which a size measurement is discarded (~35%). */
+  sizeDepthOutlier: number;
+  /**
+   * Bounds (multiples of g) on the effective downward acceleration of flights
+   * without a touch rule. Pure gravity is wrong for a volleyball: topspin adds
+   * Magnus force and can roughly double the drop, and forcing exactly g made
+   * the solver explain a spinning serve's extra curvature as "closer to the
+   * camera", pulling it onto the wrong side of the net.
+   */
+  accelMinG: number;
+  accelMaxG: number;
+  /**
+   * Weight of a touch point's own image position (per px). Below 1 because in
+   * a gap it comes from the analyzer's straight-line fill, which cuts the
+   * corner of the turn by a few px.
+   */
+  knotImageWeight: number;
+  /** Rejected segments up to this many samples between accepted ones are bridged. */
+  bridgeMaxFrames: number;
+  /** Scale (px) of the robust reprojection loss in the rally solver. */
+  robustReprojPx: number;
+  /** Reprojection error (px) above which an observation is treated as an outlier. */
+  rallyOutlierPx: number;
+  /**
+   * Per-segment acceptance: median error, not mean. TrackNet occasionally sits
+   * ~15 px off the ball for a few frames, which says nothing about the arc.
+   * Under a broadcast lens (f ~ 6600 px at 45-55 m) 10 px is ~7 cm at the ball.
+   */
+  segMaxMedianErrPx: number;
+  /** Share of a segment's samples that must lie within rallyOutlierPx. */
+  segMinInlierFrac: number;
+  /** Frames either side searched for a player's lowest feet (take-off spot). */
+  playerTrackFrames: number;
+  /** Residual px per metre between a knot and its nearest candidate player. */
+  anchorWeight: number;
+  /** Distance (m) beyond which the anchor pull stops growing (robust). */
+  anchorRobustM: number;
+  /** A player beyond this |z| (m) at the start of a rally is serving. */
+  serverMinAbsZ: number;
+  /** Where each touch type can happen, in rally order. */
+  rules: {
+    toss: TouchRule;
+    serve: TouchRule;
+    reception: TouchRule;
+    set: TouchRule;
+    attack: TouchRule;
+    block: TouchRule;
+  };
+}
+
+export const DEFAULT_RALLY_PARAMS: RallyParams = {
+  touchSplitM: 0.071,
+  touchMinSeg: 5,
+  touchMinDvMps: 3.55,
+  rallyMaxGapS: 1.0,
+  knotMaxY: 4.5,
+  softMaxSpeed: 30,
+  touchImpulseWeight: 0.3,
+  sizeDepthWeight: 10,
+  sizeDepthOutlier: 0.3,
+  accelMinG: 0.8,
+  accelMaxG: 2.2,
+  knotImageWeight: 0.4,
+  bridgeMaxFrames: 6,
+  robustReprojPx: 5,
+  rallyOutlierPx: 25,
+  segMaxMedianErrPx: 10,
+  segMinInlierFrac: 0.7,
+  playerTrackFrames: 10,
+  anchorWeight: 12,
+  anchorRobustM: 3,
+  serverMinAbsZ: COURT_HALF_L - 1,
+  rules: {
+    // Heights: the toss leaves the hand at ~1-2.5 m; a jump serve, set and
+    // attack are struck above the head; a reception can be anything from a
+    // low dig to an overhead pass; a block is above the net tape.
+    toss:      { minAbsZ: COURT_HALF_L - 1, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 1.0, maxY: 2.6, minG: 0.9, maxG: 1.15 },
+    serve:     { minAbsZ: COURT_HALF_L - 2, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 2.4, maxY: 3.8, minG: 0.8, maxG: 2.2 },
+    // Received in the back court: even a short serve lands 3-4 m from the net.
+    reception: { minAbsZ: 2, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 0.2, maxY: 3.0, minG: 0.9, maxG: 1.15 },
+    set:       { minAbsZ: 0, maxAbsZ: 4,   minY: 2.2, maxY: 3.4, minG: 0.9, maxG: 1.15 },
+    // Front-row attacks are hit ~0.5-1 m from the net. The attacker is often
+    // hidden behind the block (no player anchor), and from behind the baseline
+    // the set's end depth is nearly unobservable: on broadcast footage, ending
+    // it 1 m or 3 m from the net differed by ~3 px. Known limit: a back-row
+    // attack (contact ~2-3 m out) is drawn too close.
+    attack:    { minAbsZ: 0, maxAbsZ: 1.0, minY: 2.9, maxY: 3.8, minG: 0.8, maxG: 2.2 },
+    block:     { minAbsZ: 0, maxAbsZ: 1.5, minY: 2.4, maxY: 3.6, minG: 0.8, maxG: 1.5 },
+  },
+};
+
+/**
+ * Parameters of the solveBallTrajectories call in progress. Module state
+ * rather than an argument threaded through every helper; set and restored by
+ * solveBallTrajectories, and JS runs one call at a time.
+ */
+let P: RallyParams = DEFAULT_RALLY_PARAMS;
+
+/**
+ * Metres at the court per image pixel for the clip being solved: camera
+ * distance to the court centre over the focal length in pixels. Converts the
+ * metre-based touch thresholds to pixels, so a wide side camera and a
+ * telephoto broadcast camera are judged alike. Set by the physics block.
+ */
+let courtMetresPerPx = 0.00709;
+/** Never split on less than this, whatever the scale: detection noise is ~2 px. */
+const TOUCH_SPLIT_MIN_PX = 4;
 
 /** Combined projection, precomputed for speed: world (x,y,z) -> NDC (u,v). */
 function _makeProjector(cam: THREE.PerspectiveCamera) {
@@ -1076,7 +1215,7 @@ function groupIntoRallies(segments: ArcObsEx[][]): ArcObsEx[][][] {
     if (seg.length === 0) continue;
     const cur = rallies[rallies.length - 1];
     const prevSeg = cur?.[cur.length - 1];
-    if (prevSeg && seg[0].t - prevSeg[prevSeg.length - 1].t <= RALLY_MAX_GAP_S) cur.push(seg);
+    if (prevSeg && seg[0].t - prevSeg[prevSeg.length - 1].t <= P.rallyMaxGapS) cur.push(seg);
     else rallies.push([seg]);
   }
   return rallies;
@@ -1096,12 +1235,6 @@ function groupIntoRallies(segments: ArcObsEx[][]): ArcObsEx[][][] {
 type PlayerBox = number[];
 /** A possible toucher's position on the court: [x, z]. */
 type TouchCandidate = [number, number];
-/** Frames either side searched for a player's lowest feet (take-off spot). */
-const PLAYER_TRACK_FRAMES = 10;
-/** Residual px per metre between a knot and its nearest candidate player. */
-const ANCHOR_WEIGHT = 12;
-/** Distance (m) beyond which the anchor pull stops growing (robust). */
-const ANCHOR_ROBUST_M = 3;
 /** Ball must clear the net tape by this much when it crosses (m). */
 const NET_CLEAR_M = 2.43 + 0.1;
 
@@ -1126,6 +1259,8 @@ function touchCandidates(
   ball: [number, number],
   playersByFrame: Map<number, PlayerBox[]>,
   cam: THREE.PerspectiveCamera,
+  /** How far above the head (in body heights) the ball may be. */
+  reachUp = 0.8,
 ): TouchCandidate[] {
   const boxes = playersByFrame.get(fi);
   if (!boxes) return [];
@@ -1136,7 +1271,7 @@ function touchCandidates(
     // Ball within reach: beside the body or above it (arms, jumps), never
     // below the feet.
     if (bx < x1 - 0.5 * w || bx > x2 + 0.5 * w) continue;
-    if (by < y1 - 0.8 * h || by > y2) continue;
+    if (by < y1 - reachUp * h || by > y2) continue;
     // A jumping server or attacker has their feet off the floor, which would
     // place them metres too deep. Use the lowest feet of the same player over
     // nearby frames: the take-off spot. "Same player" must be followed frame
@@ -1147,7 +1282,7 @@ function touchCandidates(
     let feetY = y2;
     for (const step of [-1, 1]) {
       let cur: PlayerBox = [x1, y1, x2, y2];
-      for (let d = step; Math.abs(d) <= PLAYER_TRACK_FRAMES; d += step) {
+      for (let d = step; Math.abs(d) <= P.playerTrackFrames; d += step) {
         let next: PlayerBox | null = null;
         let bestIou = 0.5;
         for (const c of playersByFrame.get(fi + d) ?? []) {
@@ -1172,21 +1307,23 @@ function boundaryCandidates(
   b: ArcObsEx,
   playersByFrame: Map<number, PlayerBox[]>,
   cam: THREE.PerspectiveCamera,
+  reachUp = 0.8,
 ): TouchCandidate[] {
   const toImg = (o: ArcObsEx): [number, number] => [(o.u + 1) / 2, (1 - o.v) / 2];
   return [
-    ...touchCandidates(a.fi, toImg(a), playersByFrame, cam),
-    ...touchCandidates(b.fi, toImg(b), playersByFrame, cam),
+    ...touchCandidates(a.fi, toImg(a), playersByFrame, cam, reachUp),
+    ...touchCandidates(b.fi, toImg(b), playersByFrame, cam, reachUp),
   ];
 }
 
 /**
- * Minimum jump in image velocity (px/s) for a split to count as a touch.
- * Measured on broadcast 1080p: real touches (serve contact, reception, set,
- * attack) change it by ~950-1900 px/s; spurious splits from detection jitter,
- * perspective or the slow top of a serve toss by ~70-420 px/s.
+ * Reach above the head (body heights) for a rally's first point. A clip
+ * usually starts with the serve toss, which goes 2-4 m above the server's
+ * head; with the normal 0.8 the server was never found on real broadcast
+ * clips, so the volleyball rules never started and no touch got a label.
  */
-const TOUCH_MIN_DV_PX_S = 500;
+const TOSS_REACH_UP = 2.5;
+
 
 /** Image velocity jump (px/s) at the boundary between two pieces of track. */
 function _velocityJumpPx(before: ArcObsEx[], after: ArcObsEx[], hw: number, hh: number): number {
@@ -1218,19 +1355,23 @@ function mergeUntouchedSplits(
   cam: THREE.PerspectiveCamera,
   hw: number,
   hh: number,
+  log?: TouchSplitDecision[],
 ): ArcObsEx[][] {
   const out: ArcObsEx[][] = [];
   for (const arc of arcs) {
     const prev = out[out.length - 1];
     if (prev && arc.length > 0) {
       const last = prev[prev.length - 1];
-      const sameRally = arc[0].t - last.t <= RALLY_MAX_GAP_S;
-      if (sameRally && (
-        boundaryCandidates(last, arc[0], playersByFrame, cam).length === 0 ||
-        _velocityJumpPx(prev, arc, hw, hh) < TOUCH_MIN_DV_PX_S
-      )) {
-        out[out.length - 1] = [...prev, ...arc];
-        continue;
+      const sameRally = arc[0].t - last.t <= P.rallyMaxGapS;
+      if (sameRally) {
+        const candidates = boundaryCandidates(last, arc[0], playersByFrame, cam).length;
+        const dvMps = _velocityJumpPx(prev, arc, hw, hh) * courtMetresPerPx;
+        const kept = candidates > 0 && dvMps >= P.touchMinDvMps;
+        log?.push({ frameBefore: last.fi, frameAfter: arc[0].fi, dvMps, candidates, kept });
+        if (!kept) {
+          out[out.length - 1] = [...prev, ...arc];
+          continue;
+        }
       }
     }
     out.push(arc);
@@ -1238,28 +1379,24 @@ function mergeUntouchedSplits(
   return out;
 }
 
-/** Where a touch must happen: on which side, and how far from the net (m). */
-interface KnotZone {
+/** Why a candidate touch split was kept or merged (diagnostics, see BallTrajectoryResult). */
+export interface TouchSplitDecision {
+  frameBefore: number;
+  frameAfter: number;
+  /** Jump in the ball's velocity at the split, m/s at the court. */
+  dvMps: number;
+  /** Players who could have touched the ball there. */
+  candidates: number;
+  kept: boolean;
+}
+
+/** A touch rule placed on one knot: its type, its side of the net, and its limits. */
+interface KnotZone extends TouchRule {
   label: string;
   /** +1 / -1: the half of the court (sign of z) the touch is on. */
   side: number;
-  minAbsZ: number;
-  maxAbsZ: number;
-  /** Contact height range (m). */
-  minY: number;
-  maxY: number;
-  /**
-   * Effective downward acceleration (multiples of g) of the flight that this
-   * touch starts. Only serves and attacks carry heavy topspin; a toss, pass
-   * or set falls at about g, and letting those drop faster makes them short
-   * and flat instead of the high arcs they are.
-   */
-  minG: number;
-  maxG: number;
 }
 
-/** A player beyond this |z| (m) at the start of a rally is serving. */
-const SERVER_MIN_ABS_Z_M = COURT_HALF_L - 1;
 
 /**
  * Volleyball rules for one rally: which touch is which, and where it can be.
@@ -1282,26 +1419,33 @@ const SERVER_MIN_ABS_Z_M = COURT_HALF_L - 1;
  */
 function applyRallyRules(anchors: TouchCandidate[][]): (KnotZone | null)[] {
   const zones: (KnotZone | null)[] = anchors.map(() => null);
-  const servers = (anchors[0] ?? []).filter(([, z]) => Math.abs(z) >= SERVER_MIN_ABS_Z_M);
-  if (servers.length === 0) return zones;
-  const S = Math.sign(servers[0][1]);
-  const L = COURT_HALF_L;
+  const isServer = ([, z]: TouchCandidate) => Math.abs(z) >= P.serverMinAbsZ - 1;
+  const servers0 = (anchors[0] ?? []).filter(isServer);
+  const servers1 = anchors.length > 2 ? (anchors[1] ?? []).filter(isServer) : [];
+  // Does the rally start with the toss, or does the clip begin at the serve
+  // contact? A toss goes up and comes down over the same server, so the
+  // same player stands at the first and the second point.
+  const sameServer = servers0.some(([x0, z0]) => servers1.some(([x1, z1]) => Math.hypot(x0 - x1, z0 - z1) < 2.5));
+  let startsWithToss: boolean;
+  let S: number;
+  if (servers0.length && (sameServer || !servers1.length)) {
+    startsWithToss = sameServer;
+    S = Math.sign(servers0[0][1]);
+  } else if (servers1.length) {
+    // Server only seen at the contact: the first point is the toss.
+    startsWithToss = true;
+    S = Math.sign(servers1[0][1]);
+  } else {
+    return zones;
+  }
+  const R = P.rules;
   const plan: KnotZone[] = [
-    // Heights: the toss leaves the hand at ~1-2.5 m; a jump serve, set and
-    // attack are struck above the head; a reception can be anything from a
-    // low dig to an overhead pass; a block is above the net tape.
-    { label: "toss",      side: S,  minAbsZ: L - 1, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 1.0, maxY: 2.6, minG: 0.9, maxG: 1.15 },
-    { label: "serve",     side: S,  minAbsZ: L - 2, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 2.4, maxY: 3.8, minG: 0.8, maxG: 2.2 },
-    { label: "reception", side: -S, minAbsZ: 2,     maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 0.2, maxY: 3.0, minG: 0.9, maxG: 1.15 },
-    { label: "set",       side: -S, minAbsZ: 0,     maxAbsZ: 4,   minY: 2.2, maxY: 3.4, minG: 0.9, maxG: 1.15 },
-    // Front-row attacks are hit ~0.5-1 m from the net. The attacker is
-    // often hidden behind the block (no player anchor), and from behind the
-    // baseline the set's end depth is nearly unobservable: on broadcast
-    // footage, ending it 1 m or 3 m from the net differed by ~3 px. This
-    // bound keeps the set travelling along the net to the hitter. Known
-    // limit: a back-row attack (contact ~2-3 m out) is drawn too close.
-    { label: "attack",    side: -S, minAbsZ: 0,     maxAbsZ: 1.0, minY: 2.9, maxY: 3.8, minG: 0.8, maxG: 2.2 },
-    { label: "block",     side: S,  minAbsZ: 0,     maxAbsZ: 1.5, minY: 2.4, maxY: 3.6, minG: 0.8, maxG: 1.5 },
+    ...(startsWithToss ? [{ label: "toss", side: S, ...R.toss }] : []),
+    { label: "serve",     side: S,  ...R.serve },
+    { label: "reception", side: -S, ...R.reception },
+    { label: "set",       side: -S, ...R.set },
+    { label: "attack",    side: -S, ...R.attack },
+    { label: "block",     side: S,  ...R.block },
   ];
   // The last knot is where the ball leaves view, not a touch.
   for (let k = 0; k < Math.min(plan.length, anchors.length - 1); k++) {
@@ -1389,13 +1533,13 @@ function solveRally(
       const [pu, pv] = project(x, y, z);
       const w = Math.sqrt(Math.max(0.1, o.conf));
       const du = (pu - o.u) * hw, dv = (pv - o.v) * hh;
-      // Pseudo-Huber: quadratic up to ~ROBUST_REPROJ_PX, linear beyond. A
+      // Pseudo-Huber: quadratic up to ~P.robustReprojPx, linear beyond. A
       // messy stretch (a deflection off a block) has 20+ px errors, and with
       // a plain square those few samples dominate the whole rally and drag
       // well-anchored touches off their players.
       const e = Math.hypot(du, dv);
       const sc = e > 1e-9
-        ? Math.sqrt(2 * ROBUST_REPROJ_PX ** 2 * (Math.sqrt(1 + (e / ROBUST_REPROJ_PX) ** 2) - 1)) / e
+        ? Math.sqrt(2 * P.robustReprojPx ** 2 * (Math.sqrt(1 + (e / P.robustReprojPx) ** 2) - 1)) / e
         : 1;
       r.push(w * du * sc, w * dv * sc);
     });
@@ -1404,7 +1548,7 @@ function solveRally(
       for (let i = 0; i < allObs.length; i++) {
         if (!sizeActive[i]) continue;
         const e = sizeResidual(p, i);
-        r.push(e == null ? SIZE_DEPTH_WEIGHT : SIZE_DEPTH_WEIGHT * e);
+        r.push(e == null ? P.sizeDepthWeight : P.sizeDepthWeight * e);
       }
     }
     // Soft priors on the knots, in "pixels per metre of violation". They only
@@ -1413,14 +1557,14 @@ function solveRally(
     const PRIOR = 20;
     for (let k = 0; k <= n; k++) {
       const [x, y, z] = [p[3 * k], p[3 * k + 1], p[3 * k + 2]];
-      r.push(PRIOR * Math.max(0, KNOT_MIN_Y_M - y, y - KNOT_MAX_Y_M));
+      r.push(PRIOR * Math.max(0, KNOT_MIN_Y_M - y, y - P.knotMaxY));
       r.push(PRIOR * Math.max(0, Math.abs(x) - RALLY_MAX_ABS_X_M));
       r.push(PRIOR * Math.max(0, Math.abs(z) - RALLY_MAX_ABS_Z_M));
     }
     // Effective gravity stays within what spin and drag can produce.
     for (let k = 0; k < n; k++) {
-      const lo = zones[k] ? zones[k]!.minG * GRAVITY : ACCEL_MIN;
-      const hi = zones[k] ? zones[k]!.maxG * GRAVITY : ACCEL_MAX;
+      const lo = zones[k] ? zones[k]!.minG * GRAVITY : (P.accelMinG * GRAVITY);
+      const hi = zones[k] ? zones[k]!.maxG * GRAVITY : (P.accelMaxG * GRAVITY);
       r.push(PRIOR * Math.max(0, lo - p[GK + k], p[GK + k] - hi));
     }
     // Speed prior. Depth along the viewing ray is the weakly observed
@@ -1434,7 +1578,7 @@ function solveRally(
       const vyMid = (p[3 * k + 4] - p[3 * k + 1]) / T;
       // Fastest point of the arc is one of its ends: vy = vyMid ± g·T/2.
       const vEnd = Math.hypot(vx, Math.abs(vyMid) + 0.5 * p[GK + k] * T, vz);
-      r.push(PRIOR * Math.max(0, vEnd - RALLY_SOFT_MAX_SPEED_MPS));
+      r.push(PRIOR * Math.max(0, vEnd - P.softMaxSpeed));
     }
     // Touch impulse prior. Measured on broadcast footage, the reprojection
     // error of a short (<0.4 s) segment changes by ~0.1 px across 30 m of
@@ -1449,7 +1593,7 @@ function solveRally(
         let vIn = (p[3 * k + c] - p[3 * (k - 1) + c]) / Ta;
         let vOut = (p[3 * (k + 1) + c] - p[3 * k + c]) / Tb;
         if (c === 1) { vIn -= 0.5 * p[GK + k - 1] * Ta; vOut += 0.5 * p[GK + k] * Tb; }
-        r.push(TOUCH_IMPULSE_WEIGHT * (vOut - vIn));
+        r.push(P.touchImpulseWeight * (vOut - vIn));
       }
     }
     // Player anchors: pull each knot towards the nearest candidate toucher.
@@ -1458,7 +1602,7 @@ function solveRally(
       if (cands.length === 0) { r.push(0); continue; }
       let d = Infinity;
       for (const [ax, az] of cands) d = Math.min(d, Math.hypot(p[3 * k] - ax, p[3 * k + 2] - az));
-      r.push(ANCHOR_WEIGHT * d / Math.sqrt(1 + (d / ANCHOR_ROBUST_M) ** 2));
+      r.push(P.anchorWeight * d / Math.sqrt(1 + (d / P.anchorRobustM) ** 2));
     }
     // Touch points must project onto the ball. A touch often falls in a short
     // detection gap (the ball is hidden by the player playing it), and without
@@ -1468,7 +1612,7 @@ function solveRally(
       const target = knotTargets[k];
       if (!target) { r.push(0, 0); continue; }
       const [pu, pv] = project(p[3 * k], p[3 * k + 1], p[3 * k + 2]);
-      r.push(KNOT_IMAGE_WEIGHT * (pu - target[0]) * hw, KNOT_IMAGE_WEIGHT * (pv - target[1]) * hh);
+      r.push(P.knotImageWeight * (pu - target[0]) * hw, P.knotImageWeight * (pv - target[1]) * hh);
     }
     // Rule zones: the side of the net and distance from it for known touches.
     for (let k = 0; k <= n; k++) {
@@ -1505,10 +1649,17 @@ function solveRally(
     const d = new THREE.Vector3(u, v, 0.5).unproject(cam).sub(cam.position).normalize();
     let t = Math.abs(d.y) > 1e-6 ? (h - cam.position.y) / d.y : 50;
     if (!(t > 0)) t = 50;
-    const p = cam.position.clone().addScaledVector(d, t);
-    // Keep the seed inside the playing area.
-    const s = Math.min(1, RALLY_MAX_ABS_Z_M / Math.max(1e-6, Math.abs(p.z)));
-    if (s < 1) p.copy(cam.position.clone().addScaledVector(d, t * s));
+    // Keep the seed inside the playing area, along x and z alike: from the
+    // side, overshooting the court happens across its width, not its length.
+    const c = cam.position;
+    for (const [axis, lim] of [["x", RALLY_MAX_ABS_X_M], ["z", RALLY_MAX_ABS_Z_M]] as const) {
+      const at = c[axis] + d[axis] * t;
+      if (Math.abs(at) > lim && Math.abs(d[axis]) > 1e-9) {
+        const tb = (Math.sign(at) * lim - c[axis]) / d[axis];
+        if (tb > 0 && tb < t) t = tb;
+      }
+    }
+    const p = c.clone().addScaledVector(d, t);
     return [p.x, p.y, p.z];
   }), ...new Array<number>(n).fill(GRAVITY)];
 
@@ -1529,17 +1680,20 @@ function solveRally(
       // point of the ray above that player.
       let bestP: THREE.Vector3 | null = null;
       let bestD = Infinity;
+      // Point of the ray passing closest to the player, measured on the
+      // floor plane: works whichever way the camera looks along the court.
+      const dh2 = d.x * d.x + d.z * d.z;
+      if (dh2 < 1e-9) return;
       for (const [ax, az] of cands) {
-        if (Math.abs(d.z) < 1e-6) continue;
-        const t = (az - cam.position.z) / d.z;
+        const t = ((ax - cam.position.x) * d.x + (az - cam.position.z) * d.z) / dh2;
         if (!(t > 0)) continue;
         const q = cam.position.clone().addScaledVector(d, t);
-        const off = Math.abs(q.x - ax);
+        const off = Math.hypot(q.x - ax, q.z - az);
         if (off < bestD) { bestD = off; bestP = q; }
       }
       if (bestP) {
         base[3 * k] = bestP.x;
-        base[3 * k + 1] = Math.min(KNOT_MAX_Y_M, Math.max(0.2, bestP.y));
+        base[3 * k + 1] = Math.min(P.knotMaxY, Math.max(0.2, bestP.y));
         base[3 * k + 2] = bestP.z;
       }
     });
@@ -1563,10 +1717,10 @@ function solveRally(
   };
   let anyOutlier = false;
   allObs.forEach(({ o, k }, i) => {
-    if (errOf(sol, o, k) > RALLY_OUTLIER_PX) { active[i] = false; anyOutlier = true; }
+    if (errOf(sol, o, k) > P.rallyOutlierPx) { active[i] = false; anyOutlier = true; }
     if (sizeActive[i]) {
       const e = sizeResidual(sol, i);
-      if (e == null || Math.abs(e) > SIZE_DEPTH_OUTLIER) { sizeActive[i] = false; anyOutlier = true; }
+      if (e == null || Math.abs(e) > P.sizeDepthOutlier) { sizeActive[i] = false; anyOutlier = true; }
     }
   });
   if (anyOutlier) sol = _levenbergMarquardt(sol, residuals);
@@ -1601,8 +1755,8 @@ function solveRally(
     else if (maxAbsX > RALLY_MAX_ABS_X_M + 1)     rejectReason = `x-out-of-bounds (${maxAbsX.toFixed(1)}m)`;
     else if (maxAbsZ > RALLY_MAX_ABS_Z_M + 1)     rejectReason = `z-out-of-bounds (${maxAbsZ.toFixed(1)}m)`;
     else if (speedMps > MAX_BALL_SPEED_MPS)       rejectReason = `speed-too-high (${speedMps.toFixed(1)} m/s)`;
-    else if (medErr > SEG_MAX_MEDIAN_ERR_PX)      rejectReason = `median-err-too-high (${medErr.toFixed(1)}px)`;
-    else if (inlierFrac < SEG_MIN_INLIER_FRAC)    rejectReason = `too-many-outliers (${(100 * inlierFrac).toFixed(0)}% inliers)`;
+    else if (medErr > P.segMaxMedianErrPx)      rejectReason = `median-err-too-high (${medErr.toFixed(1)}px)`;
+    else if (inlierFrac < P.segMinInlierFrac)    rejectReason = `too-many-outliers (${(100 * inlierFrac).toFixed(0)}% inliers)`;
 
     return {
       obs: seg, tStart: tau[k], tEnd: tau[k + 1],
@@ -2103,7 +2257,48 @@ function _processArcs(
   return { positions, methods, rejectedFrames };
 }
 
+type SolverFrame = Pick<FrameData, "frame" | "timestamp" | "ball_img_pos" | "ball_bbox" | "ball_interpolated" | "ball_conf" | "ball_diameter_px" | "players_near_ball"
+  | "ball_ref_pos" | "ball_ref_diameter_px" | "players_ref">;
+
+/**
+ * For a camera that pans and zooms, use the measurements expressed in the
+ * reference image (the analyzer's "virtual static camera"), which is the
+ * image the calibration belongs to. A frame without a trusted motion estimate
+ * loses its ball rather than mixing two coordinate systems. Static clips have
+ * no ref fields and pass through unchanged.
+ */
+function toReferenceFrames(frames: SolverFrame[]): SolverFrame[] {
+  if (!frames.some((f) => f.ball_ref_pos)) return frames;
+  return frames.map((f) => ({
+    ...f,
+    ball_img_pos: f.ball_ref_pos,
+    ball_diameter_px: f.ball_ref_diameter_px,
+    players_near_ball: f.players_ref,
+    // The bbox is in raw image coords and is not used by this mode.
+    ball_bbox: undefined,
+  }));
+}
+
 export function solveBallTrajectories(
+  frames: SolverFrame[],
+  calibration: CalibrationResult,
+  aspect: number,
+  options?: BallReconstructionOptions,
+): BallTrajectoryResult {
+  frames = toReferenceFrames(frames);
+  const prev = P;
+  const o = options?.rallyParams;
+  P = o
+    ? { ...DEFAULT_RALLY_PARAMS, ...o, rules: { ...DEFAULT_RALLY_PARAMS.rules, ...o.rules } }
+    : DEFAULT_RALLY_PARAMS;
+  try {
+    return _solveBallTrajectories(frames, calibration, aspect, options);
+  } finally {
+    P = prev;
+  }
+}
+
+function _solveBallTrajectories(
   frames: Pick<FrameData, "frame" | "timestamp" | "ball_img_pos" | "ball_bbox" | "ball_interpolated" | "ball_conf" | "ball_diameter_px" | "players_near_ball">[],
   calibration: CalibrationResult,
   aspect: number,
@@ -2296,6 +2491,7 @@ export function solveBallTrajectories(
     // ── Physics-reprojection arc solver (post-loop) ──────────────────────────
     const physicsDebug: PhysicsReprojectionDebug[] = [];
     const touches: BallTouch[] = [];
+    const touchSplits: TouchSplitDecision[] = [];
 
     if (trajectoryMode === "physics-reprojection") {
       // Detections reaching here have already passed the analyzer's motion
@@ -2335,6 +2531,11 @@ export function solveBallTrajectories(
         .filter((f) => f.ball_img_pos)
         .map((f) => ({ t: f.timestamp, u: f.ball_img_pos![0] * 2 - 1, v: 1 - f.ball_img_pos![1] * 2 }));
       const frameDt = frames.length > 1 ? Math.max(1e-3, frames[1].timestamp - frames[0].timestamp) : 1 / 30;
+      const nearestFrame = (t: number): number => {
+        let best = frames[0];
+        for (const f of frames) if (Math.abs(f.timestamp - t) < Math.abs(best.timestamp - t)) best = f;
+        return best.frame;
+      };
       const imageAt = (t: number): [number, number] | null => {
         let best: { t: number; u: number; v: number } | null = null;
         for (const b of ballTrack) if (!best || Math.abs(b.t - t) < Math.abs(best.t - t)) best = b;
@@ -2343,8 +2544,13 @@ export function solveBallTrajectories(
       const playersByFrame = new Map<number, PlayerBox[]>();
       for (const f of frames) if (f.players_near_ball) playersByFrame.set(f.frame, f.players_near_ball);
       const hasPlayers = playersByFrame.size > 0;
+      {
+        const centre = new THREE.Vector3(0, 1.5, 0);
+        const fPx = vH / 2 / Math.tan((effectiveFovY * Math.PI) / 360);
+        courtMetresPerPx = cam.position.distanceTo(centre) / fPx;
+      }
       const splitArcs = splitArcsEx(obsEx, vW, vH);
-      const arcs = hasPlayers ? mergeUntouchedSplits(splitArcs, playersByFrame, cam, vW / 2, vH / 2) : splitArcs;
+      const arcs = hasPlayers ? mergeUntouchedSplits(splitArcs, playersByFrame, cam, vW / 2, vH / 2, touchSplits) : splitArcs;
       if (hasPlayers) {
         console.log(`[physicsReproj] touch splits: ${splitArcs.length} -> ${arcs.length} after dropping ones with no player`);
       }
@@ -2399,7 +2605,7 @@ export function solveBallTrajectories(
         const anchors: TouchCandidate[][] = [];
         if (hasPlayers) {
           const first = rally[0];
-          anchors.push(boundaryCandidates(first[0], first[Math.min(1, first.length - 1)], playersByFrame, cam));
+          anchors.push(boundaryCandidates(first[0], first[Math.min(1, first.length - 1)], playersByFrame, cam, TOSS_REACH_UP));
           for (let k = 1; k < rally.length; k++) {
             const prevSeg = rally[k - 1];
             anchors.push(boundaryCandidates(prevSeg[prevSeg.length - 1], rally[k][0], playersByFrame, cam));
@@ -2408,9 +2614,41 @@ export function solveBallTrajectories(
         }
         const zones = hasPlayers ? applyRallyRules(anchors) : [];
         const results = solveRally(rally, cam, vW, vH, anchors, zones, imageAt);
+        // Which knots are touches. Measured on 11 labelled broadcast clips,
+        // false touches came from three places, each handled here:
+        //  - a rally's first point is only where the ball came into view (or
+        //    reappeared after a >1 s detection gap, usually high in the air):
+        //    a touch only when the rules identified it as the toss or serve;
+        //  - after the ball reaches the floor the play is over; bounces,
+        //    catches and rolling balls are not touches;
+        //  - the touch's frame is the contact itself (the knot), not the first
+        //    detection after it, which is several frames late when the ball is
+        //    hidden at the contact.
+        let deadAfter = Infinity;
+        results.forEach((seg, k) => {
+          // Not the rally's first point, not a touch the rules identified (a
+          // reception solved too low is a solver error, not the end of play),
+          // and not below the floor (also a solver error).
+          if (k === 0 || zones[k]) return;
+          const y = seg.posAt(seg.tStart)[1];
+          if (y > -0.2 && y <= FLOOR_CONTACT_Y_M && k < deadAfter) deadAfter = k;
+        });
+        // The bounce itself is often not a knot: near the floor, among the
+        // players, the ball goes undetected. But the flight into it still
+        // reaches the floor, so a flight whose arc dips to floor height ends
+        // play at its end. Same guards: not when the next point is a touch
+        // the rules identified, not for arcs far below the floor (solver error).
+        results.forEach((seg, k) => {
+          if (!seg.accepted || zones[k + 1] || k + 1 >= deadAfter) return;
+          let minY = Infinity;
+          for (let i = 1; i < 10; i++) minY = Math.min(minY, seg.posAt(seg.tStart + ((seg.tEnd - seg.tStart) * i) / 10)[1]);
+          if (minY > -0.5 && minY <= FLOOR_ARC_Y_M) deadAfter = k + 1;
+        });
         results.forEach((seg, k) => {
           if (!seg.accepted && !(k > 0 && results[k - 1].accepted)) return;
-          touches.push({ frame: seg.obs[0].fi, position: seg.posAt(seg.tStart), label: zones[k]?.label ?? "touch" });
+          if (k === 0 && !zones[0]) return;
+          if (k >= deadAfter) return;
+          touches.push({ frame: nearestFrame(seg.tStart), position: seg.posAt(seg.tStart), label: zones[k]?.label ?? "touch" });
         });
         console.log(
           "[rally] " + results.map((seg, k) => {
@@ -2433,7 +2671,7 @@ export function solveBallTrajectories(
           // block: two touches in five frames) is drawn as a straight line
           // between its touch points, so the path does not break there.
           const segIdx = results.indexOf(seg);
-          const bridge = !seg.accepted && seg.obs.length <= BRIDGE_MAX_FRAMES &&
+          const bridge = !seg.accepted && seg.obs.length <= P.bridgeMaxFrames &&
             segIdx > 0 && segIdx < results.length - 1 &&
             results[segIdx - 1].accepted && results[segIdx + 1].accepted;
           if (bridge) {
@@ -2707,6 +2945,7 @@ export function solveBallTrajectories(
       positions, methods, debugRecords,
       physicsDebug: physicsDebug.length > 0 ? physicsDebug : undefined,
       touches: touches.length > 0 ? touches : undefined,
+      touchSplits: touchSplits.length > 0 ? touchSplits : undefined,
       stats: { detectedFrames, solved3dFrames, rejectedFrames, methodCounts, avgConf },
     };
   }
@@ -2731,3 +2970,6 @@ export function solveBallTrajectories(
     stats: { detectedFrames, solved3dFrames, rejectedFrames, methodCounts, avgConf },
   };
 }
+
+/** Internal helpers exposed for unit tests (src/eval). Not part of the app API. */
+export const __test__ = { fitQuadratic: _fitQuadratic, applyRallyRules, velocityJumpPx: _velocityJumpPx };

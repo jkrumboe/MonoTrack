@@ -1,0 +1,156 @@
+{
+  "clip": "usa_jap_r4",
+  "touches": [
+    {
+      "frame": 0,
+      "type": "toss",
+      "feet": [
+        0.09141,
+        0.59861
+      ]
+    },
+    {
+      "frame": 42,
+      "type": "serve",
+      "feet": [
+        0.1875,
+        0.52361
+      ]
+    }
+  ],
+  "court": {
+    "view": "side",
+    "points": [
+      {
+        "id": 0,
+        "name": "far sideline, left end",
+        "world": [
+          4.5,
+          -9
+        ],
+        "frame": 0,
+        "pt": [
+          0.29063,
+          0.54444
+        ]
+      },
+      {
+        "id": 1,
+        "name": "far sideline, left 3 m line",
+        "world": [
+          4.5,
+          -3
+        ],
+        "frame": 0,
+        "pt": [
+          0.48906,
+          0.55278
+        ]
+      },
+      {
+        "id": 2,
+        "name": "far sideline, centre line",
+        "world": [
+          4.5,
+          0
+        ],
+        "frame": 0,
+        "pt": [
+          0.58828,
+          0.55833
+        ]
+      },
+      {
+        "id": 3,
+        "name": "far sideline, right 3 m line",
+        "world": [
+          4.5,
+          3
+        ],
+        "frame": 0,
+        "pt": [
+          0.68828,
+          0.56389
+        ]
+      },
+      {
+        "id": 4,
+        "name": "far sideline, right end",
+        "world": [
+          4.5,
+          9
+        ],
+        "frame": 0,
+        "pt": [
+          0.89844,
+          0.57083
+        ]
+      },
+      {
+        "id": 5,
+        "name": "near sideline, left end",
+        "world": [
+          -4.5,
+          -9
+        ],
+        "frame": 0,
+        "pt": [
+          0.2,
+          0.75
+        ]
+      },
+      {
+        "id": 6,
+        "name": "near sideline, left 3 m line",
+        "world": [
+          -4.5,
+          -3
+        ],
+        "frame": 0,
+        "pt": [
+          0.45625,
+          0.7625
+        ]
+      },
+      {
+        "id": 7,
+        "name": "near sideline, centre line",
+        "world": [
+          -4.5,
+          0
+        ],
+        "frame": 0,
+        "pt": [
+          0.58516,
+          0.77083
+        ]
+      },
+      {
+        "id": 8,
+        "name": "near sideline, right 3 m line",
+        "world": [
+          -4.5,
+          3
+        ],
+        "frame": 0,
+        "pt": [
+          0.71406,
+          0.77778
+        ]
+      },
+      {
+        "id": 9,
+        "name": "near sideline, right end",
+        "world": [
+          -4.5,
+          9
+        ],
+        "frame": 0,
+        "pt": [
+          0.99453,
+          0.79722
+        ]
+      }
+    ]
+  }
+}

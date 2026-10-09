@@ -254,8 +254,12 @@ function reprojectionError(
   // sign the optimiser was pinned rather than converged.
   if (cy < 1 || cy > 60) return 1e9;
   if (fov < 3 || fov > 90) return 1e9;
-  if (cz < 5 || cz > 200) return 1e9;
-  if (Math.abs(cx) > 40) return 1e9;
+  // Distance from the court centre on the floor, in any direction. Bounding z
+  // alone assumed a camera behind a baseline and rejected every side camera
+  // (z ~ 0), throwing away an exact homography solution for one pinned on the
+  // bound 8-20 m away.
+  const horiz = Math.hypot(cx, cz);
+  if (horiz < 5 || horiz > 200) return 1e9;
 
   const camPos = new THREE.Vector3(cx, cy, cz);
   const lookAt = new THREE.Vector3(lx, ly, lz);
@@ -605,7 +609,7 @@ export function solveCameraIterative(
     const seedCost = cost(dltSeed);
     const atBound =
       bestParams[6] <= 3.05 || bestParams[6] >= 89.5 ||
-      bestParams[2] >= 199 || bestParams[1] >= 59.5;
+      Math.hypot(bestParams[0], bestParams[2]) >= 199 || bestParams[1] >= 59.5;
     if (atBound || !(bestCost < seedCost)) {
       log.push(
         `Refinement rejected (${atBound ? "hit a parameter bound" : "no improvement"}); ` +

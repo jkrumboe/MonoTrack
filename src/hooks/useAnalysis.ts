@@ -44,6 +44,17 @@ export interface FrameData {
    */
   players_near_ball?: number[][];
   /**
+   * Camera motion (pan/zoom from a fixed spot): 3x3 homography, row-major,
+   * mapping this frame's pixels to the reference frame's pixels. Absent for a
+   * static camera. The fields below are the same measurements expressed in the
+   * reference image ("virtual static camera"), which is what the 3D solver
+   * uses; absent when this frame's motion estimate was not trusted.
+   */
+  ref_from_frame?: number[];
+  ball_ref_pos?: [number, number];
+  ball_ref_diameter_px?: number;
+  players_ref?: number[][];
+  /**
    * Relative depth at ball centre from Depth Anything V2 [0,1] (0=near, 1=far).
    * Present only for YOLO-detected (non-interpolated) frames when the depth model is available.
    */

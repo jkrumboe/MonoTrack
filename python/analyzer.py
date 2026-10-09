@@ -2018,11 +2018,16 @@ def analyze_video_cv(video_path: str):
     COURT_SEARCH_LAST_FRAME = 300
     court_candidates = []  # (score, frame_idx, timestamp, corners)
     frame_idx = 0
+    # Pan/zoom from a fixed spot: measure each frame's homography so ball,
+    # sizes and players can be expressed in the court-calibration frame.
+    from camera_motion import CameraMotion, apply_h, local_scale, map_box
+    motion = CameraMotion()
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        motion.update(frame)
 
         timestamp = round(frame_idx / fps, 4)
         fh, fw = frame.shape[:2]
@@ -2180,6 +2185,18 @@ def analyze_video_cv(video_path: str):
 
     cap.release()
 
+    # The calibration frame is the reference image for the whole clip.
+    ref_frame = court_data[0]["frame"] if court_data else 0
+    motion.set_reference(ref_frame)
+    camera_moving = not motion.is_static()
+    if camera_moving:
+        zooms = [z for z in (motion.zoom(i) for i in range(frame_idx)) if z]
+        n_bad = sum(1 for i in range(frame_idx) if motion.ref_from_frame(i) is None)
+        print(f"[camera] Moving camera: zoom vs reference {min(zooms):.2f}-{max(zooms):.2f}, "
+              f"{n_bad}/{frame_idx} frames without a trusted motion estimate", file=sys.stderr)
+    else:
+        print("[camera] Static camera", file=sys.stderr)
+
     # ── Safety net: fall back to YOLO if TrackNet found almost nothing ─────
     # TrackNet is trained on real broadcast volleyball; if this footage is far
     # enough outside that distribution that it fires on almost nothing, a
@@ -2290,6 +2307,18 @@ def analyze_video_cv(video_path: str):
             if fi in ball_depth:
                 frame_msg["ball_depth_estimate"] = ball_depth[fi]
 
+        # Moving camera: the same measurements in the reference image.
+        Hn = motion.ref_from_frame(fi) if camera_moving else None
+        if Hn is not None:
+            frame_msg["ref_from_frame"] = [round(float(v), 8) for v in Hn.reshape(-1)]
+            if bd is not None:
+                frame_msg["ball_ref_pos"] = [round(v, 6) for v in apply_h(Hn, bd['pos'])]
+                if "ball_diameter_px" in frame_msg:
+                    frame_msg["ball_ref_diameter_px"] = round(
+                        frame_msg["ball_diameter_px"] * local_scale(Hn, bd['pos']), 2)
+                if "players_near_ball" in frame_msg:
+                    frame_msg["players_ref"] = [map_box(Hn, b) for b in frame_msg["players_near_ball"]]
+
         send(frame_msg)
 
         if fi % 200 == 0 and fi > 0:
@@ -2301,6 +2330,7 @@ def analyze_video_cv(video_path: str):
         "total_frames": frame_idx,
         "fps": fps,
         "court_data": court_data,
+        "camera_moving": camera_moving,
         "score": {"team1": 0, "team2": 0},
         "stats": {},
     })

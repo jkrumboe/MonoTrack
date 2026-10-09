@@ -1,0 +1,268 @@
+{
+  "clip": "usa_jap_r3",
+  "touches": [
+    {
+      "frame": 38,
+      "type": "serve",
+      "feet": [
+        0.18047,
+        0.54722
+      ]
+    },
+    {
+      "frame": 58,
+      "type": "reception",
+      "feet": [
+        0.58906,
+        0.65556
+      ]
+    },
+    {
+      "frame": 90,
+      "type": "set",
+      "feet": [
+        0.51328,
+        0.52222
+      ]
+    },
+    {
+      "frame": 111,
+      "type": "attack",
+      "feet": [
+        0.69609,
+        0.53056
+      ]
+    },
+    {
+      "frame": 124,
+      "type": "dig",
+      "feet": [
+        0.28906,
+        0.50139
+      ]
+    },
+    {
+      "frame": 171,
+      "type": "set",
+      "feet": [
+        0.23516,
+        0.61944
+      ]
+    },
+    {
+      "frame": 218,
+      "type": "attack",
+      "feet": [
+        0.35234,
+        0.40556
+      ]
+    },
+    {
+      "frame": 222,
+      "type": "block",
+      "feet": [
+        0.41094,
+        0.41667
+      ]
+    },
+    {
+      "frame": 233,
+      "type": "dig",
+      "feet": [
+        0.30547,
+        0.5625
+      ]
+    },
+    {
+      "frame": 275,
+      "type": "set",
+      "feet": [
+        0.41953,
+        0.61944
+      ]
+    },
+    {
+      "frame": 296,
+      "type": "attack",
+      "feet": [
+        0.37578,
+        0.49306
+      ]
+    },
+    {
+      "frame": 304,
+      "type": "dig",
+      "feet": [
+        0.82109,
+        0.69861
+      ]
+    },
+    {
+      "frame": 329,
+      "type": "set",
+      "feet": [
+        0.79766,
+        0.58333
+      ]
+    },
+    {
+      "frame": 377,
+      "type": "dig",
+      "feet": [
+        0.43047,
+        0.775
+      ]
+    },
+    {
+      "frame": 416,
+      "type": "set",
+      "feet": [
+        0.31172,
+        0.63194
+      ]
+    },
+    {
+      "frame": 453,
+      "type": "attack",
+      "feet": [
+        0.40937,
+        0.40833
+      ]
+    }
+  ],
+  "court": {
+    "view": "side",
+    "points": [
+      {
+        "id": 0,
+        "name": "far sideline, left end",
+        "world": [
+          4.5,
+          -9
+        ],
+        "frame": 0,
+        "pt": [
+          0.28906,
+          0.56389
+        ]
+      },
+      {
+        "id": 1,
+        "name": "far sideline, left 3 m line",
+        "world": [
+          4.5,
+          -3
+        ],
+        "frame": 0,
+        "pt": [
+          0.48438,
+          0.57083
+        ]
+      },
+      {
+        "id": 2,
+        "name": "far sideline, centre line",
+        "world": [
+          4.5,
+          0
+        ],
+        "frame": 0,
+        "pt": [
+          0.58281,
+          0.575
+        ]
+      },
+      {
+        "id": 3,
+        "name": "far sideline, right 3 m line",
+        "world": [
+          4.5,
+          3
+        ],
+        "frame": 0,
+        "pt": [
+          0.68203,
+          0.57917
+        ]
+      },
+      {
+        "id": 4,
+        "name": "far sideline, right end",
+        "world": [
+          4.5,
+          9
+        ],
+        "frame": 0,
+        "pt": [
+          0.88906,
+          0.58611
+        ]
+      },
+      {
+        "id": 5,
+        "name": "near sideline, left end",
+        "world": [
+          -4.5,
+          -9
+        ],
+        "frame": 0,
+        "pt": [
+          0.19844,
+          0.76389
+        ]
+      },
+      {
+        "id": 6,
+        "name": "near sideline, left 3 m line",
+        "world": [
+          -4.5,
+          -3
+        ],
+        "frame": 0,
+        "pt": [
+          0.45234,
+          0.775
+        ]
+      },
+      {
+        "id": 7,
+        "name": "near sideline, centre line",
+        "world": [
+          -4.5,
+          0
+        ],
+        "frame": 0,
+        "pt": [
+          0.58125,
+          0.78056
+        ]
+      },
+      {
+        "id": 8,
+        "name": "near sideline, right 3 m line",
+        "world": [
+          -4.5,
+          3
+        ],
+        "frame": 0,
+        "pt": [
+          0.70703,
+          0.78889
+        ]
+      },
+      {
+        "id": 9,
+        "name": "near sideline, right end",
+        "world": [
+          -4.5,
+          9
+        ],
+        "frame": 0,
+        "pt": [
+          0.98438,
+          0.80972
+        ]
+      }
+    ]
+  }
+}

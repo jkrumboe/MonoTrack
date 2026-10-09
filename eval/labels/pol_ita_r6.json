@@ -1,0 +1,192 @@
+{
+  "clip": "pol_ita_r6",
+  "touches": [
+    {
+      "frame": 24,
+      "type": "toss",
+      "feet": [
+        0.11094,
+        0.47083
+      ]
+    },
+    {
+      "frame": 51,
+      "type": "serve",
+      "feet": [
+        0.21641,
+        0.4875
+      ]
+    },
+    {
+      "frame": 83,
+      "type": "reception",
+      "feet": [
+        0.73672,
+        0.50833
+      ]
+    },
+    {
+      "frame": 112,
+      "type": "set",
+      "feet": [
+        0.66953,
+        0.45278
+      ]
+    },
+    {
+      "frame": 141,
+      "type": "attack",
+      "feet": [
+        0.69922,
+        0.39167
+      ]
+    },
+    {
+      "frame": 144,
+      "type": "block",
+      "feet": [
+        0.5625,
+        0.45139
+      ]
+    },
+    {
+      "frame": 165,
+      "type": "dig",
+      "feet": [
+        0.47109,
+        0.55972
+      ]
+    },
+    {
+      "frame": 219,
+      "type": "set",
+      "feet": [
+        0.3375,
+        0.58472
+      ]
+    }
+  ],
+  "court": {
+    "view": "side",
+    "propagatedFrom": "pol_ita_r1",
+    "points": [
+      {
+        "id": 0,
+        "name": "far sideline, left end",
+        "world": [
+          4.5,
+          -9
+        ],
+        "frame": 40,
+        "pt": [
+          0.2601,
+          0.40299
+        ]
+      },
+      {
+        "id": 1,
+        "name": "far sideline, left 3 m line",
+        "world": [
+          4.5,
+          -3
+        ],
+        "frame": 40,
+        "pt": [
+          0.47721,
+          0.40748
+        ]
+      },
+      {
+        "id": 2,
+        "name": "far sideline, centre line",
+        "world": [
+          4.5,
+          0
+        ],
+        "frame": 40,
+        "pt": [
+          0.58427,
+          0.4118
+        ]
+      },
+      {
+        "id": 3,
+        "name": "far sideline, right 3 m line",
+        "world": [
+          4.5,
+          3
+        ],
+        "frame": 40,
+        "pt": [
+          0.69239,
+          0.41193
+        ]
+      },
+      {
+        "id": 4,
+        "name": "far sideline, right end",
+        "world": [
+          4.5,
+          9
+        ],
+        "frame": 40,
+        "pt": [
+          0.91939,
+          0.41774
+        ]
+      },
+      {
+        "id": 5,
+        "name": "near sideline, left end",
+        "world": [
+          -4.5,
+          -9
+        ],
+        "frame": 40,
+        "pt": [
+          0.14057,
+          0.61477
+        ]
+      },
+      {
+        "id": 6,
+        "name": "near sideline, left 3 m line",
+        "world": [
+          -4.5,
+          -3
+        ],
+        "frame": 40,
+        "pt": [
+          0.43577,
+          0.62366
+        ]
+      },
+      {
+        "id": 7,
+        "name": "near sideline, centre line",
+        "world": [
+          -4.5,
+          0
+        ],
+        "frame": 40,
+        "pt": [
+          0.58627,
+          0.62597
+        ]
+      },
+      {
+        "id": 8,
+        "name": "near sideline, right 3 m line",
+        "world": [
+          -4.5,
+          3
+        ],
+        "frame": 40,
+        "pt": [
+          0.73045,
+          0.63381
+        ]
+      }
+    ]
+  }
+}
