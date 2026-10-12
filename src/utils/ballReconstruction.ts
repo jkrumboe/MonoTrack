@@ -1593,7 +1593,7 @@ interface KnotZone extends TouchRule {
  * Shortest time between two touches (s), except for the block or dig after
  * an attack. Labelled clips: the shortest is serve to reception, 0.56 s.
  */
-const MIN_TOUCH_INTERVAL_S = 0.45;
+const MIN_TOUCH_INTERVAL_S = 0.52;
 /** How far over the net (m) a blocker's hands reach into the attacker's side. */
 const BLOCK_REACH_OVER_M = 0.75;
 
@@ -1663,6 +1663,10 @@ function applyRallyRules(
   skip: Set<number> = new Set(),
   /** Time of each knot (s), to drop splits too soon after a touch. */
   knotT: number[] = [],
+  /** Where the previous rally's touch sequence stopped (see RulesState). */
+  resume: RulesState | null = null,
+  /** Receives where this rally's sequence stops. */
+  out: { state?: RulesState } = {},
 ): (KnotZone | null)[] {
   const zones: (KnotZone | null)[] = anchors.map(() => null);
   const isServer = ([, z]: TouchCandidate) => Math.abs(z) >= P.serverMinAbsZ - 1;
@@ -1674,6 +1678,7 @@ function applyRallyRules(
   const sameServer = servers0.some(([x0, z0]) => servers1.some(([x1, z1]) => Math.hypot(x0 - x1, z0 - z1) < 2.5));
   let startsWithToss: boolean;
   let S: number;
+  let step = 0;
   if (servers0.length && (sameServer || !servers1.length)) {
     startsWithToss = sameServer;
     S = Math.sign(servers0[0][1]);
@@ -1681,36 +1686,50 @@ function applyRallyRules(
     // Server only seen at the contact: the first point is the toss.
     startsWithToss = true;
     S = Math.sign(servers1[0][1]);
+  } else if (resume && knotT[0] - resume.lastT <= RULES_CARRY_S) {
+    // No serve here: the play goes on from the previous piece of track,
+    // which ended at a detection gap. Touches may have been missed in it,
+    // so skip ahead to the next one on the side of the net where the
+    // players at the first touch stand.
+    ({ S, startsWithToss, step } = resume);
+    const first = anchors.findIndex((a, k) => a.length > 0 && !skip.has(k));
+    if (first >= 0) {
+      const side = Math.sign(anchors[first].reduce((sum, [, z]) => sum + Math.sign(z), 0));
+      const probe = rallyPlan(S, startsWithToss, step + 4);
+      for (let i = 0; i < 3 && side && probe[step].side !== side; i++) step++;
+    }
   } else {
     return zones;
   }
-  const R = P.rules;
-  const plan: KnotZone[] = [
-    ...(startsWithToss ? [{ label: "toss", side: S, ...R.toss }] : []),
-    { label: "serve",     side: S,  ...R.serve },
-    { label: "reception", side: -S, ...R.reception },
-    { label: "set",       side: -S, ...R.set },
-    { label: "attack",    side: -S, ...R.attack },
-    // The attack is blocked at the net or dug in the back court: forcing a
-    // block threw away the digger and let the knot (and the attack before
-    // it) drift to the wrong depth.
-    _eitherZone(S, [{ label: "block", ...R.block }, { label: "dig", ...R.dig }]),
-  ];
+  const plan = rallyPlan(S, startsWithToss, step + anchors.length);
   // The last knot is where the ball leaves view, not a touch.
   let lastT = -Infinity;
-  for (let k = 0, step = 0; step < plan.length && k < anchors.length - 1; k++) {
+  const firstStep = step;
+  for (let k = 0; step < plan.length && k < anchors.length - 1; k++) {
     if (skip.has(k)) continue;
+    // A resumed rally's first point is only where the ball came back into
+    // view, unless a player is there to have played it.
+    if (k === 0 && resume && step === firstStep && !servers0.length && !servers1.length && !anchors[0].length) continue;
     // A split too soon after the previous touch is not the next one (a
     // reception and a "set" 0.28 s apart, say): it would shift every later
     // touch's rule by one. Only the block or dig follows an attack that fast.
     // The toss is no interval: its knot is wherever the clip first sees the
     // ball, already on its way up.
-    if (step > 0 && plan[step - 1].label !== "toss" && !plan[step].alternatives &&
+    if (step > firstStep && plan[step - 1].label !== "toss" && !plan[step].alternatives &&
         knotT[k] - lastT < MIN_TOUCH_INTERVAL_S) {
       skip.add(k);
       continue;
     }
     lastT = knotT[k] ?? lastT;
+    // Re-sync by side of the net: players at this touch all on the other
+    // side from the expected one means a touch was missed (hidden, or in a
+    // detection gap). Jump to the next expected touch on their side.
+    const side = Math.sign(anchors[k].reduce((sum, [, z]) => sum + Math.sign(z), 0));
+    if (side && anchors[k].every(([, z]) => Math.sign(z) === side) && plan[step].side !== side) {
+      for (let i = 1; i <= 2 && step + i < plan.length; i++) {
+        if (plan[step + i].side === side) { step += i; break; }
+      }
+    }
     const zone = plan[step++];
     zones[k] = zone;
     // An attacker is anchored at the take-off spot, and the approach jump
@@ -1730,8 +1749,52 @@ function applyRallyRules(
     // to someone who cannot have played the ball.
     anchors[k] = kept;
   }
+  out.state = { S, startsWithToss, step, lastT: knotT[knotT.length - 1] ?? -Infinity };
   return zones;
 }
+
+/**
+ * The touch sequence of a rally served from side S, at least `length` long:
+ * toss (when seen), serve, reception, set, attack, then block or dig, set,
+ * attack... with the sides alternating.
+ */
+function rallyPlan(S: number, startsWithToss: boolean, length: number): KnotZone[] {
+  const R = P.rules;
+  const plan: KnotZone[] = [
+    ...(startsWithToss ? [{ label: "toss", side: S, ...R.toss }] : []),
+    { label: "serve",     side: S,  ...R.serve },
+    { label: "reception", side: -S, ...R.reception },
+    { label: "set",       side: -S, ...R.set },
+    { label: "attack",    side: -S, ...R.attack },
+    // The attack is blocked at the net or dug in the back court: forcing a
+    // block threw away the digger and let the knot (and the attack before
+    // it) drift to the wrong depth.
+    _eitherZone(S, [{ label: "block", ...R.block }, { label: "dig", ...R.dig }]),
+  ];
+  // The rally goes on in the same cycle, the sides alternating: the
+  // defending team digs (or blocks), sets and attacks, then the other side
+  // defends. Labelled long rallies follow it touch for touch.
+  for (let side = S; plan.length < length; side = -side) {
+    plan.push(
+      { label: "set",    side, ...R.set },
+      { label: "attack", side, ...R.attack },
+      _eitherZone(-side, [{ label: "block", ...R.block }, { label: "dig", ...R.dig }]),
+    );
+  }
+  return plan;
+}
+
+/** Where a rally's touch sequence stopped, to resume it after a gap. */
+interface RulesState {
+  S: number;
+  startsWithToss: boolean;
+  /** Index of the next touch in rallyPlan. */
+  step: number;
+  /** Time of the rally's last point (s). */
+  lastT: number;
+}
+/** Longest gap (s) across which the touch sequence carries on. */
+const RULES_CARRY_S = 4;
 
 /**
  * Fit one rally as connected ballistic segments (see block comment above).
@@ -2868,7 +2931,7 @@ function _solveBallTrajectories(
       // Volleyball rules and player anchors on top of the rally solver.
       // Knots that are the ball above the picture, not touches (see below).
       const offscreen = new Set<number>();
-      const solveRuled = (rally: ArcObsEx[][]) => {
+      const solveRuled = (rally: ArcObsEx[][], resume: RulesState | null = null) => {
         const free = new Set<number>();
         for (let k = 1; k < rally.length; k++) if (offscreen.has(rally[k][0].fi)) free.add(k);
         // Candidate touchers per knot: the rally's first sample (ball in the
@@ -2916,8 +2979,12 @@ function _solveBallTrajectories(
         // Knot times as solveRally sets them: mid-gap, or the contact at the arms.
         const knotT = rally.map((seg, k) => k === 0 ? seg[0].t
           : contacts[k]?.t ?? 0.5 * (rally[k - 1][rally[k - 1].length - 1].t + seg[0].t));
-        const zones = hasPlayers ? applyRallyRules(anchors, free, knotT) : [];
-        return { anchors, zones, free, contacts, results: solveRally(rally, cam, vW, vH, anchors, zones, imageAt, free, contacts) };
+        const rules: { state?: RulesState } = {};
+        const zones = hasPlayers ? applyRallyRules(anchors, free, knotT, resume, rules) : [];
+        return {
+          anchors, zones, free, contacts, rules: rules.state ?? null,
+          results: solveRally(rally, cam, vW, vH, anchors, zones, imageAt, free, contacts),
+        };
       };
       // A flight joined across the top of the picture that the solver cannot
       // fit (the arc is rejected) is put back as two pieces, so it is not
@@ -2964,6 +3031,8 @@ function _solveBallTrajectories(
       // Segments shorter than two samples cannot carry a touch-to-touch arc on
       // their own, but they still constrain the rally they sit in.
       const rallies = groupIntoRallies(arcs, offscreen);
+      // The touch sequence carries over a detection gap into the next rally.
+      let carry: RulesState | null = null;
       let segId = 0;
       for (const rally of rallies) {
         const nObs = rally.reduce((s, a) => s + a.length, 0);
@@ -2988,7 +3057,8 @@ function _solveBallTrajectories(
           continue;
         }
 
-        const { anchors, zones, free, contacts, results } = solveRuled(rally);
+        const { anchors, zones, free, contacts, rules, results } = solveRuled(rally, carry);
+        carry = rules;
         // Which knots are touches. Measured on 11 labelled broadcast clips,
         // false touches came from three places, each handled here:
         //  - a rally's first point is only where the ball came into view (or
