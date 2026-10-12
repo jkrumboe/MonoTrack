@@ -60,6 +60,8 @@ VIEW_W = 1280
 #                sideline is x = +4.5
 #   behind view: camera at +z, so the far baseline is z = -9 and the picture's
 #                left sideline is x = -4.5
+NET_TAPE_Y = 2.43            # top of the net tape, men
+ANTENNA_TOP_Y = NET_TAPE_Y + 0.8
 COURT_POINTS = {
     "side": [
         ("far sideline, left end", (4.5, -9)),
@@ -72,6 +74,13 @@ COURT_POINTS = {
         ("near sideline, centre line", (-4.5, 0)),
         ("near sideline, right 3 m line", (-4.5, 3)),
         ("near sideline, right end", (-4.5, 9)),
+        # Above the floor (x, z, height): the antennas stand on the sidelines,
+        # from the net tape (2.43 m, men) up 0.8 m. Known heights fix the
+        # camera's focal length and height scale.
+        ("far antenna, top", (4.5, 0, ANTENNA_TOP_Y)),
+        ("far antenna, at the net tape", (4.5, 0, NET_TAPE_Y)),
+        ("near antenna, top", (-4.5, 0, ANTENNA_TOP_Y)),
+        ("near antenna, at the net tape", (-4.5, 0, NET_TAPE_Y)),
     ],
     "behind": [
         ("far baseline, left end", (-4.5, -9)),
@@ -84,6 +93,10 @@ COURT_POINTS = {
         ("right sideline, far 3 m line", (4.5, -3)),
         ("right sideline, centre line", (4.5, 0)),
         ("right sideline, near 3 m line", (4.5, 3)),
+        ("left antenna, top", (-4.5, 0, ANTENNA_TOP_Y)),
+        ("left antenna, at the net tape", (-4.5, 0, NET_TAPE_Y)),
+        ("right antenna, top", (4.5, 0, ANTENNA_TOP_Y)),
+        ("right antenna, at the net tape", (4.5, 0, NET_TAPE_Y)),
     ],
 }
 NUM_KEYS = [ord(c) for c in "1234567890"]
@@ -141,7 +154,8 @@ def main():
 
     def fitted_court():
         """World (x,z) -> reference image homography from the placed points, or None."""
-        pts = court["points"]
+        # Floor points only: a homography maps the floor plane.
+        pts = [p for p in court["points"] if len(p["world"]) == 2]
         if len(pts) < 4:
             return None
         world = np.float32([p["world"] for p in pts])
@@ -237,7 +251,7 @@ def main():
                 pos = (int(q[0] * W), int(q[1] * H))
                 here = p["frame"] == fi
                 cv2.drawMarker(img, pos, (0, 0, 255) if here else (0, 140, 255), cv2.MARKER_CROSS, 34 if here else 22, 4 if here else 2)
-                draw_text(img, str((p["id"] + 1) % 10), (pos[0] + 12, pos[1] - 10), (0, 0, 255) if here else (0, 140, 255))
+                draw_text(img, str(p["id"] + 1), (pos[0] + 12, pos[1] - 10), (0, 0, 255) if here else (0, 140, 255))
 
         view = cv2.resize(img, (VIEW_W, int(H * scale)))
         if state["court_mode"]:
@@ -249,10 +263,11 @@ def main():
             for j, (name, _) in enumerate(COURT_POINTS[court["view"]]):
                 mark = "x" if j in placed else " "
                 color = (0, 255, 255) if state["court_pick"] == j else ((120, 255, 120) if j in placed else (230, 230, 230))
-                draw_text(view, f"[{mark}] {(j + 1) % 10}  {name}", (12, y0 + 26 * (j + 1)), color, 0.6, 1)
+                key_hint = (j + 1) % 10 if j < 10 else "n"
+                draw_text(view, f"[{mark}] {key_hint}  {name}", (12, y0 + 26 * (j + 1)), color, 0.6, 1)
         here = [t for t in touches if t["frame"] == fi]
         status = f"frame {fi}/{n - 1}"
-        n_pts = len(court["points"])
+        n_pts = sum(1 for p in court["points"] if len(p["world"]) == 2)   # floor points
         if state["court_mode"]:
             status += f"   court: {n_pts} point{'s' if n_pts != 1 else ''}"
             status += "   (need 4+)" if n_pts < 4 else "   check the red lines, k to finish, w to save"

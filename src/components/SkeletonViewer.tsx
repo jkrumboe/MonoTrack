@@ -119,6 +119,43 @@ const TOUCH_COLORS: Record<string, number> = {
   touch: 0xeeeeee,
 };
 
+/**
+ * Clip-space matrix that takes the reference-frame camera's projection to
+ * this video frame's, for a camera that pans and zooms from a fixed spot.
+ *
+ * The analyzer stores per frame `ref_from_frame`: a homography from this
+ * frame's normalised image coords [0,1] (y down) to the reference frame's.
+ * Its inverse, rewritten in NDC (x, y in [-1,1], y up), acts on clip coords
+ * (x, y, w); z passes through, which keeps depth ordering (w changes only
+ * slightly for a rotation/zoom). Frames without a trusted estimate borrow the
+ * nearest one within a few frames. Null for a static camera.
+ */
+function frameWarpMatrix(
+  frames: FrameData[] | undefined,
+  currentFrame: number,
+): THREE.Matrix4 | null {
+  if (!frames || frames.length === 0 || !frames.some((f) => f.ref_from_frame)) return null;
+  const idx = Math.min(Math.max(0, currentFrame), frames.length - 1);
+  let H: number[] | undefined;
+  for (let d = 0; d <= 5 && !H; d++) {
+    H = frames[idx - d]?.ref_from_frame ?? frames[idx + d]?.ref_from_frame;
+  }
+  if (!H) return null;
+  // ref -> frame in normalised coords.
+  const G = new THREE.Matrix3().set(H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8]).invert();
+  // normalised -> NDC and back.
+  const N = new THREE.Matrix3().set(2, 0, -1, 0, -2, 1, 0, 0, 1);
+  const Ninv = new THREE.Matrix3().set(0.5, 0, 0.5, 0, -0.5, 0.5, 0, 0, 1);
+  const h = new THREE.Matrix3().multiplyMatrices(N, G).multiply(Ninv).elements; // column-major
+  // Matrix4.set takes row-major; h[col * 3 + row].
+  return new THREE.Matrix4().set(
+    h[0], h[3], 0, h[6],
+    h[1], h[4], 0, h[7],
+    0, 0, 1, 0,
+    h[2], h[5], 0, h[8],
+  );
+}
+
 export default function SkeletonViewer({
   overlay = false,
   calibration,
@@ -149,6 +186,10 @@ export default function SkeletonViewer({
     touchMarkers: THREE.Group;
   } | null>(null);
   const lastRenderSizeRef = useRef({ w: 0, h: 0, aspect: 0 });
+  // Overlay on a panning/zooming camera: the calibration belongs to the
+  // reference frame, so each video frame's view is that camera followed by
+  // the frame's homography. Held as a clip-space matrix; null = static.
+  const frameWarpRef = useRef<THREE.Matrix4 | null>(null);
 
   useEffect(() => {
     overlayModeRef.current = overlay;
@@ -320,6 +361,16 @@ export default function SkeletonViewer({
 
       // Don't update controls in overlay mode — it would fight camera.lookAt() set by calibration.
       if (!overlayModeRef.current) controls.update();
+      if (overlayModeRef.current) {
+        // Rebuild from the plain calibrated projection, then warp it into
+        // the current video frame (no-op for a static camera).
+        camera.updateProjectionMatrix();
+        const warp = frameWarpRef.current;
+        if (warp) {
+          camera.projectionMatrix.premultiply(warp);
+          camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+        }
+      }
       renderer.render(scene, camera);
     };
     animate();
@@ -342,6 +393,11 @@ export default function SkeletonViewer({
       container.removeChild(renderer.domElement);
     };
   }, []);
+
+  // Per-frame warp for the overlay when the camera pans and zooms.
+  useEffect(() => {
+    frameWarpRef.current = overlay ? frameWarpMatrix(frames, currentFrame) : null;
+  }, [overlay, frames, currentFrame]);
 
   // Toggle overlay mode: transparent background + lock/unlock orbit controls
   useEffect(() => {

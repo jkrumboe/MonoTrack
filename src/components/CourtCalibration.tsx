@@ -4,6 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { type CalibrationResult, solveCameraIterative } from "../utils/cameraSolver";
 import { computeHomography, applyHomography } from "../utils/courtHomography";
 
+/** Top of the net tape (m), men's height. */
+const NET_TAPE_Y_M = 2.43;
+/** The antennas rise 0.8 m above the net tape. */
+const ANTENNA_TOP_Y_M = NET_TAPE_Y_M + 0.8;
+
 /**
  * Vital intersections users place manually.
  * Court centered at origin (x: left/right, z: far/near), y=0 is floor.
@@ -19,12 +24,47 @@ const CALIBRATION_POINTS_3D = [
   { x:  4.5, y: 0, z:  3.0, label: "Near 10ft Right", color: "#5588ff" },
   { x: -4.5, y: 0, z:  9.0, label: "Near Left Corner", color: "#ffff44" },
   { x:  4.5, y: 0, z:  9.0, label: "Near Right Corner", color: "#4444ff" },
+  // Above the floor: the antennas stand on the sidelines, from the net tape
+  // (2.43 m, men) up 0.8 m. Known heights fix the camera's focal length and
+  // height scale, which floor points alone leave weak (worst from the side).
+  { x: -4.5, y: ANTENNA_TOP_Y_M, z: 0, label: "Left Antenna · Top", color: "#ff66cc" },
+  { x: -4.5, y: NET_TAPE_Y_M, z: 0, label: "Left Antenna · Net Tape", color: "#cc66ff" },
+  { x:  4.5, y: ANTENNA_TOP_Y_M, z: 0, label: "Right Antenna · Top", color: "#ff99dd" },
+  { x:  4.5, y: NET_TAPE_Y_M, z: 0, label: "Right Antenna · Net Tape", color: "#dd99ff" },
 ];
+
+/**
+ * The same ten court points named as seen from the side. The world frame must
+ * not be mirrored relative to the picture, so a side camera is taken to stand
+ * at -x: the near sideline is x = -4.5 and the picture's left end is z = -9.
+ */
+const SIDE_LABELS = [
+  "Near sideline · left end", "Far sideline · left end",
+  "Near sideline · left 3 m line", "Far sideline · left 3 m line",
+  "Near sideline · centre line", "Far sideline · centre line",
+  "Near sideline · right 3 m line", "Far sideline · right 3 m line",
+  "Near sideline · right end", "Far sideline · right end",
+  "Near antenna · top", "Near antenna · net tape",
+  "Far antenna · top", "Far antenna · net tape",
+];
+type CourtView = "behind" | "side";
+type Pt = { x: number; y: number };
+/** Click order per view (indices into CALIBRATION_POINTS_3D). */
+const CLICK_ORDER: Record<CourtView, number[]> = {
+  behind: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+  // Along the far sideline left to right, then the near one; then the
+  // antennas, far one first (the near one is often out of the picture).
+  side: [1, 3, 5, 7, 9, 0, 2, 4, 6, 8, 12, 13, 10, 11],
+};
+/** At least this many points must be placed (a homography needs 4). */
+const MIN_POINTS = 4;
 
 const CALIBRATION_GUIDE_LINES: [number, number][] = [
   [0, 1], [2, 3], [4, 5], [6, 7], [8, 9],
   [0, 2], [2, 4], [4, 6], [6, 8],
   [1, 3], [3, 5], [5, 7], [7, 9],
+  // Antennas, and the net tape between them.
+  [10, 11], [12, 13], [11, 13],
 ];
 
 const AUTO_CORNER_WORLD: [number, number][] = [
@@ -55,7 +95,9 @@ function expandCornersToCalibrationPoints(corners: { x: number; y: number }[]) {
   const dst = corners.map((c) => [c.x, c.y] as [number, number]);
   const H = computeHomography(src, dst);
   if (!H) return corners;
-  return CALIBRATION_POINTS_3D.map((p) => {
+  // Floor points only: the homography maps the floor plane, so it cannot
+  // place the antennas. Those are left for the user to click.
+  return CALIBRATION_POINTS_3D.filter((p) => p.y === 0).map((p) => {
     const [x, y] = applyHomography(H, p.x, p.z);
     return { x, y };
   });
@@ -70,6 +112,13 @@ interface CourtCalibrationProps {
   onViewTransformChange?: (transform: { zoom: number; panX: number; panY: number }) => void;
   onCalibrated: (result: CalibrationResult) => void;
   onCancel: () => void;
+  /**
+   * Moving camera: map a point on the frame being shown (video-normalised
+   * [0,1]) into the reference frame the calibration must belong to, and back.
+   * Omitted for a static camera.
+   */
+  toReference?: (p: Pt) => Pt;
+  fromReference?: (p: Pt) => Pt;
 }
 
 export default function CourtCalibration({
@@ -81,9 +130,22 @@ export default function CourtCalibration({
   onViewTransformChange,
   onCalibrated,
   onCancel,
+  toReference,
+  fromReference,
 }: CourtCalibrationProps) {
-  const [points, setPoints] = useState<{ x: number; y: number }[]>([]);
-  const [activePoint, setActivePoint] = useState(0);
+  // Indexed like CALIBRATION_POINTS_3D: a point, null = skipped (not
+  // visible), undefined = not reached yet. `step` walks CLICK_ORDER[view].
+  const [points, setPoints] = useState<(Pt | null | undefined)[]>([]);
+  const [view, setView] = useState<CourtView>("behind");
+  // Starts by adjusting the current calibration when there is one; Reset or
+  // a change of view leaves it to place the points afresh.
+  const [adjusting, setAdjusting] = useState(adjustMode);
+  const [step, setStep] = useState(0);
+  const order = CLICK_ORDER[view];
+  const N = CALIBRATION_POINTS_3D.length;
+  const activePoint = step < N ? order[step] : -1;
+  const placedCount = points.filter(Boolean).length;
+  const labelOf = (i: number) => (view === "side" ? SIDE_LABELS[i] : CALIBRATION_POINTS_3D[i].label);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
   const [autoStatus, setAutoStatus] = useState<string>("");
@@ -97,21 +159,21 @@ export default function CourtCalibration({
   // Debug state: filled after each Apply to show step-by-step pipeline
   const [pipeline, setPipeline] = useState<{
     // Step 1 – what the user placed (container-normalized [0,1])
-    containerPts: Array<{ x: number; y: number }>;
+    containerPts: Array<Pt | null>;
     // Step 2 – letterbox geometry
     lb: { cw: number; ch: number; ox: number; oy: number; rw: number; rh: number; videoAR: number };
     // Step 3 – video-frame-normalized [0,1]
-    videoFramePts: Array<{ x: number; y: number }>;
+    videoFramePts: Array<Pt | null>;
     // Step 4 – NDC [-1,1] sent to solver
-    ndcPts: Array<{ x: number; y: number }>;
+    ndcPts: Array<Pt | null>;
     // Step 5 – solver result
     fov: number;
     pos: [number, number, number];
     lookAt: [number, number, number];
     solverLog: string[];
     // Step 6 – reprojection (container-normalized [0,1])
-    reprojected: Array<{ x: number; y: number }>;
-    errPx: number[];
+    reprojected: Array<Pt | null>;
+    errPx: Array<number | null>;
     avgErrPx: number;
     quality: string;
     // pending: accepted by user to actually apply
@@ -149,13 +211,16 @@ export default function CourtCalibration({
 
   // In adjust mode, project current calibration corners to 2D on mount
   useEffect(() => {
-    if (!adjustMode || !initialCalibration) return;
+    if (!adjusting || !initialCalibration) return;
     const aspect = getVideoAspect();
     const cam = new THREE.PerspectiveCamera(initialCalibration.fov, aspect, 0.1, 500);
     cam.position.set(...initialCalibration.position);
     cam.lookAt(new THREE.Vector3(...initialCalibration.lookAt));
     cam.updateMatrixWorld();
     cam.updateProjectionMatrix();
+    // A camera along a sideline is a side view: name the points that way.
+    const [px, , pz] = initialCalibration.position;
+    setView(Math.abs(px) > Math.abs(pz) ? "side" : "behind");
 
     // Compute letterbox rect so we can map video-frame NDC → container [0,1]
     const cw2 = containerRef.current?.clientWidth || 0;
@@ -170,37 +235,58 @@ export default function CourtCalibration({
       }
     }
 
-    const projected: { x: number; y: number }[] = [];
+    const projected: (Pt | null)[] = [];
     for (const c of CALIBRATION_POINTS_3D) {
       const v = new THREE.Vector3(c.x, c.y, c.z).project(cam);
+      // Outside the picture (or behind the camera): not placeable, leave it
+      // out. Clamped to the edge it would be solved as if clicked there.
+      if (Math.abs(v.x) > 1 || Math.abs(v.y) > 1 || v.z > 1) { projected.push(null); continue; }
       // Video-frame NDC [-1,1] → video-frame [0,1]
-      const vx = (v.x + 1) / 2;
-      const vy = (-v.y + 1) / 2;
+      let vx = (v.x + 1) / 2;
+      let vy = (-v.y + 1) / 2;
+      // The calibration belongs to the reference frame; show it on this one.
+      if (fromReference) ({ x: vx, y: vy } = fromReference({ x: vx, y: vy }));
       // Video-frame [0,1] → container [0,1] (letterbox expand)
       const cx = cw2 > 0 ? (ox2 + vx * rw2) / cw2 : vx;
       const cy = ch2 > 0 ? (oy2 + vy * rh2) / ch2 : vy;
-      projected.push({ x: Math.max(0, Math.min(1, cx)), y: Math.max(0, Math.min(1, cy)) });
+      projected.push({ x: cx, y: cy });
     }
     setPoints(projected);
-    setActivePoint(CALIBRATION_POINTS_3D.length);
+    setStep(CALIBRATION_POINTS_3D.length);
     setZoom(1);
     setPan({ x: 0, y: 0 });
-  }, [adjustMode, initialCalibration, getVideoAspect]);
+  }, [adjusting, initialCalibration, getVideoAspect, fromReference]);
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
-      if (adjustMode) return;
+      if (adjusting) return;
       if (dragIndex !== null || isPanning) return;
       const pos = clientToNormalized(e.clientX, e.clientY);
       if (!pos) return;
 
-      if (points.length < CALIBRATION_POINTS_3D.length) {
-        setPoints((prev) => [...prev, pos]);
-        setActivePoint((prev) => prev + 1);
+      if (activePoint >= 0) {
+        setPoints((prev) => { const next = [...prev]; next[activePoint] = pos; return next; });
+        setStep((prev) => prev + 1);
       }
     },
-    [adjustMode, points.length, dragIndex, isPanning, clientToNormalized]
+    [adjusting, activePoint, dragIndex, isPanning, clientToNormalized]
   );
+
+  /** Switch behind/side naming; placements so far no longer mean anything. */
+  const handleView = useCallback((v: CourtView) => {
+    setAdjusting(false);
+    setView(v);
+    setPoints([]);
+    setStep(0);
+    setPipeline(null);
+  }, []);
+
+  /** The highlighted point is not visible in this frame: leave it out. */
+  const handleSkip = useCallback(() => {
+    if (activePoint < 0) return;
+    setPoints((prev) => { const next = [...prev]; next[activePoint] = null; return next; });
+    setStep((prev) => prev + 1);
+  }, [activePoint]);
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent, index: number) => {
@@ -283,10 +369,13 @@ export default function CourtCalibration({
   }, [dragIndex, isPanning, clientToNormalized]);
 
   const handleApply = useCallback(() => {
-    if (points.length !== CALIBRATION_POINTS_3D.length) return;
+    if (placedCount < MIN_POINTS) return;
 
     // ── Step 1 ─ collect container-normalized [0,1] positions ────────────────
-    const containerPts = points.map(p => ({ x: p.x, y: p.y }));
+    const containerPts = CALIBRATION_POINTS_3D.map((_, i) => {
+      const p = points[i];
+      return p ? { x: p.x, y: p.y } : null;
+    });
 
     // ── Step 2 ─ compute letterbox geometry ───────────────────────────────────
     const cw = containerRef.current?.clientWidth || 1;
@@ -302,17 +391,24 @@ export default function CourtCalibration({
     const lb = { cw, ch, ox, oy, rw, rh, videoAR };
 
     // ── Step 3 ─ video-frame-normalized [0,1] ─────────────────────────────────
-    const videoFramePts = containerPts.map(p => ({
+    const videoFramePts = containerPts.map(p => (p ? {
       x: (p.x * cw - ox) / rw,
       y: (p.y * ch - oy) / rh,
-    }));
+    } : null));
 
     // ── Step 4 ─ NDC [-1,1] for solver ────────────────────────────────────────
-    const ndcPts = videoFramePts.map(p => ({ x: p.x * 2 - 1, y: -(p.y * 2 - 1) }));
+    // A moving camera's clicks are moved into the reference frame first: the
+    // calibration (and the ball data) belong to that frame.
+    const ndcPts = videoFramePts.map(p => {
+      if (!p) return null;
+      const r = toReference ? toReference(p) : p;
+      return { x: r.x * 2 - 1, y: -(r.y * 2 - 1) };
+    });
 
-    // ── Step 5 ─ solver ───────────────────────────────────────────────────────
-    const worldPoints = CALIBRATION_POINTS_3D.map(p => ({ x: p.x, y: p.y, z: p.z }));
-    const { result, log } = solveCameraIterative(ndcPts, videoAR, worldPoints);
+    // ── Step 5 ─ solver (placed points only) ──────────────────────────────────
+    const used = CALIBRATION_POINTS_3D.map((_, i) => i).filter((i) => ndcPts[i]);
+    const worldPoints = used.map((i) => ({ x: CALIBRATION_POINTS_3D[i].x, y: CALIBRATION_POINTS_3D[i].y, z: CALIBRATION_POINTS_3D[i].z }));
+    const { result, log } = solveCameraIterative(used.map((i) => ndcPts[i]!), videoAR, worldPoints);
 
     if (!result) {
       setAutoStatus("ERROR: solver failed — check coordinates");
@@ -327,23 +423,21 @@ export default function CourtCalibration({
     rCam.updateMatrixWorld();
     rCam.updateProjectionMatrix();
 
-    const reprojected: Array<{ x: number; y: number }> = [];
-    const errPxArr: number[] = [];
+    const reprojected: Array<Pt | null> = [];
+    const errPxArr: Array<number | null> = [];
     for (let i = 0; i < CALIBRATION_POINTS_3D.length; i++) {
       const wp = CALIBRATION_POINTS_3D[i];
       const v = new THREE.Vector3(wp.x, wp.y, wp.z).project(rCam);
-      // video-frame NDC → video-frame [0,1] → container [0,1]
-      const vfx = (v.x + 1) / 2;
-      const vfy = (1 - v.y) / 2;
-      const ccx = (ox + vfx * rw) / cw;
-      const ccy = (oy + vfy * rh) / ch;
-      reprojected.push({ x: ccx, y: ccy });
-      // pixel error using video height (1080p reference)
-      const dx = vfx - videoFramePts[i].x;
-      const dy = vfy - videoFramePts[i].y;
-      errPxArr.push(Math.sqrt(dx * dx + dy * dy) * 1080);
+      // reference NDC → reference [0,1] → this frame [0,1] → container [0,1]
+      let vf = { x: (v.x + 1) / 2, y: (1 - v.y) / 2 };
+      if (fromReference) vf = fromReference(vf);
+      reprojected.push({ x: (ox + vf.x * rw) / cw, y: (oy + vf.y * rh) / ch });
+      // pixel error using video height (1080p reference), placed points only
+      const placed = videoFramePts[i];
+      errPxArr.push(placed ? Math.hypot(vf.x - placed.x, vf.y - placed.y) * 1080 : null);
     }
-    const avgErrPx = errPxArr.reduce((a, b) => a + b, 0) / errPxArr.length;
+    const errs = errPxArr.filter((e): e is number => e != null);
+    const avgErrPx = errs.reduce((a, b) => a + b, 0) / Math.max(1, errs.length);
     const quality = avgErrPx < 5 ? "excellent" : avgErrPx < 15 ? "good" : avgErrPx < 35 ? "fair" : "poor";
 
     setPipeline({
@@ -362,8 +456,8 @@ export default function CourtCalibration({
       pending: result,
     });
     setActiveStep(6); // jump straight to reprojection view
-    setAutoStatus(`Solved — avg reprojection error: ${avgErrPx.toFixed(1)} px (${quality})`);
-  }, [points, getVideoAspect]);
+    setAutoStatus(`Solved from ${used.length} points — avg reprojection error: ${avgErrPx.toFixed(1)} px (${quality})`);
+  }, [points, placedCount, getVideoAspect, toReference, fromReference]);
 
   const handleAccept = useCallback(() => {
     if (!pipeline) return;
@@ -371,8 +465,9 @@ export default function CourtCalibration({
   }, [pipeline, onCalibrated]);
 
   const handleReset = useCallback(() => {
+    setAdjusting(false);
     setPoints([]);
-    setActivePoint(0);
+    setStep(0);
     setDebugInfo(null);
     setPipeline(null);
     setZoom(1);
@@ -434,12 +529,14 @@ export default function CourtCalibration({
           }
         }
 
+        // Auto detection reports corners in behind-the-baseline order.
+        setView("behind");
         const expanded = expandCornersToCalibrationPoints(corners);
         setPoints(expanded.map((p) => ({
           x: Math.max(0, Math.min(1, p.x)),
           y: Math.max(0, Math.min(1, p.y)),
         })));
-        setActivePoint(expanded.length);
+        setStep(expanded.length);
         setAutoStatus(`Detected ${corners.length} corners`);
         setDebugInfo({ steps, log, corners });
       } else {
@@ -461,20 +558,23 @@ export default function CourtCalibration({
       onMouseDown={handlePanStart}
       onWheel={handleWheel}
       onContextMenu={(e) => e.preventDefault()}
-      style={{ width: "100%", height: "100%", position: "absolute", top: 0, left: 0, cursor: adjustMode ? "default" : points.length < CALIBRATION_POINTS_3D.length ? "crosshair" : "default", zIndex: 20 }}
+      style={{ width: "100%", height: "100%", position: "absolute", top: 0, left: 0, cursor: adjusting ? "default" : activePoint >= 0 ? "crosshair" : "default", zIndex: 20 }}
     >
       <div className="calibration-instructions">
-        {adjustMode ? (
-          <span>Drag points to adjust intersections. Mouse wheel zooms, middle/right drag pans.</span>
-        ) : points.length < CALIBRATION_POINTS_3D.length ? (
+        {adjusting ? (
+          <span>Drag points to adjust intersections. Mouse wheel zooms, middle/right drag pans. Way off? Pick Behind/Side or Re-place points to click them afresh.</span>
+        ) : activePoint >= 0 ? (
           <span>
-            Click point <strong>{activePoint + 1}/{CALIBRATION_POINTS_3D.length}</strong>:{" "}
+            Click point <strong>{step + 1}/{N}</strong>:{" "}
             <span style={{ color: CALIBRATION_POINTS_3D[activePoint].color }}>
-              {CALIBRATION_POINTS_3D[activePoint].label}
+              {labelOf(activePoint)}
             </span>
+            {" "}<span style={{ opacity: 0.75 }}>(Skip it if it is not in the picture; {MIN_POINTS}+ needed, {placedCount} placed)</span>
           </span>
+        ) : placedCount >= MIN_POINTS ? (
+          <span>Drag points, then Solve ({placedCount} placed)</span>
         ) : (
-          <span>Drag points, then Apply</span>
+          <span>Only {placedCount} placed: at least {MIN_POINTS} are needed. Reset and try another frame.</span>
         )}
       </div>
 
@@ -487,7 +587,7 @@ export default function CourtCalibration({
         }}
       >
 
-        {points.map((p, i) => (
+        {points.map((p, i) => p && (
           <div
             key={i}
             onMouseDown={(e) => handleMouseDown(e, i)}
@@ -499,20 +599,21 @@ export default function CourtCalibration({
               cursor: "grab",
             }}
           >
-            <span className="calibration-point-label">{CALIBRATION_POINTS_3D[i].label}</span>
+            <span className="calibration-point-label">{labelOf(i)}</span>
           </div>
         ))}
 
-        {(points.length >= 2 || pipeline !== null) && (
+        {(placedCount >= 2 || pipeline !== null) && (
           <svg style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
             {/* Guide lines between placed points */}
             {CALIBRATION_GUIDE_LINES.map(([a, b], i) => {
-              if (!points[a] || !points[b]) return null;
+              const pa = points[a], pb = points[b];
+              if (!pa || !pb) return null;
               return (
                 <line
                   key={i}
-                  x1={`${points[a].x * 100}%`} y1={`${points[a].y * 100}%`}
-                  x2={`${points[b].x * 100}%`} y2={`${points[b].y * 100}%`}
+                  x1={`${pa.x * 100}%`} y1={`${pa.y * 100}%`}
+                  x2={`${pb.x * 100}%`} y2={`${pb.y * 100}%`}
                   stroke="rgba(255,255,255,0.6)" strokeWidth="2" strokeDasharray="6,4"
                 />
               );
@@ -521,8 +622,8 @@ export default function CourtCalibration({
             {/* Reprojection overlay — shown when on step 6 */}
             {pipeline && activeStep === 6 && points.map((p, i) => {
               const rp = pipeline.reprojected[i];
-              if (!rp) return null;
               const err = pipeline.errPx[i];
+              if (!p || !rp || err == null) return null;
               const col = err < 5 ? "#00ff88" : err < 15 ? "#ffcc00" : err < 35 ? "#ff8800" : "#ff3333";
               const mx = ((p.x + rp.x) / 2) * 100;
               const my = ((p.y + rp.y) / 2) * 100;
@@ -545,11 +646,22 @@ export default function CourtCalibration({
       </div>
 
       <div className="calibration-buttons" onClick={(e) => e.stopPropagation()}>
-        {!adjustMode && <button className="btn btn-primary" onClick={handleAutoDetect}>Auto Detect</button>}
+        {(
+          <span style={{ display: "inline-flex", gap: 4 }}>
+            <button className={`btn ${view === "behind" ? "btn-primary" : "btn-secondary"}`} onClick={() => handleView("behind")}
+              title="Camera behind a baseline">Behind</button>
+            <button className={`btn ${view === "side" ? "btn-primary" : "btn-secondary"}`} onClick={() => handleView("side")}
+              title="Camera along a sideline">Side</button>
+          </span>
+        )}
+        {!adjusting && activePoint >= 0 && (
+          <button className="btn btn-secondary" onClick={handleSkip} title="This point is not in the picture">Skip point</button>
+        )}
+        {!adjusting && <button className="btn btn-primary" onClick={handleAutoDetect}>Auto Detect</button>}
         <button className="btn btn-secondary" onClick={() => setZoom((z) => Math.max(MIN_ZOOM, z / 1.2))}>−</button>
         <button className="btn btn-secondary" onClick={() => setZoom((z) => Math.min(MAX_ZOOM, z * 1.2))}>+</button>
         <button className="btn btn-secondary" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>Fit</button>
-        {points.length === CALIBRATION_POINTS_3D.length && !pipeline && (
+        {(adjusting || activePoint < 0) && placedCount >= MIN_POINTS && !pipeline && (
           <button className="btn btn-primary" onClick={handleApply}>Solve →</button>
         )}
         {pipeline && (
@@ -561,7 +673,10 @@ export default function CourtCalibration({
         {pipeline && (
           <button className="btn btn-secondary" onClick={() => setPipeline(null)}>Adjust Points</button>
         )}
-        {points.length > 0 && !adjustMode && !pipeline && (
+        {adjusting && !pipeline && (
+          <button className="btn btn-secondary" onClick={handleReset} title="Discard these points and click them afresh">Re-place points</button>
+        )}
+        {step > 0 && !adjusting && !pipeline && (
           <button className="btn btn-secondary" onClick={handleReset}>Reset</button>
         )}
         <button className="btn btn-secondary" onClick={onCancel}>Cancel</button>
@@ -608,13 +723,16 @@ export default function CourtCalibration({
                 <table className="pipeline-table">
                   <thead><tr><th>Point</th><th>x</th><th>y</th></tr></thead>
                   <tbody>
-                    {CALIBRATION_POINTS_3D.map((pt, i) => (
-                      <tr key={i}>
-                        <td style={{ color: pt.color }}>● {pt.label}</td>
-                        <td>{pipeline.containerPts[i].x.toFixed(4)}</td>
-                        <td>{pipeline.containerPts[i].y.toFixed(4)}</td>
-                      </tr>
-                    ))}
+                    {CALIBRATION_POINTS_3D.map((pt, i) => {
+                      const cp = pipeline.containerPts[i];
+                      return cp && (
+                        <tr key={i}>
+                          <td style={{ color: pt.color }}>● {labelOf(i)}</td>
+                          <td>{cp.x.toFixed(4)}</td>
+                          <td>{cp.y.toFixed(4)}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -660,10 +778,11 @@ export default function CourtCalibration({
                   <tbody>
                     {CALIBRATION_POINTS_3D.map((pt, i) => {
                       const vp = pipeline.videoFramePts[i];
+                      if (!vp) return null;
                       const ok = vp.x >= 0 && vp.x <= 1 && vp.y >= 0 && vp.y <= 1;
                       return (
                         <tr key={i}>
-                          <td style={{ color: pt.color }}>● {pt.label}</td>
+                          <td style={{ color: pt.color }}>● {labelOf(i)}</td>
                           <td style={{ color: ok ? "#ddd" : "#f55" }}>{vp.x.toFixed(4)}</td>
                           <td style={{ color: ok ? "#ddd" : "#f55" }}>{vp.y.toFixed(4)}</td>
                           <td style={{ color: ok ? "#5f5" : "#f55" }}>{ok ? "✓" : "✗ OOB!"}</td>
@@ -682,13 +801,16 @@ export default function CourtCalibration({
                 <table className="pipeline-table">
                   <thead><tr><th>Point</th><th>x</th><th>y</th></tr></thead>
                   <tbody>
-                    {CALIBRATION_POINTS_3D.map((pt, i) => (
-                      <tr key={i}>
-                        <td style={{ color: pt.color }}>● {pt.label}</td>
-                        <td>{pipeline.ndcPts[i].x.toFixed(4)}</td>
-                        <td>{pipeline.ndcPts[i].y.toFixed(4)}</td>
-                      </tr>
-                    ))}
+                    {CALIBRATION_POINTS_3D.map((pt, i) => {
+                      const np = pipeline.ndcPts[i];
+                      return np && (
+                        <tr key={i}>
+                          <td style={{ color: pt.color }}>● {labelOf(i)}</td>
+                          <td>{np.x.toFixed(4)}</td>
+                          <td>{np.y.toFixed(4)}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -734,10 +856,11 @@ export default function CourtCalibration({
                   <tbody>
                     {CALIBRATION_POINTS_3D.map((pt, i) => {
                       const err = pipeline.errPx[i];
+                      if (err == null) return null;
                       const col = err < 5 ? "#00ff88" : err < 15 ? "#ffcc00" : err < 35 ? "#ff8800" : "#ff4444";
                       return (
                         <tr key={i}>
-                          <td style={{ color: pt.color }}>● {pt.label}</td>
+                          <td style={{ color: pt.color }}>● {labelOf(i)}</td>
                           <td style={{ color: col, fontFamily: "monospace" }}>{err.toFixed(1)}</td>
                         </tr>
                       );

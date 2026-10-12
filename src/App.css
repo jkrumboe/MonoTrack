@@ -265,6 +265,24 @@ body {
   color: var(--text-secondary);
   min-width: 80px;
   text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.frame-counter-sub {
+  opacity: 0.6;
+}
+
+.progress-time {
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.analysis-duration {
+  margin-left: auto;
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 /* === Stats Panel === */

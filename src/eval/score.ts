@@ -78,7 +78,7 @@ export function scoreClip(fx: Fixture, truth: Truth, run: PipelineRun | null): {
       matches: [],
       metrics: {
         clip: fx.clip, synthetic, touchesTrue: truth.touches.length, touchesFound: 0, touchesMatched: 0,
-        recall: 0, precision: 0, typeAccuracy: 0, touchPosErrM: null, touchHeightErrM: null,
+        recall: 0, precision: 0, typeAccuracy: 0, touchPosErrM: null, touchHeightErrM: null, touchFrameErr: null,
         pathRmsM: null, pathCoverage: synthetic ? 0 : null, reprojMedianPx: null, score: 0,
       },
     };
@@ -128,6 +128,7 @@ export function scoreClip(fx: Fixture, truth: Truth, run: PipelineRun | null): {
       touchesTrue: truth.touches.length, touchesFound: nFound, touchesMatched: matched.length,
       recall, precision, typeAccuracy,
       touchPosErrM, touchHeightErrM: hErrs.length ? mean(hErrs) : null,
+      touchFrameErr: matched.length ? mean(matched.map((m) => Math.abs(m.found!.frame - m.trueFrame))) : null,
       pathRmsM, pathCoverage, reprojMedianPx: reproj.length ? median(reproj) : null,
       score,
     },

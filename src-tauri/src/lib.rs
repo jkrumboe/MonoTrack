@@ -305,6 +305,23 @@ async fn detect_court(
     }
 }
 
+/// Store a hand-placed court so later clips of the same match calibrate
+/// themselves (python/court_store.py). Runs the analyzer once and waits.
+#[tauri::command]
+async fn save_court(app: AppHandle, video_path: String, frame: u32, corners: Vec<[f64; 2]>) -> Result<String, String> {
+    let request = serde_json::json!({ "video_path": video_path, "frame": frame, "corners": corners });
+    let output = Command::new(find_python())
+        .arg(analyzer_script_path(&app))
+        .arg("--save-court")
+        .arg(request.to_string())
+        .output()
+        .map_err(|e| format!("Failed to start Python: {}", e))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 #[tauri::command]
 async fn stop_analysis(state: State<'_, AnalyzerProcess>) -> Result<String, String> {
     if let Ok(mut guard) = state.0.lock() {
@@ -335,7 +352,7 @@ pub fn run() {
             stdin: Mutex::new(None),
             stdout: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![start_analysis, stop_analysis, detect_court, write_text_file])
+        .invoke_handler(tauri::generate_handler![start_analysis, stop_analysis, detect_court, save_court, write_text_file])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

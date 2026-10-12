@@ -33,7 +33,7 @@ for (const c of cases) {
     `${tag} ${c.name.padEnd(18)} ` +
     (m
       ? `score ${m.score.toFixed(1).padStart(5)}  touches ${m.touchesMatched}/${m.touchesTrue} (found ${m.touchesFound})` +
-        `  type ${fmt(m.typeAccuracy)}  pos ${fmt(m.touchPosErrM)} m  h ${fmt(m.touchHeightErrM)} m` +
+        `  type ${fmt(m.typeAccuracy)}  pos ${fmt(m.touchPosErrM)} m  h ${fmt(m.touchHeightErrM)} m  dt ${fmt(m.touchFrameErr)} f` +
         `  path ${fmt(m.pathRmsM)} m  cov ${fmt(m.pathCoverage)}  reproj ${fmt(m.reprojMedianPx, 1)} px`
       : `unlabelled: ${r.run?.result.touches?.length ?? 0} touches found`) +
     `  (${r.run?.millis ?? 0} ms)`,

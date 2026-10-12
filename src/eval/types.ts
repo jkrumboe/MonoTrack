@@ -36,8 +36,11 @@ export interface TouchLabel {
 export interface CourtPointLabel {
   id: number;
   name: string;
-  /** Court coordinates (x across, z along; net at z = 0), metres. */
-  world: [number, number];
+  /**
+   * Court coordinates (x across, z along; net at z = 0), metres, plus the
+   * height above the floor for points that are not on it (antennas).
+   */
+  world: [number, number] | [number, number, number];
   /** Frame it was clicked on, and where (normalised raw image coords). */
   frame: number;
   pt: [number, number];
@@ -81,6 +84,8 @@ export interface ClipMetrics {
   touchPosErrM: number | null;
   /** Mean height error of matched touches (m), synthetic only. */
   touchHeightErrM: number | null;
+  /** Mean |found - true| touch frame of matched touches (frames). Reported, not scored. */
+  touchFrameErr: number | null;
   /** RMS 3D error over frames that have both truth and a solved position (m). */
   pathRmsM: number | null;
   /** Share of true-path frames that got a 3D position. */

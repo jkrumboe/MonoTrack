@@ -9,7 +9,7 @@ import { type CalibrationResult, solveCameraIterative } from "./utils/cameraSolv
 import CourtKeypointOverlay from "./components/CourtKeypointOverlay";
 import CourtCalibration from "./components/CourtCalibration";
 import CourtMapView from "./components/CourtMapView";
-import ProgressBar from "./components/ProgressBar";
+import ProgressBar, { formatDuration } from "./components/ProgressBar";
 import StatsDisplay from "./components/StatsDisplay";
 import PlaybackControls from "./components/PlaybackControls";
 import PlayerTrackingOverlay from "./components/PlayerTrackingOverlay";
@@ -58,6 +58,51 @@ function projectKeypointsFromCalibration(
     // NDC [-1,1] from videoAR camera → video-frame normalized [0,1]
     return [(v.x + 1) / 2, (1 - v.y) / 2];
   });
+}
+
+/**
+ * Mapping between a video frame and the reference frame for a camera that
+ * pans and zooms (from the analyzer's per-frame `ref_from_frame`), in
+ * video-normalised [0,1] coords. Frames without a trusted estimate borrow the
+ * nearest one within a few frames. Null for a static camera.
+ */
+function referenceMapping(
+  frames: FrameData[],
+  frameIdx: number,
+): { toReference: (p: { x: number; y: number }) => { x: number; y: number }; fromReference: (p: { x: number; y: number }) => { x: number; y: number } } | null {
+  if (!frames.length || !frames.some((f) => f.ref_from_frame)) return null;
+  const idx = Math.min(Math.max(0, frameIdx), frames.length - 1);
+  let H: number[] | undefined;
+  for (let d = 0; d <= 5 && !H; d++) H = frames[idx - d]?.ref_from_frame ?? frames[idx + d]?.ref_from_frame;
+  if (!H) return null;
+  const M = new THREE.Matrix3().set(H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8]);
+  const Minv = M.clone().invert();
+  const apply = (m: THREE.Matrix3) => (p: { x: number; y: number }) => {
+    const v = new THREE.Vector3(p.x, p.y, 1).applyMatrix3(m);
+    return { x: v.x / v.z, y: v.y / v.z };
+  };
+  return { toReference: apply(M), fromReference: apply(Minv) };
+}
+
+/**
+ * Remember a hand-placed court so later clips of the same match calibrate
+ * themselves: the analyzer matches their venue against this frame
+ * (python/court_store.py). Stored as the four court corners on the
+ * reference frame, the calibration's own image, like a detected court.
+ */
+function saveCourtForMatch(videoPath: string, cal: CalibrationResult, aspect: number, refFrame: number) {
+  const cam = new THREE.PerspectiveCamera(cal.fov, aspect, 0.1, 500);
+  cam.position.set(...cal.position);
+  cam.lookAt(new THREE.Vector3(...cal.lookAt));
+  cam.updateMatrixWorld();
+  cam.updateProjectionMatrix();
+  const corners = [[-4.5, -9], [4.5, -9], [4.5, 9], [-4.5, 9]].map(([x, z]) => {
+    const v = new THREE.Vector3(x, 0, z).project(cam);
+    return [(v.x + 1) / 2, (1 - v.y) / 2];
+  });
+  invoke("save_court", { videoPath, frame: refFrame, corners })
+    .then((r) => console.log("[court] saved for this match:", r))
+    .catch((e) => console.warn("[court] could not save court:", e));
 }
 
 /** Overlay showing manual ball-centre correction markers on the video pane. */
@@ -137,6 +182,8 @@ function App() {
     result,
     courtData,
     error,
+    elapsedMs,
+    analysisDurationMs,
     startAnalysis,
     stopAnalysis,
   } = useAnalysis();
@@ -359,11 +406,20 @@ function App() {
     return best;
   }, [courtData, currentFrame]);
 
+  // Pan/zoom camera: this frame's mapping to the reference frame (the one the
+  // calibration and court keypoints belong to), and back. Null when static.
+  const frameMapping = useMemo(() => referenceMapping(frames, currentFrame), [frames, currentFrame]);
+
   const currentKeypoints = (() => {
-    if (manualCalibrationLocked && calibration && videoSize.width > 0 && videoSize.height > 0) {
-      return projectKeypointsFromCalibration(calibration, videoSize);
-    }
-    return getKeypointsForFrame(currentFrame);
+    const kps = manualCalibrationLocked && calibration && videoSize.width > 0 && videoSize.height > 0
+      ? projectKeypointsFromCalibration(calibration, videoSize)
+      : getKeypointsForFrame(currentFrame);
+    if (!frameMapping || !kps) return kps;
+    return kps.map((k) => {
+      if (!k) return k;
+      const p = frameMapping.fromReference({ x: k[0], y: k[1] });
+      return [p.x, p.y];
+    });
   })();
 
   /** Compute calibration from precomputed court corners for the current frame. */
@@ -401,13 +457,15 @@ function App() {
     setVideoSize({ width: el.videoWidth, height: el.videoHeight });
   }, []);
 
+  // canplay fires after every seek. Only recalibrate when the court sample
+  // actually changes — a new calibration object reruns the whole ball solver,
+  // which is what made scrubbing the timeline crawl.
   const handleCanPlay = useCallback(() => {
-    if (manualCalibrationLocked) return;
-    // Calibrate from precomputed data if available
-    if (courtData.length > 0) {
-      updateCalibrationForFrame(currentFrame);
-    }
-  }, [courtData, currentFrame, updateCalibrationForFrame, manualCalibrationLocked]);
+    if (manualCalibrationLocked || !currentCourtEntry) return;
+    if (calibration && lastCalibratedCourtFrameRef.current === currentCourtEntry.frame) return;
+    lastCalibratedCourtFrameRef.current = currentCourtEntry.frame;
+    updateCalibrationForFrame(currentCourtEntry.frame);
+  }, [calibration, currentCourtEntry, updateCalibrationForFrame, manualCalibrationLocked]);
 
   // When courtData arrives (analysis complete) or video becomes ready, calibrate for frame 0
   useEffect(() => {
@@ -686,11 +744,60 @@ function App() {
   }, [isPlaying, isRealVideo, frames.length]);
 
   const togglePlay = useCallback(() => {
-    if (currentFrame >= frames.length - 1) {
+    if (!isPlaying && (currentFrame >= frames.length - 1 || videoElRef.current?.ended)) {
       setCurrentFrame(0);
     }
-    setIsPlaying((prev) => !prev);
-  }, [currentFrame, frames.length]);
+    setIsPlaying(!isPlaying);
+  }, [isPlaying, currentFrame, frames.length]);
+
+  const stopPlayback = useCallback(() => setIsPlaying(false), []);
+
+  // Scrubbing or stepping always pauses, so the video doesn't fight the slider.
+  // The slider can fire several input events per screen refresh; re-rendering
+  // the whole app for each is wasted work, so apply at most one per frame.
+  const pendingScrubRef = useRef<number | null>(null);
+  const scrubRafRef = useRef(0);
+  const seekToFrame = useCallback(
+    (frame: number) => {
+      setIsPlaying(false);
+      pendingScrubRef.current = Math.max(0, Math.min(frame, frames.length - 1));
+      if (scrubRafRef.current) return;
+      scrubRafRef.current = requestAnimationFrame(() => {
+        scrubRafRef.current = 0;
+        if (pendingScrubRef.current !== null) setCurrentFrame(pendingScrubRef.current);
+        pendingScrubRef.current = null;
+      });
+    },
+    [frames.length]
+  );
+  useEffect(() => () => cancelAnimationFrame(scrubRafRef.current), []);
+
+  // Keyboard: Space toggles playback, ←/→ step one frame (Shift = 10 frames)
+  useEffect(() => {
+    if (frames.length === 0) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.isContentEditable ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          (target.tagName === "INPUT" && (target as HTMLInputElement).type !== "range"))
+      ) {
+        return;
+      }
+      if (e.code === "Space") {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.code === "ArrowRight" || e.code === "ArrowLeft") {
+        e.preventDefault();
+        const step = (e.shiftKey ? 10 : 1) * (e.code === "ArrowRight" ? 1 : -1);
+        seekToFrame(currentFrame + step);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [frames.length, currentFrame, togglePlay, seekToFrame]);
 
   const videoInnerTransform = useMemo(() => {
     if (showCalibration) {
@@ -752,8 +859,9 @@ function App() {
         {status === "running" && (
           <div className="analysis-running">
             <h2>Analyzing Video...</h2>
-            <ProgressBar percent={progress} message={progressMessage} />
-            <p className="frame-count">{frames.length} frames processed</p>
+            <ProgressBar percent={progress} message={progressMessage} elapsedMs={elapsedMs} />
+            {/* Frames arrive all at once at the end; until then the progress message counts them. */}
+            {frames.length > 0 && <p className="frame-count">{frames.length} frames received</p>}
           </div>
         )}
 
@@ -800,6 +908,14 @@ function App() {
                     Court Aligned ✓
                   </span>
                 )}
+                {analysisDurationMs !== null && (
+                  <span
+                    className="analysis-duration"
+                    title={`${result.total_frames} frames · ${(result.total_frames / (analysisDurationMs / 1000)).toFixed(1)} frames/s`}
+                  >
+                    Analyzed in {formatDuration(analysisDurationMs)}
+                  </span>
+                )}
               </div>
 
               {viewMode === "side-by-side" && (
@@ -836,6 +952,7 @@ function App() {
                         onMetadataLoaded={handleMetadataLoaded}
                         onVideoElement={handleVideoElement}
                         onCanPlay={handleCanPlay}
+                        onPlaybackStopped={stopPlayback}
                       />
                       {currentKeypoints && !showCalibration && (
                         <CourtKeypointOverlay
@@ -873,8 +990,11 @@ function App() {
                             setCalibration(cal);
                             setManualCalibrationLocked(true);
                             setShowCalibration(false);
+                            if (isRealVideo && videoAspect) saveCourtForMatch(videoPath, cal, videoAspect, courtData[0]?.frame ?? 0);
                           }}
                           onCancel={() => setShowCalibration(false)}
+                          toReference={frameMapping?.toReference}
+                          fromReference={frameMapping?.fromReference}
                         />
                       )}
                     </div>
@@ -914,6 +1034,7 @@ function App() {
                       onMetadataLoaded={handleMetadataLoaded}
                       onVideoElement={handleVideoElement}
                       onCanPlay={handleCanPlay}
+                      onPlaybackStopped={stopPlayback}
                     />
                   </div>
                   <div className="overlay-3d">
@@ -954,7 +1075,8 @@ function App() {
                 currentFrame={currentFrame}
                 totalFrames={frames.length}
                 isPlaying={isPlaying}
-                onFrameChange={setCurrentFrame}
+                fps={isRealVideo ? result.fps : undefined}
+                onFrameChange={seekToFrame}
                 onTogglePlay={togglePlay}
               />
             </div>

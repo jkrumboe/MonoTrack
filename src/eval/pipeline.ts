@@ -19,7 +19,7 @@ function applyH(H: number[] | undefined, [x, y]: number[]): [number, number] {
  * Each point is mapped from the frame it was clicked on into the reference
  * image with that frame's homography (identity for a static camera).
  */
-export function courtFromLabel(fx: Fixture, court: CourtLabel): { img: [number, number][]; world: [number, number][] } {
+export function courtFromLabel(fx: Fixture, court: CourtLabel): { img: [number, number][]; world: ([number, number] | [number, number, number])[] } {
   let points = court.points ?? [];
   if (!points.length && court.corners && court.frame != null) {
     // Old format: 4 corners on one frame, image order far-left, far-right,
@@ -43,7 +43,7 @@ export function calibrate(fx: Fixture, court?: CourtLabel): CalibrationResult | 
   if (court) {
     const { img, world } = courtFromLabel(fx, court);
     if (img.length < 4) return null;
-    return solveCameraIterative(img.map(toNdc), aspect, world.map(([x, z]) => ({ x, y: 0, z }))).result;
+    return solveCameraIterative(img.map(toNdc), aspect, world.map(([x, z, h]) => ({ x, y: h ?? 0, z }))).result;
   }
   if (!fx.courtCorners) return null;
   return solveCameraIterative(fx.courtCorners.map(toNdc), aspect).result;

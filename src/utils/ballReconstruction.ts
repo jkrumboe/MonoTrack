@@ -226,7 +226,7 @@ export interface BallTrajectoryResult {
 export interface BallTouch {
   frame: number;
   position: [number, number, number];
-  /** "toss" | "serve" | "reception" | "set" | "attack" | "block" | "touch". */
+  /** "toss" | "serve" | "reception" | "set" | "attack" | "block" | "dig" | "touch". */
   label: string;
 }
 
@@ -928,6 +928,8 @@ function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number
  * floor has its centre at 0.105 m; real digs are played well above that.
  */
 const FLOOR_CONTACT_Y_M = 0.3;
+/** Longest detection gap (s) across which a touch is dated at the knot (see touch reporting). */
+const TOUCH_FRAME_MAX_GAP_S = 0.4;
 /** A flight whose arc gets this low (ball centre, m) has reached the floor. */
 const FLOOR_ARC_Y_M = 0.15;
 /** Touches happen at player height: floor of the soft bound on knot height (m). */
@@ -993,6 +995,15 @@ export interface RallyParams {
   knotMaxY: number;
   /** Speeds above this (m/s) are penalised; a hard men's jump serve is ~30 m/s. */
   softMaxSpeed: number;
+  /**
+   * Air drag: deceleration per m/s of speed, per m/s (rho·Cd·A / 2m). A
+   * volleyball is light for its size: 1.2·0.47·0.035 / (2·0.27) ~ 0.036,
+   * i.e. ~0.4 g of drag at 10 m/s. 0 is a drag-free arc. Off by default:
+   * at 0.036 the labelled real clips moved by -1.8 points overall (better on
+   * most, one fragile clip lost every arc) and the drag-free synthetic
+   * scenarios cannot judge it.
+   */
+  dragPerM: number;
   /** Residual px per m/s of velocity change at a knot (touch impulse prior). */
   touchImpulseWeight: number;
   /**
@@ -1047,6 +1058,7 @@ export interface RallyParams {
     set: TouchRule;
     attack: TouchRule;
     block: TouchRule;
+    dig: TouchRule;
   };
 }
 
@@ -1057,6 +1069,7 @@ export const DEFAULT_RALLY_PARAMS: RallyParams = {
   rallyMaxGapS: 1.0,
   knotMaxY: 4.5,
   softMaxSpeed: 30,
+  dragPerM: 0,
   touchImpulseWeight: 0.3,
   sizeDepthWeight: 10,
   sizeDepthOutlier: 0.3,
@@ -1088,6 +1101,9 @@ export const DEFAULT_RALLY_PARAMS: RallyParams = {
     // attack (contact ~2-3 m out) is drawn too close.
     attack:    { minAbsZ: 0, maxAbsZ: 1.0, minY: 2.9, maxY: 3.8, minG: 0.8, maxG: 2.2 },
     block:     { minAbsZ: 0, maxAbsZ: 1.5, minY: 2.4, maxY: 3.6, minG: 0.8, maxG: 1.5 },
+    // A dig is played low, anywhere from the 3 m line back (and beyond the
+    // end line); the ball leaves it at about g, like a pass.
+    dig:       { minAbsZ: 1.5, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 0.1, maxY: 2.6, minG: 0.9, maxG: 1.15 },
   },
 };
 
@@ -1208,14 +1224,58 @@ interface RallySegmentResult {
   outlier: boolean[];
 }
 
+/** Ball this close to the top of the picture (NDC v) is leaving or entering it there. */
+const TOP_EDGE_NDC = 0.85;
+/** Longest flight above the picture that is joined into one arc (s). */
+const OFFSCREEN_MAX_S = 4;
+
+/**
+ * Join the two pieces of a flight that went out of the top of the picture.
+ * High balls (toss, serve, set, free ball) regularly leave the frame for
+ * 1-2 s. Split there, the rally broke in two (gaps over rallyMaxGapS) or got
+ * a knot in the gap, near the apex, where the knot-height cap and the
+ * analyzer's straight-line gap fill pulled the arc down. Nobody touches the
+ * ball above the picture, so exit and re-entry are one ballistic arc, and its
+ * timing and gravity give the route above the frame.
+ */
+function joinOffscreenFlights(
+  arcs: ArcObsEx[][],
+  /** Frames of re-entry samples not to join at (their joined arc did not fit). */
+  skip: Set<number> = new Set(),
+  /** Receives the frame of each re-entry sample joined. */
+  joined?: number[],
+): ArcObsEx[][] {
+  const vOf = (o: ArcObsEx) => o.frameV ?? o.v;
+  const leftThroughTop = (a: ArcObsEx[]) =>
+    a.length >= 2 && vOf(a[a.length - 1]) >= TOP_EDGE_NDC && vOf(a[a.length - 1]) > vOf(a[Math.max(0, a.length - 3)]);
+  const cameThroughTop = (a: ArcObsEx[]) =>
+    a.length >= 2 && vOf(a[0]) >= TOP_EDGE_NDC && vOf(a[0]) > vOf(a[Math.min(a.length - 1, 2)]);
+  const out: ArcObsEx[][] = [];
+  for (const arc of arcs) {
+    const prev = out[out.length - 1];
+    if (prev && arc.length > 0 && !skip.has(arc[0].fi) && leftThroughTop(prev) && cameThroughTop(arc) &&
+        arc[0].t - prev[prev.length - 1].t <= OFFSCREEN_MAX_S) {
+      out[out.length - 1] = [...prev, ...arc];
+      joined?.push(arc[0].fi);
+      continue;
+    }
+    out.push(arc);
+  }
+  return out;
+}
+
 /** Group touch-split segments into rallies (chains separated by short gaps). */
-function groupIntoRallies(segments: ArcObsEx[][]): ArcObsEx[][][] {
+function groupIntoRallies(
+  segments: ArcObsEx[][],
+  /** Frames of first samples that continue the rally whatever the gap before them. */
+  keepTogether: Set<number> = new Set(),
+): ArcObsEx[][][] {
   const rallies: ArcObsEx[][][] = [];
   for (const seg of segments) {
     if (seg.length === 0) continue;
     const cur = rallies[rallies.length - 1];
     const prevSeg = cur?.[cur.length - 1];
-    if (prevSeg && seg[0].t - prevSeg[prevSeg.length - 1].t <= P.rallyMaxGapS) cur.push(seg);
+    if (prevSeg && (seg[0].t - prevSeg[prevSeg.length - 1].t <= P.rallyMaxGapS || keepTogether.has(seg[0].fi))) cur.push(seg);
     else rallies.push([seg]);
   }
   return rallies;
@@ -1266,36 +1326,162 @@ function touchCandidates(
   if (!boxes) return [];
   const [bx, by] = ball;
   const out: TouchCandidate[] = [];
-  for (const [x1, y1, x2, y2] of boxes) {
+  for (const box of boxes) {
+    const [x1, y1, x2, y2] = box;
     const w = x2 - x1, h = y2 - y1;
     // Ball within reach: beside the body or above it (arms, jumps), never
     // below the feet.
     if (bx < x1 - 0.5 * w || bx > x2 + 0.5 * w) continue;
     if (by < y1 - reachUp * h || by > y2) continue;
-    // A jumping server or attacker has their feet off the floor, which would
-    // place them metres too deep. Use the lowest feet of the same player over
-    // nearby frames: the take-off spot. "Same player" must be followed frame
-    // to frame by overlap - from behind the baseline, far-side players and
-    // near-net players share image columns and sizes, so matching on column
-    // alone grabbed someone else's feet.
-    const cx = (x1 + x2) / 2;
-    let feetY = y2;
-    for (const step of [-1, 1]) {
-      let cur: PlayerBox = [x1, y1, x2, y2];
-      for (let d = step; Math.abs(d) <= P.playerTrackFrames; d += step) {
-        let next: PlayerBox | null = null;
-        let bestIou = 0.5;
-        for (const c of playersByFrame.get(fi + d) ?? []) {
-          const iou = _boxIou(cur, c);
-          if (iou > bestIou) { bestIou = iou; next = c; }
-        }
-        if (!next) break;
-        cur = next;
-        feetY = Math.max(feetY, cur[3]);
+    const g = takeOffSpot(fi, box, playersByFrame, cam);
+    if (g) out.push(g);
+  }
+  return out;
+}
+
+/**
+ * Court position of a player's take-off spot. A jumping server or attacker
+ * has their feet off the floor, which would place them metres too deep, so
+ * use the lowest feet of the same player over nearby frames. "Same player"
+ * must be followed frame to frame by overlap - from behind the baseline,
+ * far-side players and near-net players share image columns and sizes, so
+ * matching on column alone grabbed someone else's feet.
+ */
+function takeOffSpot(
+  fi: number,
+  box: PlayerBox,
+  playersByFrame: Map<number, PlayerBox[]>,
+  cam: THREE.PerspectiveCamera,
+): TouchCandidate | null {
+  const [x1, y1, x2, y2] = box;
+  let feetY = y2;
+  for (const step of [-1, 1]) {
+    let cur: PlayerBox = [x1, y1, x2, y2];
+    for (let d = step; Math.abs(d) <= P.playerTrackFrames; d += step) {
+      let next: PlayerBox | null = null;
+      let bestIou = 0.5;
+      for (const c of playersByFrame.get(fi + d) ?? []) {
+        const iou = _boxIou(cur, c);
+        if (iou > bestIou) { bestIou = iou; next = c; }
       }
+      if (!next) break;
+      cur = next;
+      feetY = Math.max(feetY, cur[3]);
     }
-    const g = _groundPointOf(cam, cx, feetY);
-    if (!g || Math.abs(g[0]) > RALLY_MAX_ABS_X_M || Math.abs(g[1]) > RALLY_MAX_ABS_Z_M) continue;
+  }
+  const g = _groundPointOf(cam, (x1 + x2) / 2, feetY);
+  if (!g || Math.abs(g[0]) > RALLY_MAX_ABS_X_M || Math.abs(g[1]) > RALLY_MAX_ABS_Z_M) return null;
+  return g;
+}
+
+/** Arm keypoints of one player: [x, y, conf] for shoulders, elbows, wrists (left, right). */
+type PlayerArms = number[][];
+/** Wrist keypoints this confident are used. */
+const WRIST_MIN_CONF = 0.3;
+/** Longest detection gap (s) in which a contact is searched for at the arms. */
+const HIDDEN_CONTACT_MAX_GAP_S = 0.8;
+/**
+ * How far a path extended into a gap may miss the wrists: sigma = base +
+ * accel * dt^2 (px at 1080p), as an unknown acceleration (a serve diving
+ * onto the receiver) bends the real path away from the extrapolation with
+ * the square of the time. The two paths' misses in sigmas are summed.
+ */
+const CONTACT_SIGMA_BASE_PX = 20;
+const CONTACT_SIGMA_ACCEL_PX = 1000;
+const HIDDEN_CONTACT_MAX_SIGMA = 4;
+
+/** A touch found at a player's arms inside a detection gap. */
+interface HiddenContact {
+  t: number;
+  frame: number;
+  /** Contact point in the image (NDC): the wrists. */
+  img: [number, number];
+  /** The player's take-off spot on the court. */
+  spot: TouchCandidate;
+}
+
+/**
+ * Where the ball was played while hidden: the frame and player at which the
+ * incoming path (extrapolated forward) and the outgoing one (extrapolated
+ * back) both pass the player's wrists. A reception is played off the
+ * forearms, a set off the hands; either way the wrists are at the ball.
+ */
+function findHiddenContact(
+  before: ArcObsEx[],
+  after: ArcObsEx[],
+  frames: { frame: number; timestamp: number }[],
+  playersByFrame: Map<number, PlayerBox[]>,
+  armsByFrame: Map<number, PlayerArms[]>,
+  cam: THREE.PerspectiveCamera,
+  hw: number,
+  hh: number,
+): HiddenContact | null {
+  const a = before.slice(-6), b = after.slice(0, 6);
+  if (a.length < 3 || b.length < 3) return null;
+  const tA = a[a.length - 1].t, tB = b[0].t;
+  if (tB - tA > HIDDEN_CONTACT_MAX_GAP_S) return null;
+  const fit = (obs: ArcObsEx[], t0: number) => {
+    const ts = obs.map((o) => o.t - t0);
+    const cu = _fitQuadratic(ts, obs.map((o) => o.u));
+    const cv = _fitQuadratic(ts, obs.map((o) => o.v));
+    return (t: number): [number, number] => {
+      const s = t - t0;
+      return [cu[0] + cu[1] * s + cu[2] * s * s, cv[0] + cv[1] * s + cv[2] * s * s];
+    };
+  };
+  const pathIn = fit(a, tA), pathOut = fit(b, tB);
+  // In 1080p pixels, so the sigmas mean the same at any resolution.
+  const px = (p: [number, number], q: [number, number]) => Math.hypot((p[0] - q[0]) * hw, (p[1] - q[1]) * hh) * (540 / hh);
+  const sigma = (dt: number) => CONTACT_SIGMA_BASE_PX + CONTACT_SIGMA_ACCEL_PX * dt * dt;
+  let best: HiddenContact | null = null;
+  let bestCost = HIDDEN_CONTACT_MAX_SIGMA;
+  for (const fr of frames) {
+    if (fr.timestamp <= tA || fr.timestamp >= tB) continue;
+    const boxes = playersByFrame.get(fr.frame) ?? [];
+    const arms = armsByFrame.get(fr.frame) ?? [];
+    const pIn = pathIn(fr.timestamp), pOut = pathOut(fr.timestamp);
+    boxes.forEach((box, i) => {
+      const wrists = (arms[i] ?? []).slice(4, 6).filter((k) => k[2] >= WRIST_MIN_CONF);
+      if (!wrists.length) return;
+      // Both wrists: their midpoint (forearms together); one: that wrist.
+      const wx = wrists.reduce((s, k) => s + k[0], 0) / wrists.length;
+      const wy = wrists.reduce((s, k) => s + k[1], 0) / wrists.length;
+      const w: [number, number] = [wx * 2 - 1, 1 - wy * 2];
+      const cost = px(pIn, w) / sigma(fr.timestamp - tA) + px(pOut, w) / sigma(tB - fr.timestamp);
+      if (cost >= bestCost) return;
+      const spot = takeOffSpot(fr.frame, box, playersByFrame, cam);
+      if (!spot) return;
+      bestCost = cost;
+      best = { t: fr.timestamp, frame: fr.frame, img: w, spot };
+    });
+  }
+  return best;
+}
+
+/** Frames sampled across a detection gap for players at a hidden touch. */
+const HIDDEN_TOUCH_SAMPLES = 5;
+/** Margin (m) around the court within which a player is in play. */
+const IN_PLAY_MARGIN_M = 1.5;
+
+/**
+ * Players behind a baseline under the ball at the start of a rally: the
+ * server. Uses every player in the frame, so the server is found even when
+ * the ball (high on the toss) is far from them in the picture. Corner line
+ * judges stand outside the sidelines and are left out.
+ */
+function serverCandidates(
+  o: ArcObsEx,
+  allPlayersByFrame: Map<number, PlayerBox[]>,
+  cam: THREE.PerspectiveCamera,
+): TouchCandidate[] {
+  const bx = (o.u + 1) / 2;
+  const out: TouchCandidate[] = [];
+  for (const [x1, , x2, y2] of allPlayersByFrame.get(o.fi) ?? []) {
+    const w = x2 - x1;
+    if (bx < x1 - 1.5 * w || bx > x2 + 1.5 * w) continue;
+    const g = _groundPointOf(cam, (x1 + x2) / 2, y2);
+    if (!g || Math.abs(g[0]) > COURT_HALF_W + 0.5) continue;
+    if (Math.abs(g[1]) < P.serverMinAbsZ || Math.abs(g[1]) > RALLY_MAX_ABS_Z_M) continue;
     out.push(g);
   }
   return out;
@@ -1395,8 +1581,59 @@ interface KnotZone extends TouchRule {
   label: string;
   /** +1 / -1: the half of the court (sign of z) the touch is on. */
   side: number;
+  /**
+   * A touch that can be one of several kinds (after an attack: a block at
+   * the net or a dig in the back court). The zone spans them all; the label
+   * is the first alternative the solved touch lies in (see zoneLabel).
+   */
+  alternatives?: (TouchRule & { label: string })[];
 }
 
+/**
+ * Shortest time between two touches (s), except for the block or dig after
+ * an attack. Labelled clips: the shortest is serve to reception, 0.56 s.
+ */
+const MIN_TOUCH_INTERVAL_S = 0.45;
+/** How far over the net (m) a blocker's hands reach into the attacker's side. */
+const BLOCK_REACH_OVER_M = 0.75;
+
+/** Does a court z fall in a rule's distance range (with slack, m)? */
+function _inZoneZ(zone: TouchRule, side: number, z: number, slack: number, extraBack = 0): boolean {
+  const into = side * z;
+  return into >= zone.minAbsZ - slack && into <= zone.maxAbsZ + slack + extraBack;
+}
+
+/**
+ * Label of a solved touch in a zone: its kind, or which alternative it lies
+ * in. By distance from the net only: the alternatives do not overlap there
+ * (a block is at the net, a dig never is), while the solved height of a
+ * touch is the least reliable coordinate.
+ */
+function zoneLabel(zone: KnotZone, [, , z]: [number, number, number]): string {
+  if (!zone.alternatives) return zone.label;
+  // Blockers reach over the net: a block can be solved just past it.
+  const hit = zone.alternatives.find((a) => _inZoneZ(a, zone.side, z, BLOCK_REACH_OVER_M));
+  return (hit ?? zone.alternatives[zone.alternatives.length - 1]).label;
+}
+
+/** One zone covering several touch kinds, for a touch that can be any of them. */
+function _eitherZone(side: number, alts: (TouchRule & { label: string })[]): KnotZone {
+  return {
+    label: alts.map((a) => a.label).join("/"), side, alternatives: alts,
+    minAbsZ: Math.min(...alts.map((a) => a.minAbsZ)), maxAbsZ: Math.max(...alts.map((a) => a.maxAbsZ)),
+    minY: Math.min(...alts.map((a) => a.minY)), maxY: Math.max(...alts.map((a) => a.maxY)),
+    minG: Math.min(...alts.map((a) => a.minG)), maxG: Math.max(...alts.map((a) => a.maxG)),
+  };
+}
+
+
+/**
+ * How far behind the contact an attacker takes off (m). Measured on the
+ * labelled clips: take-off 1.6-2.4 m from the net for contacts ~0.5-1 m out.
+ */
+const ATTACK_RUNUP_M = 1.5;
+/** Distance from the net (m) beyond which a receiver is preferred: 3 m line + 1 m. */
+const RECEPTION_BACK_Z_M = 4;
 
 /**
  * Volleyball rules for one rally: which touch is which, and where it can be.
@@ -1417,7 +1654,16 @@ interface KnotZone extends TouchRule {
  * Returns one zone per knot (null = no rule) and filters `anchors` in place
  * to the candidates that satisfy their zone.
  */
-function applyRallyRules(anchors: TouchCandidate[][]): (KnotZone | null)[] {
+function applyRallyRules(
+  anchors: TouchCandidate[][],
+  /**
+   * Knots that are not touches (the ball was above the picture there).
+   * Knots dropped as too soon after the previous touch are added to it.
+   */
+  skip: Set<number> = new Set(),
+  /** Time of each knot (s), to drop splits too soon after a touch. */
+  knotT: number[] = [],
+): (KnotZone | null)[] {
   const zones: (KnotZone | null)[] = anchors.map(() => null);
   const isServer = ([, z]: TouchCandidate) => Math.abs(z) >= P.serverMinAbsZ - 1;
   const servers0 = (anchors[0] ?? []).filter(isServer);
@@ -1445,16 +1691,40 @@ function applyRallyRules(anchors: TouchCandidate[][]): (KnotZone | null)[] {
     { label: "reception", side: -S, ...R.reception },
     { label: "set",       side: -S, ...R.set },
     { label: "attack",    side: -S, ...R.attack },
-    { label: "block",     side: S,  ...R.block },
+    // The attack is blocked at the net or dug in the back court: forcing a
+    // block threw away the digger and let the knot (and the attack before
+    // it) drift to the wrong depth.
+    _eitherZone(S, [{ label: "block", ...R.block }, { label: "dig", ...R.dig }]),
   ];
   // The last knot is where the ball leaves view, not a touch.
-  for (let k = 0; k < Math.min(plan.length, anchors.length - 1); k++) {
-    const zone = plan[k];
+  let lastT = -Infinity;
+  for (let k = 0, step = 0; step < plan.length && k < anchors.length - 1; k++) {
+    if (skip.has(k)) continue;
+    // A split too soon after the previous touch is not the next one (a
+    // reception and a "set" 0.28 s apart, say): it would shift every later
+    // touch's rule by one. Only the block or dig follows an attack that fast.
+    // The toss is no interval: its knot is wherever the clip first sees the
+    // ball, already on its way up.
+    if (step > 0 && plan[step - 1].label !== "toss" && !plan[step].alternatives &&
+        knotT[k] - lastT < MIN_TOUCH_INTERVAL_S) {
+      skip.add(k);
+      continue;
+    }
+    lastT = knotT[k] ?? lastT;
+    const zone = plan[step++];
     zones[k] = zone;
-    const kept = anchors[k].filter(([, z]) => {
-      const into = zone.side * z;
-      return into >= zone.minAbsZ - 0.5 && into <= zone.maxAbsZ + 0.5;
-    });
+    // An attacker is anchored at the take-off spot, and the approach jump
+    // carries them forward to the contact: allow that run-up behind the zone.
+    const runUp = zone.label === "attack" ? ATTACK_RUNUP_M : 0;
+    let kept = anchors[k].filter(([, z]) => zone.alternatives
+      ? zone.alternatives.some((a) => _inZoneZ(a, zone.side, z, 0.5))
+      : _inZoneZ(zone, zone.side, z, 0.5, runUp));
+    // Serve receive is played from the back court: the front-row players
+    // stand at the net to attack and block. Prefer anyone behind the 3 m line.
+    if (zone.label === "reception") {
+      const back = kept.filter(([, z]) => zone.side * z >= RECEPTION_BACK_Z_M);
+      if (back.length) kept = back;
+    }
     // No candidate fits: the toucher was not detected (an attacker hidden
     // behind the block, say). Use the zone alone rather than pull the knot
     // to someone who cannot have played the ball.
@@ -1478,6 +1748,14 @@ function solveRally(
   zones: (KnotZone | null)[] = [],
   /** Ball image position (NDC) at a time, incl. gap-filled frames, if known. */
   imageAt: (t: number) => [number, number] | null = () => null,
+  /**
+   * Knots that are not touches but the ball above the picture: no height
+   * cap there, and no image target (the gap fill is a straight line that
+   * cuts under the arc).
+   */
+  freeKnots: Set<number> = new Set(),
+  /** Per knot: a contact found at a player's arms (time and image point). */
+  contacts: (HiddenContact | null)[] = [],
 ): RallySegmentResult[] {
   const hw = videoWidth / 2, hh = videoHeight / 2;
   const project = _makeProjector(cam);
@@ -1491,23 +1769,45 @@ function solveRally(
   tau.push(lastSeg[lastSeg.length - 1].t);
   // A one-sample segment would have zero duration; give it a frame.
   for (let k = 1; k <= n; k++) if (tau[k] - tau[k - 1] < 1e-3) tau[k] = tau[k - 1] + 1 / 30;
+  // A contact seen at the arms dates the touch better than mid-gap.
+  for (let k = 1; k < n; k++) if (contacts[k]) tau[k] = contacts[k]!.t;
 
   // Parameter layout: 3 per knot, then one effective downward acceleration
   // per segment (see ACCEL_*), then the size log-scale when sizes exist.
   const GK = 3 * (n + 1);
-  const segPos = (p: number[], k: number, t: number): [number, number, number] => {
+  // Arc through both knots under gravity and air drag. Drag is linearised
+  // (deceleration k·v) so the arc stays closed-form; k comes from the
+  // segment's typical speed, as real drag grows with speed (see DRAG_PER_M).
+  // Without it a long flight (a high pass out of the picture and back) had
+  // no drag-free arc matching both ends.
+  const segState = (p: number[], k: number, s: number): { pos: [number, number, number]; vel: [number, number, number] } => {
     const T = tau[k + 1] - tau[k];
-    const s = t - tau[k];
-    const [x0, y0, z0] = [p[3 * k], p[3 * k + 1], p[3 * k + 2]];
-    const [x1, y1, z1] = [p[3 * k + 3], p[3 * k + 4], p[3 * k + 5]];
-    // Ballistic arc through both knots: linear in x/z, plus gravity sag in y.
-    const a = s / T;
-    return [x0 + (x1 - x0) * a, y0 + (y1 - y0) * a + 0.5 * p[GK + k] * s * (T - s), z0 + (z1 - z0) * a];
+    const g = p[GK + k];
+    const d = [p[3 * k + 3] - p[3 * k], p[3 * k + 4] - p[3 * k + 1], p[3 * k + 5] - p[3 * k + 2]];
+    const kd = P.dragPerM * Math.hypot(Math.hypot(d[0], d[1], d[2]) / T, 0.25 * g * T);
+    let w: number, dw: number, sag: number, dsag: number;
+    if (kd * T < 1e-4) {
+      // Drag-free limit: linear in x/z, plus gravity sag in y.
+      w = s / T; dw = 1 / T;
+      sag = 0.5 * g * s * (T - s); dsag = 0.5 * g * (T - 2 * s);
+    } else {
+      const E = (u: number) => (1 - Math.exp(-kd * u)) / kd;
+      const ET = E(T);
+      w = E(s) / ET; dw = Math.exp(-kd * s) / ET;
+      sag = (g / kd) * (T * w - s); dsag = (g / kd) * (T * dw - 1);
+    }
+    return {
+      pos: [p[3 * k] + d[0] * w, p[3 * k + 1] + d[1] * w + sag, p[3 * k + 2] + d[2] * w],
+      vel: [d[0] * dw, d[1] * dw + dsag, d[2] * dw],
+    };
   };
+  const segPos = (p: number[], k: number, t: number) => segState(p, k, t - tau[k]).pos;
 
   const allObs = segs.flatMap((seg, k) => seg.map((o) => ({ o, k })));
   const active = allObs.map(() => true);
-  const knotTargets = tau.map((t) => imageAt(t));
+  // At a contact the ball is at the wrists; elsewhere use the image track
+  // (in a gap, the analyzer's straight-line fill).
+  const knotTargets = tau.map((t, k) => contacts[k]?.img ?? imageAt(t));
   // Size-depth terms are rejected separately: a bad segmentation (ball merged
   // with a yellow shirt, say) should not also throw away a good 2D position.
   // Size fixes absolute depth; it is the only cue that does, since gravity's
@@ -1557,7 +1857,7 @@ function solveRally(
     const PRIOR = 20;
     for (let k = 0; k <= n; k++) {
       const [x, y, z] = [p[3 * k], p[3 * k + 1], p[3 * k + 2]];
-      r.push(PRIOR * Math.max(0, KNOT_MIN_Y_M - y, y - P.knotMaxY));
+      r.push(PRIOR * Math.max(0, KNOT_MIN_Y_M - y, freeKnots.has(k) ? 0 : y - P.knotMaxY));
       r.push(PRIOR * Math.max(0, Math.abs(x) - RALLY_MAX_ABS_X_M));
       r.push(PRIOR * Math.max(0, Math.abs(z) - RALLY_MAX_ABS_Z_M));
     }
@@ -1572,12 +1872,11 @@ function solveRally(
     // with segments flying at 50-160 m/s, which still projects onto the image
     // track. Nothing in volleyball moves faster than a hard jump serve.
     for (let k = 0; k < n; k++) {
-      const T = tau[k + 1] - tau[k];
-      const vx = (p[3 * k + 3] - p[3 * k]) / T;
-      const vz = (p[3 * k + 5] - p[3 * k + 2]) / T;
-      const vyMid = (p[3 * k + 4] - p[3 * k + 1]) / T;
-      // Fastest point of the arc is one of its ends: vy = vyMid ± g·T/2.
-      const vEnd = Math.hypot(vx, Math.abs(vyMid) + 0.5 * p[GK + k] * T, vz);
+      // Fastest point of the arc is one of its ends.
+      const vEnd = Math.max(
+        Math.hypot(...segState(p, k, 0).vel),
+        Math.hypot(...segState(p, k, tau[k + 1] - tau[k]).vel),
+      );
       r.push(PRIOR * Math.max(0, vEnd - P.softMaxSpeed));
     }
     // Touch impulse prior. Measured on broadcast footage, the reprojection
@@ -1587,14 +1886,9 @@ function solveRally(
     // well-determined neighbours instead of zig-zagging, while a real touch
     // (10-40 m/s of change) is still far cheaper than misfitting its samples.
     for (let k = 1; k < n; k++) {
-      const Ta = tau[k] - tau[k - 1];
-      const Tb = tau[k + 1] - tau[k];
-      for (let c = 0; c < 3; c++) {
-        let vIn = (p[3 * k + c] - p[3 * (k - 1) + c]) / Ta;
-        let vOut = (p[3 * (k + 1) + c] - p[3 * k + c]) / Tb;
-        if (c === 1) { vIn -= 0.5 * p[GK + k - 1] * Ta; vOut += 0.5 * p[GK + k] * Tb; }
-        r.push(P.touchImpulseWeight * (vOut - vIn));
-      }
+      const vIn = segState(p, k - 1, tau[k] - tau[k - 1]).vel;
+      const vOut = segState(p, k, 0).vel;
+      for (let c = 0; c < 3; c++) r.push(P.touchImpulseWeight * (vOut[c] - vIn[c]));
     }
     // Player anchors: pull each knot towards the nearest candidate toucher.
     for (let k = 0; k <= n; k++) {
@@ -1609,7 +1903,7 @@ function solveRally(
     // this the two arcs meet wherever their extrapolations cross: at a set
     // that was a 0.4 m dip below the net tape, 50 px off the ball.
     for (let k = 0; k <= n; k++) {
-      const target = knotTargets[k];
+      const target = freeKnots.has(k) ? null : knotTargets[k];
       if (!target) { r.push(0, 0); continue; }
       const [pu, pv] = project(p[3 * k], p[3 * k + 1], p[3 * k + 2]);
       r.push(P.knotImageWeight * (pu - target[0]) * hw, P.knotImageWeight * (pv - target[1]) * hh);
@@ -1733,10 +2027,7 @@ function solveRally(
   let idx = 0;
   return segs.map((seg, k) => {
     const T = tau[k + 1] - tau[k];
-    const [x0, y0, z0] = [sol[3 * k], sol[3 * k + 1], sol[3 * k + 2]];
-    const [x1, y1, z1] = [sol[3 * k + 3], sol[3 * k + 4], sol[3 * k + 5]];
-    const v0 = [(x1 - x0) / T, (y1 - y0) / T + 0.5 * sol[GK + k] * T, (z1 - z0) / T];
-    const speedMps = Math.hypot(v0[0], v0[1], v0[2]);
+    const speedMps = Math.hypot(...segState(sol, k, 0).vel);
     const errPx = seg.map((o) => errOf(sol, o, k));
     const outlier = seg.map(() => !active[idx++]);
     const inl = errPx.filter((_, i) => !outlier[i]);
@@ -1778,6 +2069,12 @@ interface ArcObsEx extends ArcObs {
    * noisy per frame for that.
    */
   sizeDepth?: number | null;
+  /**
+   * Vertical NDC position in the camera's own image (u/v are in the
+   * reference image for a moving camera). Says whether the ball is at the
+   * edge of the picture; see joinOffscreenFlights.
+   */
+  frameV?: number;
 }
 
 /** Per-observation output from the arc solver (includes outliers). */
@@ -2258,7 +2555,11 @@ function _processArcs(
 }
 
 type SolverFrame = Pick<FrameData, "frame" | "timestamp" | "ball_img_pos" | "ball_bbox" | "ball_interpolated" | "ball_conf" | "ball_diameter_px" | "players_near_ball"
-  | "ball_ref_pos" | "ball_ref_diameter_px" | "players_ref">;
+  | "players" | "players_arms" | "ball_ref_pos" | "ball_ref_diameter_px" | "players_ref" | "players_all_ref"
+  | "players_arms_ref"> & {
+  /** Ball position in the camera's own image, kept when ball_img_pos is swapped for the reference one. */
+  ball_frame_pos?: [number, number];
+};
 
 /**
  * For a camera that pans and zooms, use the measurements expressed in the
@@ -2272,8 +2573,11 @@ function toReferenceFrames(frames: SolverFrame[]): SolverFrame[] {
   return frames.map((f) => ({
     ...f,
     ball_img_pos: f.ball_ref_pos,
+    ball_frame_pos: f.ball_img_pos,
     ball_diameter_px: f.ball_ref_diameter_px,
     players_near_ball: f.players_ref,
+    players: f.players_all_ref,
+    players_arms: f.players_arms_ref,
     // The bbox is in raw image coords and is not used by this mode.
     ball_bbox: undefined,
   }));
@@ -2299,7 +2603,7 @@ export function solveBallTrajectories(
 }
 
 function _solveBallTrajectories(
-  frames: Pick<FrameData, "frame" | "timestamp" | "ball_img_pos" | "ball_bbox" | "ball_interpolated" | "ball_conf" | "ball_diameter_px" | "players_near_ball">[],
+  frames: SolverFrame[],
   calibration: CalibrationResult,
   aspect: number,
   options?: BallReconstructionOptions,
@@ -2523,6 +2827,7 @@ function _solveBallTrajectories(
           sizeDepth: f.ball_diameter_px && f.ball_diameter_px > 0
             ? fyPx * ballDiameterM / f.ball_diameter_px
             : null,
+          frameV: f.ball_frame_pos ? 1 - f.ball_frame_pos[1] * 2 : undefined,
         }))
         .filter((o) => o.conf >= minFitConf);
 
@@ -2544,13 +2849,97 @@ function _solveBallTrajectories(
       const playersByFrame = new Map<number, PlayerBox[]>();
       for (const f of frames) if (f.players_near_ball) playersByFrame.set(f.frame, f.players_near_ball);
       const hasPlayers = playersByFrame.size > 0;
+      // Every player on every frame (newer analyzer output), for touches the
+      // ball is hidden at and for finding the server.
+      const allPlayersByFrame = new Map<number, PlayerBox[]>();
+      for (const f of frames) if (f.players) allPlayersByFrame.set(f.frame, f.players);
+      const armsByFrame = new Map<number, PlayerArms[]>();
+      for (const f of frames) if (f.players_arms) armsByFrame.set(f.frame, f.players_arms);
       {
         const centre = new THREE.Vector3(0, 1.5, 0);
         const fPx = vH / 2 / Math.tan((effectiveFovY * Math.PI) / 360);
         courtMetresPerPx = cam.position.distanceTo(centre) / fPx;
       }
-      const splitArcs = splitArcsEx(obsEx, vW, vH);
-      const arcs = hasPlayers ? mergeUntouchedSplits(splitArcs, playersByFrame, cam, vW / 2, vH / 2, touchSplits) : splitArcs;
+      const rawArcs = splitArcsEx(obsEx, vW, vH);
+      const buildArcs = (skip: Set<number>, joined?: number[], log?: TouchSplitDecision[]) => {
+        const split = joinOffscreenFlights(rawArcs, skip, joined);
+        return { split, arcs: hasPlayers ? mergeUntouchedSplits(split, playersByFrame, cam, vW / 2, vH / 2, log) : split };
+      };
+      // Volleyball rules and player anchors on top of the rally solver.
+      // Knots that are the ball above the picture, not touches (see below).
+      const offscreen = new Set<number>();
+      const solveRuled = (rally: ArcObsEx[][]) => {
+        const free = new Set<number>();
+        for (let k = 1; k < rally.length; k++) if (offscreen.has(rally[k][0].fi)) free.add(k);
+        // Candidate touchers per knot: the rally's first sample (ball in the
+        // server's hands) and every touch between segments. The last knot is
+        // where the ball leaves view, not a touch.
+        const anchors: TouchCandidate[][] = [];
+        const contacts: (HiddenContact | null)[] = [];
+        if (hasPlayers) {
+          const first = rally[0];
+          anchors.push(boundaryCandidates(first[0], first[Math.min(1, first.length - 1)], playersByFrame, cam, TOSS_REACH_UP));
+          if (allPlayersByFrame.size && !anchors[0].some(([, z]) => Math.abs(z) >= P.serverMinAbsZ - 1)) {
+            anchors[0].push(...serverCandidates(first[0], allPlayersByFrame, cam));
+          }
+          for (let k = 1; k < rally.length; k++) {
+            if (free.has(k)) { anchors.push([]); continue; }
+            const prevSeg = rally[k - 1];
+            const a = prevSeg[prevSeg.length - 1], b = rally[k][0];
+            // Hidden touch found at a player's arms: that player, alone.
+            const contact = armsByFrame.size && b.fi - a.fi > 2
+              ? findHiddenContact(prevSeg, rally[k], frames, allPlayersByFrame, armsByFrame, cam, vW / 2, vH / 2)
+              : null;
+            contacts[k] = contact;
+            if (contact) { anchors.push([contact.spot]); continue; }
+            const cands = boundaryCandidates(a, b, playersByFrame, cam);
+            // The ball hidden at the touch (behind the receiver's arms, say):
+            // the players around where it was at that moment.
+            // The contact can be anywhere in the gap, so look across it.
+            if (allPlayersByFrame.size && b.fi - a.fi > 2) {
+              const n = Math.min(HIDDEN_TOUCH_SAMPLES, b.fi - a.fi - 1);
+              for (let i = 1; i <= n; i++) {
+                const t = a.t + ((b.t - a.t) * i) / (n + 1);
+                const img = imageAt(t);
+                if (!img) continue;
+                for (const c of touchCandidates(nearestFrame(t), [(img[0] + 1) / 2, (1 - img[1]) / 2], allPlayersByFrame, cam)) {
+                  if (Math.abs(c[0]) > COURT_HALF_W + IN_PLAY_MARGIN_M || Math.abs(c[1]) > COURT_HALF_L + IN_PLAY_MARGIN_M) continue;
+                  // Same player seen again a few frames on: keep one.
+                  if (!cands.some(([x, z]) => Math.hypot(x - c[0], z - c[1]) < 0.5)) cands.push(c);
+                }
+              }
+            }
+            anchors.push(cands);
+          }
+          anchors.push([]);
+        }
+        // Knot times as solveRally sets them: mid-gap, or the contact at the arms.
+        const knotT = rally.map((seg, k) => k === 0 ? seg[0].t
+          : contacts[k]?.t ?? 0.5 * (rally[k - 1][rally[k - 1].length - 1].t + seg[0].t));
+        const zones = hasPlayers ? applyRallyRules(anchors, free, knotT) : [];
+        return { anchors, zones, free, contacts, results: solveRally(rally, cam, vW, vH, anchors, zones, imageAt, free, contacts) };
+      };
+      // A flight joined across the top of the picture that the solver cannot
+      // fit (the arc is rejected) is put back as two pieces, so it is not
+      // lost from the path altogether.
+      const joined: number[] = [];
+      const firstPass = buildArcs(new Set(), joined);
+      const badJoins = new Set<number>();
+      if (joined.length) {
+        for (const rally of groupIntoRallies(firstPass.arcs)) {
+          if (rally.reduce((s, a) => s + a.length, 0) < MIN_ARC_FRAMES) continue;
+          const segJoins = rally.map((seg) => joined.filter((fi) => seg.some((o) => o.fi === fi)));
+          if (!segJoins.some((j) => j.length)) continue;
+          solveRuled(rally).results.forEach((r, k) => {
+            if (!r.accepted) segJoins[k].forEach((fi) => badJoins.add(fi));
+          });
+        }
+        console.log(`[physicsReproj] off-screen flights joined: ${joined.length}, undone (no fit): ${badJoins.size}`);
+      }
+      const { split: splitArcs, arcs } = buildArcs(badJoins, undefined, touchSplits);
+      // An undone join is still one flight: the halves stay in one rally, and
+      // the knot between them is the ball above the picture, not a touch.
+      badJoins.forEach((fi) => offscreen.add(fi));
       if (hasPlayers) {
         console.log(`[physicsReproj] touch splits: ${splitArcs.length} -> ${arcs.length} after dropping ones with no player`);
       }
@@ -2574,7 +2963,7 @@ function _solveBallTrajectories(
 
       // Segments shorter than two samples cannot carry a touch-to-touch arc on
       // their own, but they still constrain the rally they sit in.
-      const rallies = groupIntoRallies(arcs);
+      const rallies = groupIntoRallies(arcs, offscreen);
       let segId = 0;
       for (const rally of rallies) {
         const nObs = rally.reduce((s, a) => s + a.length, 0);
@@ -2599,21 +2988,7 @@ function _solveBallTrajectories(
           continue;
         }
 
-        // Candidate touchers per knot: the rally's first sample (ball in the
-        // server's hands) and every touch between segments. The last knot is
-        // where the ball leaves view, not a touch.
-        const anchors: TouchCandidate[][] = [];
-        if (hasPlayers) {
-          const first = rally[0];
-          anchors.push(boundaryCandidates(first[0], first[Math.min(1, first.length - 1)], playersByFrame, cam, TOSS_REACH_UP));
-          for (let k = 1; k < rally.length; k++) {
-            const prevSeg = rally[k - 1];
-            anchors.push(boundaryCandidates(prevSeg[prevSeg.length - 1], rally[k][0], playersByFrame, cam));
-          }
-          anchors.push([]);
-        }
-        const zones = hasPlayers ? applyRallyRules(anchors) : [];
-        const results = solveRally(rally, cam, vW, vH, anchors, zones, imageAt);
+        const { anchors, zones, free, contacts, results } = solveRuled(rally);
         // Which knots are touches. Measured on 11 labelled broadcast clips,
         // false touches came from three places, each handled here:
         //  - a rally's first point is only where the ball came into view (or
@@ -2629,7 +3004,7 @@ function _solveBallTrajectories(
           // Not the rally's first point, not a touch the rules identified (a
           // reception solved too low is a solver error, not the end of play),
           // and not below the floor (also a solver error).
-          if (k === 0 || zones[k]) return;
+          if (k === 0 || zones[k] || free.has(k)) return;
           const y = seg.posAt(seg.tStart)[1];
           if (y > -0.2 && y <= FLOOR_CONTACT_Y_M && k < deadAfter) deadAfter = k;
         });
@@ -2645,10 +3020,23 @@ function _solveBallTrajectories(
           if (minY > -0.5 && minY <= FLOOR_ARC_Y_M) deadAfter = k + 1;
         });
         results.forEach((seg, k) => {
-          if (!seg.accepted && !(k > 0 && results[k - 1].accepted)) return;
+          if (free.has(k)) return;
+          // A touch the rules placed at a player stands even when the flights
+          // on both sides of it fit badly (a reception between a blurred serve
+          // and a pass that left the picture).
+          const ruled = !!zones[k] && (anchors[k]?.length ?? 0) > 0;
+          if (!seg.accepted && !(k > 0 && results[k - 1].accepted) && !ruled) return;
           if (k === 0 && !zones[0]) return;
           if (k >= deadAfter) return;
-          touches.push({ frame: nearestFrame(seg.tStart), position: seg.posAt(seg.tStart), label: zones[k]?.label ?? "touch" });
+          // Short gap (an arm hides the ball at contact): the knot is the
+          // contact. Long gap (a high toss leaves the frame and only comes
+          // back at the serve): the ball reappears right after the contact,
+          // while the knot, midway through the gap, would be far too early.
+          const prevObs = k > 0 ? results[k - 1].obs : null;
+          const gap = prevObs ? seg.obs[0].t - prevObs[prevObs.length - 1].t : 0;
+          const frame = contacts[k]?.frame ?? (gap <= TOUCH_FRAME_MAX_GAP_S ? nearestFrame(seg.tStart) : seg.obs[0].fi);
+          const position = seg.posAt(seg.tStart);
+          touches.push({ frame, position, label: zones[k] ? zoneLabel(zones[k]!, position) : "touch" });
         });
         console.log(
           "[rally] " + results.map((seg, k) => {

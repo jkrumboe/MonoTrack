@@ -44,6 +44,16 @@ export interface FrameData {
    */
   players_near_ball?: number[][];
   /**
+   * Every person in the frame, same format. Taken on every frame, so the
+   * players are known when the ball is hidden at a touch.
+   */
+  players?: number[][];
+  /**
+   * Arm keypoints per entry of `players` (pose model): [x, y, conf] for the
+   * left/right shoulder, elbow and wrist, normalised.
+   */
+  players_arms?: number[][][];
+  /**
    * Camera motion (pan/zoom from a fixed spot): 3x3 homography, row-major,
    * mapping this frame's pixels to the reference frame's pixels. Absent for a
    * static camera. The fields below are the same measurements expressed in the
@@ -54,6 +64,8 @@ export interface FrameData {
   ball_ref_pos?: [number, number];
   ball_ref_diameter_px?: number;
   players_ref?: number[][];
+  players_all_ref?: number[][];
+  players_arms_ref?: number[][][];
   /**
    * Relative depth at ball centre from Depth Anything V2 [0,1] (0=near, 1=far).
    * Present only for YOLO-detected (non-interpolated) frames when the depth model is available.
@@ -110,22 +122,35 @@ export function useAnalysis() {
   const [courtData, setCourtData] = useState<CourtDataEntry[]>([]);
   const framesRef = useRef<FrameData[]>([]);
   const courtDataRef = useRef<CourtDataEntry[]>([]);
+  // Wall-clock timing of the current/last run
+  const startTimeRef = useRef<number | null>(null);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [analysisDurationMs, setAnalysisDurationMs] = useState<number | null>(null);
+
+  // Tick the elapsed clock while running
+  useEffect(() => {
+    if (status !== "running") return;
+    const id = window.setInterval(() => {
+      if (startTimeRef.current !== null) setElapsedMs(performance.now() - startTimeRef.current);
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [status]);
 
   useEffect(() => {
     const unlisteners: Promise<UnlistenFn>[] = [];
 
     unlisteners.push(
       listen<FrameData>("analysis-frame", (event) => {
-        framesRef.current = [...framesRef.current, event.payload];
+        framesRef.current.push(event.payload);
         // Collect court corners from frame data if present
         const payload = event.payload;
         if (payload.court_corners) {
-          courtDataRef.current = [...courtDataRef.current, {
+          courtDataRef.current.push({
             frame: payload.frame,
             timestamp: payload.timestamp,
             corners: payload.court_corners,
             keypoints: payload.court_keypoints,
-          }];
+          });
         }
         // Batch UI updates — update every 50 frames to avoid rendering overhead
         if (framesRef.current.length % 50 === 0) {
@@ -150,6 +175,15 @@ export function useAnalysis() {
         setResult(event.payload);
         setStatus("complete");
         setProgress(100);
+        if (startTimeRef.current !== null) {
+          const ms = performance.now() - startTimeRef.current;
+          setElapsedMs(ms);
+          setAnalysisDurationMs(ms);
+          console.log(
+            `[analysis] ${event.payload.total_frames} frames in ${(ms / 1000).toFixed(1)}s` +
+            ` (${(event.payload.total_frames / (ms / 1000)).toFixed(1)} fps)`
+          );
+        }
       })
     );
 
@@ -175,6 +209,9 @@ export function useAnalysis() {
     setCourtData([]);
     framesRef.current = [];
     courtDataRef.current = [];
+    startTimeRef.current = performance.now();
+    setElapsedMs(0);
+    setAnalysisDurationMs(null);
 
     try {
       await invoke("start_analysis", { videoPath });
@@ -201,6 +238,8 @@ export function useAnalysis() {
     result,
     courtData,
     error,
+    elapsedMs,
+    analysisDurationMs,
     startAnalysis,
     stopAnalysis,
   };

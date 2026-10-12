@@ -531,10 +531,15 @@ export function solveCameraIterative(
   // The court is planar, so a homography is the well-conditioned route; the
   // 3x4 DLT below is only a fallback for the (unused) non-coplanar case.
   let dltSeed: number[] | null = null;
-  const coplanar = modelPoints.every((p) => Math.abs(p.y) < 1e-6);
+  // Floor points seed the camera through the homography; points above the
+  // floor (antennas on the net) then join the refinement below, where they
+  // fix the focal length and height scale that floor points alone leave
+  // weak, worst of all from the side.
+  const floor = modelPoints.map((_, i) => i).filter((i) => Math.abs(modelPoints[i].y) < 1e-6);
+  const coplanar = floor.length >= 4;
 
   if (coplanar) {
-    const H = homographyFromPlanar(modelPoints.map((p) => [p.x, p.z]), pts2d);
+    const H = homographyFromPlanar(floor.map((i) => [modelPoints[i].x, modelPoints[i].z]), floor.map((i) => pts2d[i]));
     const hCal = H ? calibrationFromHomography(H, imgW, imgH) : null;
     if (hCal) {
       const { fov, position, lookAt } = hCal;

@@ -140,6 +140,33 @@ def _get_yolo_model():
         return None
 
 
+_pose_model = None
+_pose_tried = False
+
+
+def _get_pose_model():
+    """Lazy-load YOLOv8-pose (people plus their keypoints). None if unavailable.
+
+    Used for the players instead of the plain detector: the same boxes, plus
+    the arms, which show where a hidden touch happened (a reception is played
+    off the forearms, a set off the hands).
+    """
+    global _pose_model, _pose_tried
+    if _pose_model is not None or _pose_tried:
+        return _pose_model
+    _pose_tried = True
+    try:
+        from ultralytics import YOLO
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Downloaded into the project root by ultralytics when missing.
+        path = os.path.abspath(os.path.join(script_dir, os.pardir, "yolov8m-pose.pt"))
+        _pose_model = YOLO(path)
+        print(f"[pose] Loaded {path}", file=sys.stderr)
+    except Exception as e:
+        print(f"[pose] Unavailable ({e}) - players without keypoints", file=sys.stderr)
+    return _pose_model
+
+
 # COCO class index for "sports ball" (includes volleyball)
 _SPORTS_BALL_CLASS = 32
 
@@ -301,26 +328,58 @@ _PERSON_CLASS = 0
 _PLAYER_NEAR_BALL = 0.16
 
 
-def _detect_players_near_ball(frame, model, cx_norm, cy_norm):
-    """Person boxes near the ball, as [x1, y1, x2, y2, conf] normalised.
+# Half precision only where it helps: a CUDA GPU.
+try:
+    import torch as _torch
+    _HALF_OK = _torch.cuda.is_available()
+except Exception:
+    _HALF_OK = False
+
+# COCO keypoints kept per player: shoulders, elbows, wrists (left, right).
+_ARM_KEYPOINTS = (5, 6, 7, 8, 9, 10)
+
+
+def _detect_players(frame, model):
+    """Every person in the frame, as [x1, y1, x2, y2, conf] normalised, and
+    for a pose model their arm keypoints ([x, y, conf] per _ARM_KEYPOINTS,
+    normalised; None for a plain detector).
 
     The 3D solver anchors each touch to the player who made it: their feet
     are on the calibrated floor, which fixes depth where the ball alone
-    cannot (see solveRally in ballReconstruction.ts).
+    cannot (see solveRally in ballReconstruction.ts). Taken on every frame,
+    not only where the ball is seen: the ball is often hidden at the touch
+    itself (a reception behind the receiver's arms), and the solver then
+    needs the players at that moment.
     """
     h, w = frame.shape[:2]
+    # Half precision on a GPU: ~2x faster, the same people found. Full
+    # resolution stays: at 960 far-side players were lost.
     results = model.predict(frame, classes=[_PERSON_CLASS], conf=0.25,
-                            verbose=False, imgsz=_BALL_IMGSZ)
-    out = []
-    for box in results[0].boxes:
+                            verbose=False, imgsz=_BALL_IMGSZ,
+                            quantize=16 if _HALF_OK else None)
+    r = results[0]
+    kps = r.keypoints.data.tolist() if getattr(r, "keypoints", None) is not None else None
+    out, arms = [], []
+    for i, box in enumerate(r.boxes):
         x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
-        x1n, y1n, x2n, y2n = x1 / w, y1 / h, x2 / w, y2 / h
+        out.append([round(x1 / w, 5), round(y1 / h, 5), round(x2 / w, 5), round(y2 / h, 5),
+                    round(float(box.conf[0]), 3)])
+        if kps is not None:
+            arms.append([[round(kps[i][j][0] / w, 5), round(kps[i][j][1] / h, 5), round(kps[i][j][2], 2)]
+                         for j in _ARM_KEYPOINTS])
+    return out, (arms if kps is not None else None)
+
+
+def _players_near_ball(boxes, aspect, cx_norm, cy_norm):
+    """The boxes near the ball (aspect = width / height of the frame)."""
+    out = []
+    for b in boxes or []:
+        x1n, y1n, x2n, y2n = b[:4]
         # Distance from the ball to the box (0 when inside), in width units.
         dx = max(x1n - cx_norm, 0.0, cx_norm - x2n)
-        dy = max(y1n - cy_norm, 0.0, cy_norm - y2n) * h / w
+        dy = max(y1n - cy_norm, 0.0, cy_norm - y2n) / aspect
         if math.hypot(dx, dy) <= _PLAYER_NEAR_BALL:
-            out.append([round(x1n, 5), round(y1n, 5), round(x2n, 5), round(y2n, 5),
-                        round(float(box.conf[0]), 3)])
+            out.append(b)
     return out
 
 
@@ -1372,7 +1431,7 @@ def detect_court_corners_debug(frame):
         steps.append({"label": "4. Hough Lines", "info": "0 segments", "image": _img_to_base64(frame)})
         return None, steps, log
 
-    segments = [l[0].tolist() for l in lines]
+    segments = np.asarray(lines).reshape(-1, 4).tolist()  # (N,1,4) or (N,4) by OpenCV version
     log.append(f"Hough segments: {len(segments)}")
 
     hough_vis = _draw_lines_on(frame, segments, color=(0, 255, 0), thickness=1)
@@ -1568,7 +1627,7 @@ def _detect_court_hough_fast(frame):
             maxLineGap=int(min(img_w, img_h) * 0.03),
         )
         if lines is not None and len(lines) >= 4:
-            segments = [l[0].tolist() for l in lines]
+            segments = np.asarray(lines).reshape(-1, 4).tolist()  # (N,1,4) or (N,4) by OpenCV version
             merged = _merge_segments(
                 segments, angle_thresh=8,
                 dist_thresh=max(img_w, img_h) * 0.02,
@@ -1992,8 +2051,10 @@ def analyze_video_cv(video_path: str):
     person_model = None
     if tracknet is not None:
         from ball_tracknet import measure_ball_diameter
-        person_model = _get_yolo_model()
+        person_model = _get_pose_model() or _get_yolo_model()
     ball_players = {}  # frame_idx -> person boxes near the ball
+    all_players = {}   # frame_idx -> every person box
+    all_arms = {}      # frame_idx -> arm keypoints per box (pose model only)
     ball_raw = {}   # frame_idx -> [cx_norm, cy_norm, conf, x1_norm, y1_norm, x2_norm, y2_norm]
     ball_tracker = _BallTracker()
     ball_diam = {}  # frame_idx -> apparent ball diameter (px), TrackNet only
@@ -2011,6 +2072,7 @@ def analyze_video_cv(video_path: str):
     # ── Pass 1: court + ball detection ────────────────────────────────────────────
     all_frame_data = []   # per-frame lightweight dicts (no raw pixels kept)
     court_data = []
+    first_frame = None
     court_detected_once = False  # stop re-running court detection after first success
     # Court-detection search: sample every Nth frame up to this frame, score each
     # candidate, and keep the best one instead of the first.
@@ -2031,6 +2093,8 @@ def analyze_video_cv(video_path: str):
 
         timestamp = round(frame_idx / fps, 4)
         fh, fw = frame.shape[:2]
+        if frame_idx == 0:
+            first_frame = frame.copy()   # matched against courts saved earlier
 
         frame_court_corners = None
         frame_court_keypoints = None
@@ -2065,6 +2129,15 @@ def analyze_video_cv(video_path: str):
             except Exception as e:
                 print(f"[court] Frame {frame_idx} error: {e}", file=sys.stderr)
 
+        if person_model is not None:
+            try:
+                boxes, arms = _detect_players(frame, person_model)
+                all_players[frame_idx] = boxes
+                if arms is not None:
+                    all_arms[frame_idx] = arms
+            except Exception as e:
+                print(f"[players] Frame {frame_idx} error: {e}", file=sys.stderr)
+
         # ── Ball detection ───────────────────────────────────────────────
         if tracknet is not None:
             tn_buf.append(frame)
@@ -2080,8 +2153,8 @@ def analyze_video_cv(video_path: str):
                             d_px = measure_ball_diameter(frm, det[0], det[1])
                             if d_px is not None:
                                 ball_diam[fi_w] = d_px
-                            if person_model is not None:
-                                ball_players[fi_w] = _detect_players_near_ball(frm, person_model, det[0], det[1])
+                            if fi_w in all_players:
+                                ball_players[fi_w] = _players_near_ball(all_players[fi_w], frm.shape[1] / frm.shape[0], det[0], det[1])
                             if fi_w < 3 or fi_w % 50 == 0:
                                 print(f"[tracknet] Frame {fi_w}: ball at {det[0]:.3f}, {det[1]:.3f} conf={det[2]:.3f}", file=sys.stderr)
                 except Exception as e:
@@ -2134,14 +2207,32 @@ def analyze_video_cv(video_path: str):
                     d_px = measure_ball_diameter(frm, det[0], det[1])
                     if d_px is not None:
                         ball_diam[fi_w] = d_px
-                    if person_model is not None:
-                        ball_players[fi_w] = _detect_players_near_ball(frm, person_model, det[0], det[1])
+                    if fi_w in all_players:
+                        ball_players[fi_w] = _players_near_ball(all_players[fi_w], frm.shape[1] / frm.shape[0], det[0], det[1])
         except Exception as e:
             print(f"[tracknet] Tail window error: {e}", file=sys.stderr)
         tn_buf, tn_idx = [], []
 
     # ── Pick the best-scoring court detection across the sampled frames ────
-    if court_candidates:
+    # A court placed by hand on an earlier clip of the same match (same
+    # camera spot, so the venue matches) beats automatic detection, which
+    # cannot handle side views at all.
+    saved_corners = None
+    if first_frame is not None:
+        try:
+            from court_store import find_court
+            saved_corners, sinfo = find_court(first_frame)
+            print(f"[court] Saved court: {sinfo}", file=sys.stderr)
+        except Exception as e:
+            print(f"[court] Saved-court lookup failed: {e}", file=sys.stderr)
+    if saved_corners is not None:
+        kps_reproj = _reproject_keypoints_from_corners(saved_corners, fh, fw)
+        court_data.append({"frame": 0, "timestamp": 0.0, "corners": saved_corners,
+                           "keypoints": kps_reproj, "source": "saved"})
+        _last_court_keypoints = kps_reproj
+        all_frame_data[0]['corners'] = saved_corners
+        all_frame_data[0]['keypoints'] = kps_reproj
+    elif court_candidates:
         # Consensus: a genuine court gives a similar camera on every frame it
         # is found, while spurious quads scatter. Pick the candidate agreeing
         # with the most others, so one lucky bad frame cannot win.
@@ -2246,7 +2337,10 @@ def analyze_video_cv(video_path: str):
 
     # ── Pass 2: Depth Anything V2 on YOLO-detected (non-interpolated) frames ──
     ball_depth = {}   # frame_idx -> relative_depth [0,1]
-    if HAS_TRANSFORMERS and HAS_TORCH and n_ball_detected > 0:
+    # Off by default: the 3D solver does not use this relative depth (see
+    # ballReconstruction.ts), and it was the slowest step of the analysis
+    # (~6 s a frame). ANALYZER_DEPTH=1 turns it back on.
+    if HAS_TRANSFORMERS and HAS_TORCH and n_ball_detected > 0 and os.environ.get("ANALYZER_DEPTH") == "1":
         send_progress(50, "Estimating depth (Depth Anything V2)...")
         try:
             depth_pipe = _get_depth_model()
@@ -2291,6 +2385,11 @@ def analyze_video_cv(video_path: str):
         if fd['keypoints'] is not None:
             frame_msg["court_keypoints"] = fd['keypoints']
 
+        if fi in all_players:
+            frame_msg["players"] = all_players[fi]
+        if fi in all_arms:
+            frame_msg["players_arms"] = all_arms[fi]
+
         # Ball position (detected or interpolated)
         bd = ball_path.get(fi)
         if bd is not None:
@@ -2318,6 +2417,11 @@ def analyze_video_cv(video_path: str):
                         frame_msg["ball_diameter_px"] * local_scale(Hn, bd['pos']), 2)
                 if "players_near_ball" in frame_msg:
                     frame_msg["players_ref"] = [map_box(Hn, b) for b in frame_msg["players_near_ball"]]
+            if "players" in frame_msg:
+                frame_msg["players_all_ref"] = [map_box(Hn, b) for b in frame_msg["players"]]
+            if "players_arms" in frame_msg:
+                frame_msg["players_arms_ref"] = [[apply_h(Hn, k[:2]) + [k[2]] for k in arms]
+                                                 for arms in frame_msg["players_arms"]]
 
         send(frame_msg)
 
@@ -2419,4 +2523,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--save-court":
+        # One-shot from the app: store a hand-placed court for later clips of
+        # the same match (see court_store.py). Argument: JSON with
+        # video_path, frame and corners.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from court_store import save_court
+        req = json.loads(sys.argv[2])
+        print(json.dumps({"saved": save_court(req["video_path"], int(req.get("frame", 0)), req["corners"])}))
+    else:
+        main()

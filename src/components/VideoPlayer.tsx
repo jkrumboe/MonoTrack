@@ -10,6 +10,8 @@ interface VideoPlayerProps {
   onMetadataLoaded?: (duration: number) => void;
   onVideoElement?: (el: HTMLVideoElement | null) => void;
   onCanPlay?: () => void;
+  /** Called when playback stops on its own (clip ended or play() failed). */
+  onPlaybackStopped?: () => void;
 }
 
 export default function VideoPlayer({
@@ -21,6 +23,7 @@ export default function VideoPlayer({
   onMetadataLoaded,
   onVideoElement,
   onCanPlay,
+  onPlaybackStopped,
 }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const isDemo = videoPath === "demo.mp4";
@@ -63,39 +66,90 @@ export default function VideoPlayer({
     }
   }, [onMetadataLoaded]);
 
-  // When playing: let video play natively, report currentTime via rAF
+  // Frame shown at a given media time, and the time to seek to for a frame.
+  // Seeking to the middle of a frame avoids landing on the boundary, which
+  // browsers often render as the previous frame.
+  const frameAt = useCallback((t: number) => Math.floor(t * fps + 1e-6), [fps]);
+  const timeOf = useCallback((f: number) => (f <= 0 ? 0 : (f + 0.5) / fps), [fps]);
+
+  // While playing, the video drives timing; report currentTime every animation frame
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || isDemo || !isPlaying) return;
+
+    const tick = () => {
+      if (!video.paused && onTimeUpdate) onTimeUpdate(video.currentTime);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [isPlaying, isDemo, onTimeUpdate, blobUrl]);
+
+  // Scrubbing fires seeks much faster than the decoder can serve them. Setting
+  // currentTime mid-seek aborts the previous one, so while dragging the picture
+  // would freeze until you let go. Instead keep at most one seek in flight and
+  // remember only the latest target; it is applied when the current one lands.
+  const pendingSeekRef = useRef<number | null>(null);
+  const seekTo = useCallback((t: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.seeking) {
+      pendingSeekRef.current = t;
+      return;
+    }
+    pendingSeekRef.current = null;
+    video.currentTime = t;
+  }, []);
+
+  const handleSeeked = useCallback(() => {
+    const video = videoRef.current;
+    const next = pendingSeekRef.current;
+    if (!video || next === null) return;
+    pendingSeekRef.current = null;
+    if (Math.abs(video.currentTime - next) > 1e-4) video.currentTime = next;
+  }, []);
+
+  // Start/stop the video and keep it on currentFrame while paused
+  const wasPlayingRef = useRef(false);
   useEffect(() => {
     const video = videoRef.current;
     if (!video || isDemo) return;
 
-    const tick = () => {
-      if (!video.paused && onTimeUpdate) {
-        onTimeUpdate(video.currentTime);
-      }
-      rafRef.current = requestAnimationFrame(tick);
-    };
+    const wasPlaying = wasPlayingRef.current;
+    wasPlayingRef.current = isPlaying;
+    const videoFrame = frameAt(pendingSeekRef.current ?? video.currentTime);
 
     if (isPlaying) {
-      video.play().catch(() => {});
-      rafRef.current = requestAnimationFrame(tick);
-    } else {
-      video.pause();
-      cancelAnimationFrame(rafRef.current);
+      if (wasPlaying) return; // already running — video owns the clock
+      if (videoFrame !== currentFrame || video.ended) {
+        pendingSeekRef.current = null;
+        video.currentTime = timeOf(currentFrame);
+      }
+      video.play().catch((err: DOMException) => {
+        // AbortError just means a pause() interrupted the play() — expected
+        if (err.name !== "AbortError") onPlaybackStopped?.();
+      });
+      return;
     }
 
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [isPlaying, isDemo, onTimeUpdate]);
+    if (!video.paused) video.pause();
 
-  // When paused: seek to frame position (for slider scrubbing)
-  useEffect(() => {
+    if (wasPlaying && Math.abs(videoFrame - currentFrame) <= 1) {
+      // Just stopped: currentFrame may trail the video by a tick. Keep the
+      // video where it is and pull the frame index up to it instead of
+      // seeking backwards (which looks like a stutter on pause).
+      onTimeUpdate?.(video.currentTime);
+      return;
+    }
+
+    if (videoFrame !== currentFrame) seekTo(timeOf(currentFrame));
+  }, [isPlaying, currentFrame, isDemo, frameAt, timeOf, seekTo, onTimeUpdate, onPlaybackStopped, blobUrl]);
+
+  const handleEnded = useCallback(() => {
     const video = videoRef.current;
-    if (!video || isDemo || isPlaying) return;
-
-    const targetTime = currentFrame / fps;
-    if (Math.abs(video.currentTime - targetTime) > 0.02) {
-      video.currentTime = targetTime;
-    }
-  }, [currentFrame, fps, isDemo, isPlaying]);
+    if (video) onTimeUpdate?.(video.currentTime);
+    onPlaybackStopped?.();
+  }, [onTimeUpdate, onPlaybackStopped]);
 
   if (isDemo) {
     return (
@@ -128,6 +182,8 @@ export default function VideoPlayer({
         preload="auto"
         onLoadedMetadata={handleLoadedMetadata}
         onCanPlay={onCanPlay}
+        onEnded={handleEnded}
+        onSeeked={handleSeeked}
       />
     </div>
   );
