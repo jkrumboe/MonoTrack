@@ -958,6 +958,12 @@ export interface TouchRule {
    */
   minG: number;
   maxG: number;
+  /**
+   * A player this far from the net (m) may still make the touch when nobody
+   * is in the usual zone; the zone is then stretched to them. Without a
+   * player the usual zone holds, so an unanchored touch does not drift.
+   */
+  reachAbsZ?: number;
 }
 
 /**
@@ -1093,7 +1099,10 @@ export const DEFAULT_RALLY_PARAMS: RallyParams = {
     serve:     { minAbsZ: COURT_HALF_L - 2, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 2.4, maxY: 3.8, minG: 0.8, maxG: 2.2 },
     // Received in the back court: even a short serve lands 3-4 m from the net.
     reception: { minAbsZ: 2, maxAbsZ: RALLY_MAX_ABS_Z_M, minY: 0.2, maxY: 3.0, minG: 0.9, maxG: 1.15 },
-    set:       { minAbsZ: 0, maxAbsZ: 4,   minY: 2.2, maxY: 3.4, minG: 0.9, maxG: 1.15 },
+    // Usually at the net, but a setter chasing a poor pass sets from the
+    // back court (pol_ita_r3: 5.6 m out): a player up to reachAbsZ counts
+    // when nobody is in the usual zone, and the zone stretches to them.
+    set:       { minAbsZ: 0, maxAbsZ: 4,   minY: 2.2, maxY: 3.4, minG: 0.9, maxG: 1.15, reachAbsZ: 7 },
     // Front-row attacks are hit ~0.5-1 m from the net. The attacker is often
     // hidden behind the block (no player anchor), and from behind the baseline
     // the set's end depth is nearly unobservable: on broadcast footage, ending
@@ -1737,7 +1746,15 @@ function applyRallyRules(
     const runUp = zone.label === "attack" ? ATTACK_RUNUP_M : 0;
     let kept = anchors[k].filter(([, z]) => zone.alternatives
       ? zone.alternatives.some((a) => _inZoneZ(a, zone.side, z, 0.5))
-      : _inZoneZ(zone, zone.side, z, 0.5, runUp));
+      : _inZoneZ(zone.reachAbsZ ? { ...zone, maxAbsZ: zone.reachAbsZ } : zone, zone.side, z, 0.5, runUp));
+    if (zone.reachAbsZ) {
+      // Someone in the usual zone is the likelier toucher.
+      const usual = kept.filter(([, z]) => _inZoneZ(zone, zone.side, z, 0.5));
+      if (usual.length) kept = usual;
+      // Only someone beyond it: stretch the zone to them.
+      const far = kept.length ? Math.max(...kept.map(([, z]) => zone.side * z)) : 0;
+      if (far > zone.maxAbsZ) zones[k] = { ...zone, maxAbsZ: far + 0.5 };
+    }
     // Serve receive is played from the back court: the front-row players
     // stand at the net to attack and block. Prefer anyone behind the 3 m line.
     if (zone.label === "reception") {

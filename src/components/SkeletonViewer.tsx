@@ -116,6 +116,7 @@ const TOUCH_COLORS: Record<string, number> = {
   set: 0xffee58,
   attack: 0xef5350,
   block: 0xab47bc,
+  dig: 0x26c6da,
   touch: 0xeeeeee,
 };
 
