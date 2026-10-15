@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
-import { estimateBallWorldPosition } from "../utils/ballReconstruction";
+import { estimateBallWorldPosition, playersOnCourt } from "../utils/ballReconstruction";
 import type { BallTouch, TrajectoryMode } from "../utils/ballReconstruction";
 import type { CalibrationResult } from "../utils/cameraSolver";
 
@@ -107,6 +107,10 @@ interface SkeletonViewerProps {
   touches?: BallTouch[];
 }
 
+/** Player figure tints by half of the court. */
+const PLAYER_COLOR_NEG_Z = 0x7fa7d9;
+const PLAYER_COLOR_POS_Z = 0xe39a9a;
+
 // Marker colour per touch type, so the rally reads serve -> reception -> set
 // -> attack at a glance.
 const TOUCH_COLORS: Record<string, number> = {
@@ -185,6 +189,7 @@ export default function SkeletonViewer({
     groundTrail: THREE.LineSegments;
     dropLines: THREE.LineSegments;
     touchMarkers: THREE.Group;
+    playerFigures: THREE.Group;
   } | null>(null);
   const lastRenderSizeRef = useRef({ w: 0, h: 0, aspect: 0 });
   // Overlay on a panning/zooming camera: the calibration belongs to the
@@ -303,10 +308,12 @@ export default function SkeletonViewer({
 
     const touchMarkers = new THREE.Group();
     scene.add(touchMarkers);
+    const playerFigures = new THREE.Group();
+    scene.add(playerFigures);
 
     sceneRef.current = {
       scene, camera, renderer, controls, courtGroup,
-      ballMesh, ballShadow, ballStem, ballTrail, groundTrail, dropLines, touchMarkers,
+      ballMesh, ballShadow, ballStem, ballTrail, groundTrail, dropLines, touchMarkers, playerFigures,
     };
 
     // Animation loop
@@ -604,6 +611,42 @@ export default function SkeletonViewer({
       line.geometry = new THREE.BufferGeometry().setFromPoints(pts);
     }
   }, [ballTrajectory, currentFrame]);
+
+  // Players of the current frame as simple figures (body + head) standing on
+  // their feet position, tinted by side of the net, so each touch can be
+  // judged against the player who made it.
+  useEffect(() => {
+    if (!sceneRef.current) return;
+    const { playerFigures } = sceneRef.current;
+    for (const child of [...playerFigures.children]) {
+      playerFigures.remove(child);
+      if (child instanceof THREE.Mesh) {
+        child.geometry.dispose();
+        (child.material as THREE.Material).dispose();
+      }
+    }
+    const f = frames?.[currentFrame];
+    const aspect = (videoAspect && videoAspect > 0) ? videoAspect
+      : (overlayVideoAspect && overlayVideoAspect > 0) ? overlayVideoAspect : 16 / 9;
+    if (!calibration || !f || overlay) return;
+    for (const pl of playersOnCourt(f, calibration, aspect)) {
+      const color = pl.z < 0 ? PLAYER_COLOR_NEG_Z : PLAYER_COLOR_POS_Z;
+      const head = 0.12;
+      const bodyH = Math.max(0.3, pl.height - 2 * head);
+      const body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.16, 0.13, bodyH, 12),
+        new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.75, roughness: 0.8 }),
+      );
+      body.position.set(pl.x, bodyH / 2, pl.z);
+      playerFigures.add(body);
+      const headMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(head, 12, 12),
+        new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.85, roughness: 0.8 }),
+      );
+      headMesh.position.set(pl.x, bodyH + head, pl.z);
+      playerFigures.add(headMesh);
+    }
+  }, [frames, currentFrame, calibration, videoAspect, overlayVideoAspect, overlay]);
 
   // Touch markers: a small sphere where the ball was played, and a ring on the
   // floor below it at the player's spot.

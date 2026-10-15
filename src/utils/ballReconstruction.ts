@@ -275,6 +275,49 @@ function rayFromImagePos(
   return { origin, dir };
 }
 
+/** A player on the court for display: feet position and height (m). */
+export interface CourtPlayer {
+  x: number;
+  z: number;
+  height: number;
+}
+
+/**
+ * Players of one frame on the court: feet from the bottom of each person box
+ * through the floor, height from where the ray to the top of the box passes
+ * over the feet. Uses the reference-frame boxes for a moving camera (the
+ * calibration's image). People well off the court (bench, crowd, officials
+ * at the scorer's table) are left out.
+ */
+export function playersOnCourt(
+  frame: Pick<FrameData, "players" | "players_all_ref">,
+  calibration: CalibrationResult,
+  aspect: number,
+): CourtPlayer[] {
+  const boxes = frame.players_all_ref ?? frame.players;
+  if (!boxes?.length || aspect <= 0) return [];
+  const cam = createCamera(calibration, aspect);
+  const out: CourtPlayer[] = [];
+  for (const [x1, y1, x2, y2] of boxes) {
+    const cx = (x1 + x2) / 2;
+    const feet = rayFromImagePos(cam, [cx, y2]);
+    if (feet.dir.y > -1e-6) continue;
+    const t = -feet.origin.y / feet.dir.y;
+    const x = feet.origin.x + feet.dir.x * t, z = feet.origin.z + feet.dir.z * t;
+    if (Math.abs(x) > COURT_HALF_W + 3 || Math.abs(z) > COURT_HALF_L + 6) continue;
+    // Point of the head ray nearest the vertical line over the feet.
+    const head = rayFromImagePos(cam, [cx, y1]);
+    const hd = new THREE.Vector2(head.dir.x, head.dir.z);
+    const along = hd.lengthSq() > 1e-9
+      ? ((x - head.origin.x) * head.dir.x + (z - head.origin.z) * head.dir.z) / hd.lengthSq()
+      : 0;
+    const height = head.origin.y + head.dir.y * along;
+    if (!(height > 0.5 && height < 3.2)) continue;
+    out.push({ x, z, height });
+  }
+  return out;
+}
+
 function normCourtToWorld(nx: number, ny: number): [number, number] {
   const x = (nx - 0.5) * COURT_WIDTH;
   const z = (ny - 0.5) * COURT_LENGTH;
