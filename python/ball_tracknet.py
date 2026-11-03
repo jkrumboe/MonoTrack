@@ -155,9 +155,22 @@ if HAS_TORCH:
             return self.outc(x)
 
 
-def default_weights_path():
+def published_weights_path():
+    """WASB-SBDT's volleyball weights (downloaded by ensure_weights)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(script_dir, "models", "tracknetv2_volleyball_best.pth.tar")
+
+
+def finetuned_weights_path():
+    """Weights retrained on your own footage by train_ball.py, if any."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, "models", "tracknetv2_volleyball_finetuned.pth.tar")
+
+
+def default_weights_path():
+    """The retrained weights when train_ball.py has saved some, else the published ones."""
+    tuned = finetuned_weights_path()
+    return tuned if os.path.isfile(tuned) else published_weights_path()
 
 
 # Google Drive id from WASB-SBDT src/setup_scripts/setup_weights.sh

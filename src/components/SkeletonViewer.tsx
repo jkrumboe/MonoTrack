@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
 import { estimateBallWorldPosition, playersOnCourt } from "../utils/ballReconstruction";
+import type { ArmJoints, CourtPlayer } from "../utils/ballReconstruction";
 import type { BallTouch, TrajectoryMode } from "../utils/ballReconstruction";
 import type { CalibrationResult } from "../utils/cameraSolver";
 
@@ -110,6 +111,141 @@ interface SkeletonViewerProps {
 /** Player figure tints by half of the court. */
 const PLAYER_COLOR_NEG_Z = 0x7fa7d9;
 const PLAYER_COLOR_POS_Z = 0xe39a9a;
+
+// Player figure proportions, as fractions of standing height. The figure is
+// built in a local frame (feet at the origin, facing +z, player's left +x)
+// and scaled to the player's height.
+const BODY = {
+  ankleY: 0.045, hipY: 0.53, hipHalfW: 0.055, stanceHalfW: 0.08,
+  thigh: 0.245, shin: 0.245, torso: 0.27, shoulderHalfW: 0.115,
+  upperArm: 0.175, forearm: 0.165, headR: 0.062, neckToHead: 0.125,
+  shoulderY: 0.815,
+};
+/** Height range that reads as a standing player; shorter boxes are a crouch. */
+const STAND_MIN_H = 1.65, STAND_MAX_H = 2.05, NOMINAL_H = 1.85;
+
+/** Shared geometries and materials for the player figures, built once. */
+let playerKit: ReturnType<typeof buildPlayerKit> | null = null;
+function buildPlayerKit() {
+  const capsule = (r: number, len: number) => new THREE.CapsuleGeometry(r, Math.max(0.001, len - 2 * r), 4, 10);
+  const mat = (color: number, roughness = 0.75) => new THREE.MeshStandardMaterial({ color, roughness });
+  return {
+    geo: {
+      thigh: capsule(0.048, BODY.thigh + 0.03),
+      shin: capsule(0.036, BODY.shin + 0.02),
+      upperArm: capsule(0.033, BODY.upperArm + 0.02),
+      forearm: capsule(0.027, BODY.forearm + 0.01),
+      torso: capsule(0.078, BODY.torso - 0.02),
+      shorts: capsule(0.075, 0.13),
+      head: new THREE.SphereGeometry(BODY.headR, 16, 12),
+      hand: new THREE.SphereGeometry(0.03, 10, 8),
+      shoe: new THREE.BoxGeometry(0.06, 0.04, 0.14),
+      ring: new THREE.RingGeometry(0.2, 0.26, 32).rotateX(-Math.PI / 2),
+    },
+    mat: {
+      jerseyNeg: mat(PLAYER_COLOR_NEG_Z, 0.6),
+      jerseyPos: mat(PLAYER_COLOR_POS_Z, 0.6),
+      ringNeg: new THREE.MeshBasicMaterial({ color: PLAYER_COLOR_NEG_Z, transparent: true, opacity: 0.55, side: THREE.DoubleSide }),
+      ringPos: new THREE.MeshBasicMaterial({ color: PLAYER_COLOR_POS_Z, transparent: true, opacity: 0.55, side: THREE.DoubleSide }),
+      shorts: mat(0x23272f),
+      skin: mat(0xc9a184, 0.85),
+      shoe: mat(0xe8e8e8, 0.5),
+    },
+  };
+}
+
+const UP = new THREE.Vector3(0, 1, 0);
+
+/** A capsule mesh spanning a -> b (its geometry already has that length). */
+function limb(geo: THREE.BufferGeometry, material: THREE.Material, a: THREE.Vector3, b: THREE.Vector3): THREE.Mesh {
+  const m = new THREE.Mesh(geo, material);
+  m.position.copy(a).add(b).multiplyScalar(0.5);
+  const dir = b.clone().sub(a);
+  if (dir.lengthSq() > 1e-9) m.quaternion.setFromUnitVectors(UP, dir.normalize());
+  return m;
+}
+
+/** Knee of a two-bone leg from hip to ankle, bending forward (+z). */
+function kneeFor(hip: THREE.Vector3, ankle: THREE.Vector3): THREE.Vector3 {
+  const mid = hip.clone().add(ankle).multiplyScalar(0.5);
+  const span = hip.distanceTo(ankle);
+  const half = Math.min(span / 2, BODY.thigh);
+  const out = Math.sqrt(Math.max(0, BODY.thigh * BODY.thigh - half * half));
+  const along = ankle.clone().sub(hip).normalize();
+  const fwd = new THREE.Vector3(0, 0, 1).addScaledVector(along, -along.z).normalize();
+  return mid.addScaledVector(fwd, out);
+}
+
+/**
+ * A jointed player figure: legs, shorts, jersey, arms and head, scaled to the
+ * player's height and facing the net. A box much shorter than a standing
+ * player becomes a crouch (bent knees, forward lean). Arms follow the pose
+ * model's keypoints when it saw them, else hang in a ready position.
+ */
+function buildPlayerFigure(pl: CourtPlayer): THREE.Group {
+  const kit = (playerKit ??= buildPlayerKit());
+  const neg = pl.z < 0;
+  const jersey = neg ? kit.mat.jerseyNeg : kit.mat.jerseyPos;
+  const yaw = neg ? 0 : Math.PI; // face the net
+  const toLocalDir = (v: THREE.Vector3) => v.clone().applyAxisAngle(UP, -yaw);
+
+  // A box topped by raised hands overstates height: use the shoulders then.
+  let h = pl.height;
+  const arms = [pl.arms?.left, pl.arms?.right].filter((a): a is ArmJoints => !!a);
+  const raised = arms.some(([s, , w]) => w.y > s.y + 0.1);
+  if (raised) h = Math.max(...arms.map(([s]) => s.y)) / BODY.shoulderY;
+  const stature = Math.min(STAND_MAX_H, Math.max(h < STAND_MIN_H ? NOMINAL_H : STAND_MIN_H, h));
+  const drop = Math.min(0.3, Math.max(0, (stature - h) / stature)); // crouch, in body units
+
+  const v = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
+  const stance = BODY.stanceHalfW + 0.1 * drop;
+  const hip = v(0, BODY.hipY - drop, -0.35 * drop);
+  const lean = Math.min(0.5, drop * 1.6);
+  const up = v(0, Math.cos(lean), Math.sin(lean));
+  const neck = hip.clone().addScaledVector(up, BODY.torso);
+
+  const g = new THREE.Group();
+  const add = (m: THREE.Mesh) => { m.castShadow = true; g.add(m); return m; };
+
+  for (const side of [1, -1]) {
+    const ankle = v(side * stance, BODY.ankleY, 0);
+    const hipJ = hip.clone().add(v(side * BODY.hipHalfW, 0, 0));
+    const knee = kneeFor(hipJ, ankle);
+    add(limb(kit.geo.thigh, kit.mat.skin, hipJ, knee));
+    add(limb(kit.geo.shin, kit.mat.skin, knee, ankle));
+    add(new THREE.Mesh(kit.geo.shoe, kit.mat.shoe)).position.set(side * stance, 0.02, 0.03);
+  }
+  const shorts = add(limb(kit.geo.shorts, kit.mat.shorts, hip.clone().addScaledVector(up, -0.04), hip.clone().addScaledVector(up, 0.09)));
+  shorts.scale.set(1.35, 1, 0.85);
+  const torso = add(limb(kit.geo.torso, jersey, hip.clone().addScaledVector(up, 0.06), neck));
+  torso.scale.set(1.45, 1, 0.75);
+  add(new THREE.Mesh(kit.geo.head, kit.mat.skin)).position.copy(neck).addScaledVector(up, BODY.neckToHead);
+
+  // Arms: keypoint directions in the local frame, applied at the model's own
+  // shoulders. Sides go by which keypoint shoulder sits on the figure's left.
+  let kpL = pl.arms?.left ?? null, kpR = pl.arms?.right ?? null;
+  if (kpL && kpR && toLocalDir(kpL[0]).x < toLocalDir(kpR[0]).x) [kpL, kpR] = [kpR, kpL];
+  for (const [side, kp] of [[1, kpL], [-1, kpR]] as const) {
+    const shoulder = neck.clone().addScaledVector(up, -0.02).add(v(side * BODY.shoulderHalfW, 0, 0));
+    const upperDir = kp ? toLocalDir(kp[1].clone().sub(kp[0])).normalize() : v(side * 0.15, -1, 0.12).normalize();
+    const foreDir = kp ? toLocalDir(kp[2].clone().sub(kp[1])).normalize() : v(0, -0.6, 0.8).normalize();
+    const elbow = shoulder.clone().addScaledVector(upperDir, BODY.upperArm);
+    const wrist = elbow.clone().addScaledVector(foreDir, BODY.forearm);
+    add(limb(kit.geo.upperArm, jersey, shoulder, elbow));
+    add(limb(kit.geo.forearm, kit.mat.skin, elbow, wrist));
+    add(new THREE.Mesh(kit.geo.hand, kit.mat.skin)).position.copy(wrist).addScaledVector(foreDir, 0.025);
+  }
+
+  g.scale.setScalar(stature);
+  g.rotation.y = yaw;
+  g.position.set(pl.x, 0, pl.z);
+  // Floor ring at the feet, unscaled, so positions read from above.
+  const ring = new THREE.Mesh(kit.geo.ring, neg ? kit.mat.ringNeg : kit.mat.ringPos);
+  ring.position.set(0, 0.006 / stature, 0);
+  ring.scale.setScalar(1 / stature);
+  g.add(ring);
+  return g;
+}
 
 // Marker colour per touch type, so the rally reads serve -> reception -> set
 // -> attack at a glance.
@@ -612,39 +748,20 @@ export default function SkeletonViewer({
     }
   }, [ballTrajectory, currentFrame]);
 
-  // Players of the current frame as simple figures (body + head) standing on
-  // their feet position, tinted by side of the net, so each touch can be
-  // judged against the player who made it.
+  // Players of the current frame as jointed figures standing on their feet
+  // position, jersey tinted by side of the net, arms posed from the pose
+  // model, so each touch can be judged against the player who made it.
+  // Geometry and materials are shared (playerKit), so removal disposes nothing.
   useEffect(() => {
     if (!sceneRef.current) return;
     const { playerFigures } = sceneRef.current;
-    for (const child of [...playerFigures.children]) {
-      playerFigures.remove(child);
-      if (child instanceof THREE.Mesh) {
-        child.geometry.dispose();
-        (child.material as THREE.Material).dispose();
-      }
-    }
+    playerFigures.clear();
     const f = frames?.[currentFrame];
     const aspect = (videoAspect && videoAspect > 0) ? videoAspect
       : (overlayVideoAspect && overlayVideoAspect > 0) ? overlayVideoAspect : 16 / 9;
     if (!calibration || !f || overlay) return;
     for (const pl of playersOnCourt(f, calibration, aspect)) {
-      const color = pl.z < 0 ? PLAYER_COLOR_NEG_Z : PLAYER_COLOR_POS_Z;
-      const head = 0.12;
-      const bodyH = Math.max(0.3, pl.height - 2 * head);
-      const body = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.16, 0.13, bodyH, 12),
-        new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.75, roughness: 0.8 }),
-      );
-      body.position.set(pl.x, bodyH / 2, pl.z);
-      playerFigures.add(body);
-      const headMesh = new THREE.Mesh(
-        new THREE.SphereGeometry(head, 12, 12),
-        new THREE.MeshStandardMaterial({ color, transparent: true, opacity: 0.85, roughness: 0.8 }),
-      );
-      headMesh.position.set(pl.x, bodyH + head, pl.z);
-      playerFigures.add(headMesh);
+      playerFigures.add(buildPlayerFigure(pl));
     }
   }, [frames, currentFrame, calibration, videoAspect, overlayVideoAspect, overlay]);
 

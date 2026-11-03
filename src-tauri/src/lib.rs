@@ -1,10 +1,24 @@
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-struct AnalyzerProcess(Mutex<Option<Child>>);
+/// Persistent analysis process. Started with the app and kept alive between
+/// analyses, so Python, torch and the detectors load once (~12 s) instead of
+/// on every run. Stopping an analysis kills it and starts a fresh one.
+#[derive(Default)]
+struct Analyzer {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    /// An analysis was sent and has not completed or failed yet.
+    busy: bool,
+    /// Bumped per spawn, so a dying old process's reader cannot clear the
+    /// state of the process that replaced it.
+    generation: u64,
+}
+
+struct AnalyzerProcess(Mutex<Analyzer>);
 
 /// Persistent court detector process — keeps model loaded in memory.
 struct CourtDetectorProcess {
@@ -74,43 +88,37 @@ fn analyzer_script_path(app: &AppHandle) -> String {
     "python/analyzer.py".to_string()
 }
 
-#[tauri::command]
-async fn start_analysis(
-    app: AppHandle,
-    state: State<'_, AnalyzerProcess>,
-    video_path: String,
-) -> Result<String, String> {
-    // Kill any existing analyzer process
-    if let Ok(mut guard) = state.0.lock() {
-        if let Some(ref mut child) = *guard {
-            let _ = child.kill();
-        }
-        *guard = None;
+fn kill_analyzer(a: &mut Analyzer) {
+    if let Some(mut child) = a.child.take() {
+        let _ = child.kill();
     }
+    a.stdin = None;
+    a.busy = false;
+}
 
+/// Start the analysis process and the threads that forward its output.
+fn spawn_analyzer(app: &AppHandle, a: &mut Analyzer) -> Result<(), String> {
+    kill_analyzer(a);
     let python = find_python();
-    let script = analyzer_script_path(&app);
+    let script = analyzer_script_path(app);
 
     let mut child = Command::new(&python)
         .arg(&script)
+        .arg("--warm")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start Python analyzer: {}. Python: {}, Script: {}", e, python, script))?;
 
-    let mut stdin = child.stdin.take().ok_or("Failed to get stdin")?;
+    let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
+    a.generation += 1;
+    let generation = a.generation;
+    a.child = Some(child);
+    a.stdin = Some(stdin);
 
-    // Store the child process
-    if let Ok(mut guard) = state.0.lock() {
-        *guard = Some(child);
-    }
-
-    let app_handle = app.clone();
-
-    // Spawn a thread to read stderr and log it
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
@@ -120,73 +128,96 @@ async fn start_analysis(
         }
     });
 
-    // Spawn a thread to read stdout and emit events to the frontend
-    let app_for_stdout = app_handle.clone();
+    // Forward stdout lines to the frontend as events.
+    let app = app.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    match serde_json::from_str::<Value>(&line) {
-                        Ok(json) => {
-                            let action = json
-                                .get("action")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or("unknown");
-
-                            match action {
-                                "frame" => {
-                                    let _ = app_for_stdout.emit("analysis-frame", &json);
-                                }
-                                "progress" => {
-                                    let _ = app_for_stdout.emit("analysis-progress", &json);
-                                }
-                                "complete" => {
-                                    let _ = app_for_stdout.emit("analysis-complete", &json);
-                                }
-                                "error" => {
-                                    let _ = app_for_stdout.emit("analysis-error", &json);
-                                }
-                                "ready" => {
-                                    let _ = app_for_stdout.emit("analyzer-ready", &json);
-                                }
-                                _ => {
-                                    let _ = app_for_stdout.emit("analysis-message", &json);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[Python stdout parse error] {}: {}", e, line);
-                        }
-                    }
-                }
+            let line = match line {
+                Ok(line) => line,
                 Err(e) => {
                     eprintln!("[Python stdout read error] {}", e);
                     break;
                 }
+            };
+            if line.trim().is_empty() {
+                continue;
             }
+            let json = match serde_json::from_str::<Value>(&line) {
+                Ok(json) => json,
+                Err(e) => {
+                    eprintln!("[Python stdout parse error] {}: {}", e, line);
+                    continue;
+                }
+            };
+            let action = json.get("action").and_then(|a| a.as_str()).unwrap_or("unknown");
+            let event = match action {
+                "frame" => "analysis-frame",
+                "progress" => "analysis-progress",
+                "complete" => "analysis-complete",
+                "error" => "analysis-error",
+                "ready" => "analyzer-ready",
+                _ => "analysis-message",
+            };
+            if action == "complete" || action == "error" {
+                if let Ok(mut a) = app.state::<AnalyzerProcess>().0.lock() {
+                    if a.generation == generation {
+                        a.busy = false;
+                    }
+                }
+            }
+            let _ = app.emit(event, &json);
+        }
+        // The process ended. If it was mid-analysis (not stopped on purpose,
+        // which clears `busy` first), report it.
+        let was_busy = match app.state::<AnalyzerProcess>().0.lock() {
+            Ok(mut a) if a.generation == generation => {
+                let was_busy = a.busy;
+                kill_analyzer(&mut a);
+                was_busy
+            }
+            _ => false,
+        };
+        if was_busy {
+            let _ = app.emit(
+                "analysis-error",
+                serde_json::json!({ "action": "error", "message": "Analyzer process exited unexpectedly" }),
+            );
         }
     });
+    Ok(())
+}
 
-    // Send the analyze command to the Python process
-    let request = serde_json::json!({
-        "action": "analyze",
-        "video_path": video_path
-    });
-
-    let msg = format!("{}\n", request);
+fn send_analyze(a: &mut Analyzer, request: &str) -> Result<(), String> {
+    let stdin = a.stdin.as_mut().ok_or("No stdin")?;
     stdin
-        .write_all(msg.as_bytes())
-        .map_err(|e| format!("Failed to write to Python stdin: {}", e))?;
+        .write_all(request.as_bytes())
+        .and_then(|_| stdin.flush())
+        .map_err(|e| format!("Failed to write to Python stdin: {}", e))
+}
 
-    // We intentionally drop stdin here so the Python process knows
-    // no more input is coming for this request. For a long-lived process,
-    // you'd keep stdin open. For simplicity, we close it after sending.
-    drop(stdin);
+#[tauri::command]
+async fn start_analysis(
+    app: AppHandle,
+    state: State<'_, AnalyzerProcess>,
+    video_path: String,
+) -> Result<String, String> {
+    let request = format!("{}
+", serde_json::json!({ "action": "analyze", "video_path": video_path }));
+    let mut a = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
+    // Reuse the warm process unless it is gone or still busy with a previous
+    // run (whose frames would otherwise mix into this one).
+    let alive = a.child.as_mut().map_or(false, |c| matches!(c.try_wait(), Ok(None)));
+    if !alive || a.busy {
+        spawn_analyzer(&app, &mut a)?;
+    }
+    if send_analyze(&mut a, &request).is_err() {
+        // The process died between runs: start it again once.
+        spawn_analyzer(&app, &mut a)?;
+        send_analyze(&mut a, &request)?;
+    }
+    a.busy = true;
     Ok("Analysis started".to_string())
 }
 
@@ -323,12 +354,11 @@ async fn save_court(app: AppHandle, video_path: String, frame: u32, corners: Vec
 }
 
 #[tauri::command]
-async fn stop_analysis(state: State<'_, AnalyzerProcess>) -> Result<String, String> {
-    if let Ok(mut guard) = state.0.lock() {
-        if let Some(ref mut child) = *guard {
-            let _ = child.kill();
-        }
-        *guard = None;
+async fn stop_analysis(app: AppHandle, state: State<'_, AnalyzerProcess>) -> Result<String, String> {
+    // Killing is the only way to interrupt a run; a fresh process starts
+    // straight away so the next analysis finds the detectors loaded.
+    if let Ok(mut a) = state.0.lock() {
+        spawn_analyzer(&app, &mut a)?;
     }
     Ok("Analysis stopped".to_string())
 }
@@ -340,19 +370,84 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| format!("Failed to write {}: {}", path, e))
 }
 
+/// Where a video's hand corrections (Inspect & Edit) are kept: next to the
+/// saved courts in ~/.tennis-3d (TENNIS3D_EDITS overrides), named by the
+/// video's file name and size, so they are found again after the video is
+/// moved or re-analysed.
+fn edits_file(video_path: &str) -> Result<std::path::PathBuf, String> {
+    let size = std::fs::metadata(video_path)
+        .map_err(|e| format!("Cannot read {}: {}", video_path, e))?
+        .len();
+    let stem: String = std::path::Path::new(video_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(60)
+        .collect();
+    let dir = match std::env::var("TENNIS3D_EDITS") {
+        Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .map_err(|_| "No home directory".to_string())?;
+            std::path::Path::new(&home).join(".tennis-3d").join("edits")
+        }
+    };
+    Ok(dir.join(format!("{}-{}.json", stem, size)))
+}
+
+/// The saved corrections for a video, or None when it has none yet.
+#[tauri::command]
+fn load_edits(video_path: String) -> Result<Option<String>, String> {
+    let file = edits_file(&video_path)?;
+    if !file.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&file)
+        .map(Some)
+        .map_err(|e| format!("Failed to read {}: {}", file.display(), e))
+}
+
+/// Save a video's corrections; returns the file they went to.
+#[tauri::command]
+fn save_edits(video_path: String, content: String) -> Result<String, String> {
+    let file = edits_file(&video_path)?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create {}: {}", dir.display(), e))?;
+    }
+    // Write then rename, so a crash mid-save cannot leave half a file.
+    let tmp = file.with_extension("json.tmp");
+    std::fs::write(&tmp, content)
+        .and_then(|_| std::fs::rename(&tmp, &file))
+        .map_err(|e| format!("Failed to write {}: {}", file.display(), e))?;
+    Ok(file.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(AnalyzerProcess(Mutex::new(None)))
+        .manage(AnalyzerProcess(Mutex::new(Analyzer::default())))
         .manage(CourtDetectorProcess {
             child: Mutex::new(None),
             stdin: Mutex::new(None),
             stdout: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![start_analysis, stop_analysis, detect_court, save_court, write_text_file])
+        .setup(|app| {
+            // Load the detectors while the user is still picking a video.
+            let handle = app.handle().clone();
+            if let Ok(mut a) = app.state::<AnalyzerProcess>().0.lock() {
+                if let Err(e) = spawn_analyzer(&handle, &mut a) {
+                    eprintln!("[analyzer] {}", e);
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![start_analysis, stop_analysis, detect_court, save_court, write_text_file, load_edits, save_edits])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

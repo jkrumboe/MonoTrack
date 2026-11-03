@@ -25,9 +25,13 @@ export function syntheticCases(): EvalCase[] {
   });
 }
 
-/** Real clips: eval/fixtures/<clip>.json, with eval/labels/<clip>.json when labelled. */
+/**
+ * Real clips: eval/fixtures/<clip>.json, with eval/labels/<clip>.json when
+ * labelled. EVAL_FIXTURES_DIR points at another fixture folder, to score
+ * analyzer changes (a new ball tracker, say) before replacing the real ones.
+ */
 export function realCases(): EvalCase[] {
-  const fxDir = path.join(EVAL_DIR, "fixtures");
+  const fxDir = process.env.EVAL_FIXTURES_DIR ?? path.join(EVAL_DIR, "fixtures");
   if (!fs.existsSync(fxDir)) return [];
   return fs.readdirSync(fxDir)
     .filter((f) => f.endsWith(".json"))

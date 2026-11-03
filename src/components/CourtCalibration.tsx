@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import * as THREE from "three";
-import { invoke } from "@tauri-apps/api/core";
+import { getBackend } from "../platform/backend";
 import { type CalibrationResult, solveCameraIterative } from "../utils/cameraSolver";
 import { computeHomography, applyHomography } from "../utils/courtHomography";
 
@@ -487,18 +487,9 @@ export default function CourtCalibration({
       const video = containerRef.current?.parentElement?.querySelector("video") as HTMLVideoElement | null;
       const frameTime = video?.currentTime ?? 0;
 
-      const result = await invoke<{
-        action: string;
-        corners?: number[][];
-        steps?: DebugStep[];
-        log?: string[];
-        message?: string;
-      }>("detect_court", {
-        videoPath,
-        frameTime,
-      });
+      const result = await (await getBackend()).detectCourt(videoPath, frameTime);
 
-      const steps = result.steps ?? [];
+      const steps = (result.steps ?? []) as DebugStep[];
       const log = result.log ?? [];
 
       if (result.action === "court_detected" && result.corners) {

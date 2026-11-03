@@ -28,5 +28,10 @@ export default defineConfig(async () => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+    // The web app in development: API calls go to the analysis server
+    // (npm run server), so the page and the API share an origin as in production.
+    proxy: {
+      "/api": "http://127.0.0.1:8765",
+    },
   },
 }));

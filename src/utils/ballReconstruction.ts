@@ -93,6 +93,16 @@ export interface BallReconstructionOptions {
    * mode). Unset fields keep DEFAULT_RALLY_PARAMS; `rules` merges per touch.
    */
   rallyParams?: Partial<Omit<RallyParams, "rules">> & { rules?: Partial<RallyParams["rules"]> };
+  /**
+   * Touch corrections made by hand (the app's Inspect & Edit view).
+   * `touchAt`: frames where a player touched the ball; the track is split
+   * there and the split kept whatever the velocity jump. `noTouchAt`: frames
+   * where a found touch was removed; a split within a few frames of one is
+   * merged back into a single flight. `pins`: where in 3D (m) the ball was
+   * at a touch, placed by hand; the touch's knot is held there and the
+   * flights either side fit to it. A pin is also a `touchAt`.
+   */
+  touchEdits?: { touchAt?: number[]; noTouchAt?: number[]; pins?: { frame: number; pos: [number, number, number] }[] };
 }
 
 export interface ReconstructionStats {
@@ -280,7 +290,19 @@ export interface CourtPlayer {
   x: number;
   z: number;
   height: number;
+  /**
+   * Arm joints in world metres when the pose model saw them: shoulder, elbow,
+   * wrist for the player's left and right arm (null where not confident).
+   * Lifted onto the vertical plane through the feet that faces the camera, so
+   * depth along the view ray is a guess but the arm's shape on screen is kept.
+   */
+  arms?: { left: ArmJoints | null; right: ArmJoints | null };
 }
+
+/** Shoulder, elbow, wrist of one arm, world metres. */
+export type ArmJoints = [THREE.Vector3, THREE.Vector3, THREE.Vector3];
+
+const ARM_MIN_CONF = 0.3;
 
 /**
  * Players of one frame on the court: feet from the bottom of each person box
@@ -290,15 +312,17 @@ export interface CourtPlayer {
  * at the scorer's table) are left out.
  */
 export function playersOnCourt(
-  frame: Pick<FrameData, "players" | "players_all_ref">,
+  frame: Pick<FrameData, "players" | "players_all_ref" | "players_arms" | "players_arms_ref">,
   calibration: CalibrationResult,
   aspect: number,
 ): CourtPlayer[] {
-  const boxes = frame.players_all_ref ?? frame.players;
+  const useRef = !!frame.players_all_ref;
+  const boxes = useRef ? frame.players_all_ref : frame.players;
+  const allArms = useRef ? frame.players_arms_ref : frame.players_arms;
   if (!boxes?.length || aspect <= 0) return [];
   const cam = createCamera(calibration, aspect);
   const out: CourtPlayer[] = [];
-  for (const [x1, y1, x2, y2] of boxes) {
+  for (const [bi, [x1, y1, x2, y2]] of boxes.entries()) {
     const cx = (x1 + x2) / 2;
     const feet = rayFromImagePos(cam, [cx, y2]);
     if (feet.dir.y > -1e-6) continue;
@@ -313,9 +337,40 @@ export function playersOnCourt(
       : 0;
     const height = head.origin.y + head.dir.y * along;
     if (!(height > 0.5 && height < 3.2)) continue;
-    out.push({ x, z, height });
+    const kps = allArms?.[bi];
+    out.push({ x, z, height, arms: kps ? liftArms(cam, kps, x, z) : undefined });
   }
   return out;
+}
+
+/**
+ * Arm keypoints ([x, y, conf] for L/R shoulder, L/R elbow, L/R wrist) onto
+ * the vertical plane through the feet facing the camera.
+ */
+function liftArms(
+  cam: THREE.PerspectiveCamera,
+  kps: number[][],
+  x: number,
+  z: number,
+): CourtPlayer["arms"] {
+  const n = new THREE.Vector3(x - cam.position.x, 0, z - cam.position.z);
+  if (n.lengthSq() < 1e-6 || kps.length < 6) return undefined;
+  n.normalize();
+  const feet = new THREE.Vector3(x, 0, z);
+  const lift = (k: number[] | undefined): THREE.Vector3 | null => {
+    if (!k || !(k[2] >= ARM_MIN_CONF)) return null;
+    const ray = rayFromImagePos(cam, [k[0], k[1]]);
+    const den = n.dot(ray.dir);
+    if (Math.abs(den) < 1e-6) return null;
+    const t = n.dot(feet.clone().sub(ray.origin)) / den;
+    return t > 0 ? ray.origin.clone().addScaledVector(ray.dir, t) : null;
+  };
+  const arm = (s: number, e: number, w: number): ArmJoints | null => {
+    const p = [lift(kps[s]), lift(kps[e]), lift(kps[w])];
+    return p[0] && p[1] && p[2] ? [p[0], p[1], p[2]] : null;
+  };
+  const left = arm(0, 2, 4), right = arm(1, 3, 5);
+  return left || right ? { left, right } : undefined;
 }
 
 function normCourtToWorld(nx: number, ny: number): [number, number] {
@@ -938,8 +993,9 @@ function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number
     };
     const splitPx = Math.max(TOUCH_SPLIT_MIN_PX, P.touchSplitM / courtMetresPerPx);
     if (devPx(obs[i]) > splitPx && devPx(obs[i + 1]) > splitPx) {
-      out.push(obs.slice(start, i));
-      start = i;
+      const at = refineSplit(obs, start, i, hw, hh);
+      out.push(obs.slice(start, at));
+      start = at;
       i = start + P.touchMinSeg;
     } else {
       i++;
@@ -947,6 +1003,55 @@ function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number
   }
   out.push(obs.slice(start));
   return out;
+}
+
+/** Frames either side of a detected split searched for the real touch. */
+const SPLIT_REFINE_FRAMES = 4;
+/** Samples beyond the search range on each side, so every candidate fits both flights. */
+const SPLIT_REFINE_WIN = 6;
+/** A moved cut must leave at most this fraction of the original cut's squared error. */
+const SPLIT_REFINE_GAIN = 0.3;
+/** Largest frame step inside the search window. */
+const SPLIT_REFINE_MAX_GAP = 2;
+
+/**
+ * Move a split to where the track really breaks. splitAtTouches cuts at the
+ * first sample off the parabola fitted so far, but that parabola spans the
+ * whole flight and can drift off a few samples before the touch (pol_ita_r4:
+ * cut at frame 60 while the serve contact was 62, so the serve arc started
+ * with three samples of the toss coming down, fit 36 px off and was rejected).
+ * Over a fixed window around the cut, the boundary where one parabola before
+ * and one after leave the least squared error is the touch.
+ */
+function refineSplit(obs: ArcObsEx[], start: number, at: number, hw: number, hh: number): number {
+  // The window stops at detection gaps: a touch hidden in a gap is already cut
+  // there, and samples beyond it belong to another flight.
+  const reach = SPLIT_REFINE_FRAMES + SPLIT_REFINE_WIN;
+  let lo = at, hi = at + 1;
+  while (lo > Math.max(start, at - reach) && obs[lo].fi - obs[lo - 1].fi <= SPLIT_REFINE_MAX_GAP) lo--;
+  while (hi < Math.min(obs.length, at + reach) && obs[hi].fi - obs[hi - 1].fi <= SPLIT_REFINE_MAX_GAP) hi++;
+  const sse = (a: number, b: number) => {
+    const seg = obs.slice(a, b);
+    const ts = seg.map((o) => o.t - seg[0].t);
+    const cu = _fitQuadratic(ts, seg.map((o) => o.u));
+    const cv = _fitQuadratic(ts, seg.map((o) => o.v));
+    return seg.reduce((s, o, i) => {
+      const t = ts[i];
+      return s + ((cu[0] + cu[1] * t + cu[2] * t * t - o.u) * hw) ** 2 + ((cv[0] + cv[1] * t + cv[2] * t * t - o.v) * hh) ** 2;
+    }, 0);
+  };
+  // Four samples a side, so neither parabola fits its points exactly.
+  const ok = (b: number) => b - lo >= 4 && hi - b >= 4;
+  if (!ok(at)) return at;
+  // Only a clearly better boundary moves the cut: near a clean touch every
+  // candidate fits about as well, and the original cut is usually right.
+  let best = at, bestErr = SPLIT_REFINE_GAIN * (sse(lo, at) + sse(at, hi));
+  for (let b = at - SPLIT_REFINE_FRAMES; b <= at + SPLIT_REFINE_FRAMES; b++) {
+    if (b === at || b <= start || !ok(b)) continue;
+    const e = sse(lo, b) + sse(b, hi);
+    if (e < bestErr) { best = b; bestErr = e; }
+  }
+  return best;
 }
 
 // ─── Rally solver: connected ballistic segments ──────────────────────────────
@@ -1120,7 +1225,7 @@ export const DEFAULT_RALLY_PARAMS: RallyParams = {
   softMaxSpeed: 30,
   dragPerM: 0,
   touchImpulseWeight: 0.3,
-  sizeDepthWeight: 10,
+  sizeDepthWeight: 25,
   sizeDepthOutlier: 0.3,
   accelMinG: 0.8,
   accelMaxG: 2.2,
@@ -1131,7 +1236,7 @@ export const DEFAULT_RALLY_PARAMS: RallyParams = {
   segMaxMedianErrPx: 10,
   segMinInlierFrac: 0.7,
   playerTrackFrames: 10,
-  anchorWeight: 12,
+  anchorWeight: 25,
   anchorRobustM: 3,
   serverMinAbsZ: COURT_HALF_L - 1,
   rules: {
@@ -1210,32 +1315,55 @@ function _solveLinear(A: number[][], b: number[]): number[] | null {
   return x;
 }
 
-/** Levenberg-Marquardt on a residual vector, numeric Jacobian. */
-function _levenbergMarquardt(p0: number[], residuals: (p: number[]) => number[], maxIter = 100): number[] {
+/**
+ * A group of residuals and the only parameters it depends on. The Jacobian
+ * is then differenced block by block: a rally's residuals each touch a few of
+ * its knots, so perturbing one parameter re-evaluates a handful of terms
+ * instead of the whole rally (that full re-evaluation was ~99% of the
+ * analysis time on a long rally).
+ */
+interface ResidualBlock {
+  params: number[];
+  eval: (p: number[]) => number[];
+}
+
+function _blockResiduals(blocks: ResidualBlock[], p: number[]): number[] {
+  const r: number[] = [];
+  for (const b of blocks) for (const v of b.eval(p)) r.push(v);
+  return r;
+}
+
+/** Levenberg-Marquardt on block residuals, numeric (forward-difference) Jacobian. */
+function _levenbergMarquardt(p0: number[], blocks: ResidualBlock[], maxIter = 100): number[] {
   let p = p0.slice();
-  let r = residuals(p);
+  let r = _blockResiduals(blocks, p);
   let cost = r.reduce((s, v) => s + v * v, 0);
   let lambda = 1e-2;
   const m = p.length;
+  const h = 1e-4;
   for (let iter = 0; iter < maxIter; iter++) {
-    const J: number[][] = [];
-    for (let j = 0; j < m; j++) {
-      const h = 1e-4;
-      const pj = p.slice();
-      pj[j] += h;
-      const rj = residuals(pj);
-      J.push(rj.map((v, i) => (v - r[i]) / h));
-    }
-    // Normal equations: (JᵀJ + λ·diag) δ = −Jᵀr
+    // Normal equations: (JᵀJ + λ·diag) δ = −Jᵀr, summed block by block.
     const JTJ = Array.from({ length: m }, () => new Array<number>(m).fill(0));
     const JTr = new Array<number>(m).fill(0);
-    for (let a = 0; a < m; a++) {
-      for (let i = 0; i < r.length; i++) JTr[a] += J[a][i] * r[i];
-      for (let b = a; b < m; b++) {
-        let s = 0;
-        for (let i = 0; i < r.length; i++) s += J[a][i] * J[b][i];
-        JTJ[a][b] = s;
-        JTJ[b][a] = s;
+    const q = p.slice();
+    for (const b of blocks) {
+      const base = b.eval(q);
+      const J = b.params.map((j) => {
+        const v0 = q[j];
+        q[j] = v0 + h;
+        const rj = b.eval(q);
+        q[j] = v0;
+        return rj.map((v, i) => (v - base[i]) / h);
+      });
+      for (let a = 0; a < J.length; a++) {
+        const ja = b.params[a];
+        for (let i = 0; i < base.length; i++) JTr[ja] += J[a][i] * base[i];
+        for (let c = a; c < J.length; c++) {
+          let s = 0;
+          for (let i = 0; i < base.length; i++) s += J[a][i] * J[c][i];
+          JTJ[ja][b.params[c]] += s;
+          if (c !== a) JTJ[b.params[c]][ja] += s;
+        }
       }
     }
     let improved = false;
@@ -1244,7 +1372,7 @@ function _levenbergMarquardt(p0: number[], residuals: (p: number[]) => number[],
       const delta = _solveLinear(A, JTr.map((v) => -v));
       if (!delta) { lambda *= 10; continue; }
       const pn = p.map((v, k) => v + delta[k]);
-      const rn = residuals(pn);
+      const rn = _blockResiduals(blocks, pn);
       const cn = rn.reduce((s, v) => s + v * v, 0);
       if (cn < cost) {
         const rel = (cost - cn) / Math.max(cost, 1e-12);
@@ -1349,6 +1477,9 @@ type PlayerBox = number[];
 type TouchCandidate = [number, number];
 /** Ball must clear the net tape by this much when it crosses (m). */
 const NET_CLEAR_M = 2.43 + 0.1;
+/** Referee zone: within this |z| of the net and this far beyond a sideline (m). */
+const OFFICIALS_NET_Z_M = 1;
+const OFFICIALS_OUT_M = 3;
 
 function _groundPointOf(cam: THREE.PerspectiveCamera, xn: number, yn: number): [number, number] | null {
   const { origin, dir } = rayFromImagePos(cam, [xn, yn]);
@@ -1423,6 +1554,10 @@ function takeOffSpot(
   }
   const g = _groundPointOf(cam, (x1 + x2) / 2, feetY);
   if (!g || Math.abs(g[0]) > RALLY_MAX_ABS_X_M || Math.abs(g[1]) > RALLY_MAX_ABS_Z_M) return null;
+  // The referees stand at the net posts, beyond the sidelines (the first on
+  // a raised stand, so their "feet" land even further out). pol_ita_r6: the
+  // first referee (9.4 m out) anchored a block and pulled it off the court.
+  if (Math.abs(g[1]) < OFFICIALS_NET_Z_M && Math.abs(g[0]) > COURT_HALF_W + OFFICIALS_OUT_M) return null;
   return g;
 }
 
@@ -1594,11 +1729,18 @@ function mergeUntouchedSplits(
   hw: number,
   hh: number,
   log?: TouchSplitDecision[],
+  /**
+   * Re-entry frames of flights out of the top of the picture that stay
+   * split. The touch there (if any) happened out of view, so neither a
+   * nearby player nor a velocity jump can confirm it, and merging would put
+   * back the one-arc flight that already failed to fit.
+   */
+  keepSplit: Set<number> = new Set(),
 ): ArcObsEx[][] {
   const out: ArcObsEx[][] = [];
   for (const arc of arcs) {
     const prev = out[out.length - 1];
-    if (prev && arc.length > 0) {
+    if (prev && arc.length > 0 && !keepSplit.has(arc[0].fi)) {
       const last = prev[prev.length - 1];
       const sameRally = arc[0].t - last.t <= P.rallyMaxGapS;
       if (sameRally) {
@@ -1610,6 +1752,60 @@ function mergeUntouchedSplits(
           out[out.length - 1] = [...prev, ...arc];
           continue;
         }
+      }
+    }
+    out.push(arc);
+  }
+  return out;
+}
+
+/** A split this many frames from a hand-marked touch is taken to be that touch. */
+const EDIT_TOUCH_SNAP_FRAMES = 3;
+/**
+ * Residual px per metre between a knot and a hand-placed 3D position. Far
+ * above the player anchor (anchorWeight): the user has seen where it was.
+ */
+const PIN_WEIGHT = 200;
+
+/**
+ * Split the track at hand-marked touches. A split the solver already made
+ * near one is reused rather than doubled. Returns the arcs and the first
+ * frame of each arc that starts at a marked touch.
+ */
+function splitAtMarkedTouches(arcs: ArcObsEx[][], touchAt: number[]): { arcs: ArcObsEx[][]; starts: Set<number> } {
+  const starts = new Set<number>();
+  if (!touchAt.length) return { arcs, starts };
+  let out = arcs;
+  for (const f of touchAt) {
+    // Near an existing split, or inside the detection gap it spans.
+    const near = out.find((a, i) => i > 0 && a.length > 0 && out[i - 1].length > 0 &&
+      f >= out[i - 1][out[i - 1].length - 1].fi - EDIT_TOUCH_SNAP_FRAMES && f <= a[0].fi + EDIT_TOUCH_SNAP_FRAMES);
+    if (near) { starts.add(near[0].fi); continue; }
+    const next: ArcObsEx[][] = [];
+    for (const a of out) {
+      const i = a.findIndex((o) => o.fi >= f);
+      if (i > 0) {
+        next.push(a.slice(0, i), a.slice(i));
+        starts.add(a[i].fi);
+      } else next.push(a);
+    }
+    out = next;
+  }
+  return { arcs: out, starts };
+}
+
+/** Merge splits within a few frames of a frame where a touch was removed by hand. */
+function mergeAtRemovedTouches(arcs: ArcObsEx[][], noTouchAt: number[], keep: Set<number>): ArcObsEx[][] {
+  if (!noTouchAt.length) return arcs;
+  const out: ArcObsEx[][] = [];
+  for (const arc of arcs) {
+    const prev = out[out.length - 1];
+    if (prev && arc.length && !keep.has(arc[0].fi)) {
+      const a = prev[prev.length - 1].fi, b = arc[0].fi;
+      if (arc[0].t - prev[prev.length - 1].t <= P.rallyMaxGapS &&
+          noTouchAt.some((f) => f >= a - EDIT_TOUCH_SNAP_FRAMES && f <= b + EDIT_TOUCH_SNAP_FRAMES)) {
+        out[out.length - 1] = [...prev, ...arc];
+        continue;
       }
     }
     out.push(arc);
@@ -1879,6 +2075,8 @@ function solveRally(
   freeKnots: Set<number> = new Set(),
   /** Per knot: a contact found at a player's arms (time and image point). */
   contacts: (HiddenContact | null)[] = [],
+  /** Per knot: a 3D position placed by hand, held by a stiff pull. */
+  pins: ([number, number, number] | null)[] = [],
 ): RallySegmentResult[] {
   const hw = videoWidth / 2, hh = videoHeight / 2;
   const project = _makeProjector(cam);
@@ -1948,59 +2146,74 @@ function solveRally(
     return Math.log(d) - Math.log(o.sizeDepth!);
   };
 
-  const residuals = (p: number[]): number[] => {
-    const r: number[] = [];
+  // Parameters each term depends on: a knot's position, or a segment (its
+  // two knots and its acceleration).
+  const knotP = (k: number) => [3 * k, 3 * k + 1, 3 * k + 2];
+  const segP = (k: number) => [...knotP(k), ...knotP(k + 1), GK + k];
+  // Soft priors are in "pixels per metre of violation". They only bite
+  // outside the plausible region, so they select among depths that fit the
+  // image equally well rather than fighting the observations.
+  const PRIOR = 20;
+  // Built per solve: outlier rejection changes which observations are active.
+  const residualBlocks = (): ResidualBlock[] => {
+    const blocks: ResidualBlock[] = [];
     allObs.forEach(({ o, k }, i) => {
       if (!active[i]) return;
-      const [x, y, z] = segPos(p, k, o.t);
-      const [pu, pv] = project(x, y, z);
-      const w = Math.sqrt(Math.max(0.1, o.conf));
-      const du = (pu - o.u) * hw, dv = (pv - o.v) * hh;
-      // Pseudo-Huber: quadratic up to ~P.robustReprojPx, linear beyond. A
-      // messy stretch (a deflection off a block) has 20+ px errors, and with
-      // a plain square those few samples dominate the whole rally and drag
-      // well-anchored touches off their players.
-      const e = Math.hypot(du, dv);
-      const sc = e > 1e-9
-        ? Math.sqrt(2 * P.robustReprojPx ** 2 * (Math.sqrt(1 + (e / P.robustReprojPx) ** 2) - 1)) / e
-        : 1;
-      r.push(w * du * sc, w * dv * sc);
+      blocks.push({ params: segP(k), eval: (p) => {
+        const [x, y, z] = segPos(p, k, o.t);
+        const [pu, pv] = project(x, y, z);
+        const w = Math.sqrt(Math.max(0.1, o.conf));
+        const du = (pu - o.u) * hw, dv = (pv - o.v) * hh;
+        // Pseudo-Huber: quadratic up to ~P.robustReprojPx, linear beyond. A
+        // messy stretch (a deflection off a block) has 20+ px errors, and with
+        // a plain square those few samples dominate the whole rally and drag
+        // well-anchored touches off their players.
+        const e = Math.hypot(du, dv);
+        const sc = e > 1e-9
+          ? Math.sqrt(2 * P.robustReprojPx ** 2 * (Math.sqrt(1 + (e / P.robustReprojPx) ** 2) - 1)) / e
+          : 1;
+        return [w * du * sc, w * dv * sc];
+      } });
     });
     // Apparent-size depth prior (log depth, so it is scale-free).
     if (hasSize) {
       for (let i = 0; i < allObs.length; i++) {
         if (!sizeActive[i]) continue;
-        const e = sizeResidual(p, i);
-        r.push(e == null ? P.sizeDepthWeight : P.sizeDepthWeight * e);
+        blocks.push({ params: segP(allObs[i].k), eval: (p) => {
+          const e = sizeResidual(p, i);
+          return [e == null ? P.sizeDepthWeight : P.sizeDepthWeight * e];
+        } });
       }
     }
-    // Soft priors on the knots, in "pixels per metre of violation". They only
-    // bite outside the plausible region, so they select among depths that fit
-    // the image equally well rather than fighting the observations.
-    const PRIOR = 20;
     for (let k = 0; k <= n; k++) {
-      const [x, y, z] = [p[3 * k], p[3 * k + 1], p[3 * k + 2]];
-      r.push(PRIOR * Math.max(0, KNOT_MIN_Y_M - y, freeKnots.has(k) ? 0 : y - P.knotMaxY));
-      r.push(PRIOR * Math.max(0, Math.abs(x) - RALLY_MAX_ABS_X_M));
-      r.push(PRIOR * Math.max(0, Math.abs(z) - RALLY_MAX_ABS_Z_M));
+      blocks.push({ params: knotP(k), eval: (p) => {
+        const [x, y, z] = [p[3 * k], p[3 * k + 1], p[3 * k + 2]];
+        return [
+          PRIOR * Math.max(0, KNOT_MIN_Y_M - y, freeKnots.has(k) ? 0 : y - P.knotMaxY),
+          PRIOR * Math.max(0, Math.abs(x) - RALLY_MAX_ABS_X_M),
+          PRIOR * Math.max(0, Math.abs(z) - RALLY_MAX_ABS_Z_M),
+        ];
+      } });
     }
     // Effective gravity stays within what spin and drag can produce.
     for (let k = 0; k < n; k++) {
       const lo = zones[k] ? zones[k]!.minG * GRAVITY : (P.accelMinG * GRAVITY);
       const hi = zones[k] ? zones[k]!.maxG * GRAVITY : (P.accelMaxG * GRAVITY);
-      r.push(PRIOR * Math.max(0, lo - p[GK + k], p[GK + k] - hi));
+      blocks.push({ params: [GK + k], eval: (p) => [PRIOR * Math.max(0, lo - p[GK + k], p[GK + k] - hi)] });
     }
     // Speed prior. Depth along the viewing ray is the weakly observed
     // direction, and without this the knots zig-zag in depth (z = 17, 5, 17...)
     // with segments flying at 50-160 m/s, which still projects onto the image
     // track. Nothing in volleyball moves faster than a hard jump serve.
     for (let k = 0; k < n; k++) {
-      // Fastest point of the arc is one of its ends.
-      const vEnd = Math.max(
-        Math.hypot(...segState(p, k, 0).vel),
-        Math.hypot(...segState(p, k, tau[k + 1] - tau[k]).vel),
-      );
-      r.push(PRIOR * Math.max(0, vEnd - P.softMaxSpeed));
+      blocks.push({ params: segP(k), eval: (p) => {
+        // Fastest point of the arc is one of its ends.
+        const vEnd = Math.max(
+          Math.hypot(...segState(p, k, 0).vel),
+          Math.hypot(...segState(p, k, tau[k + 1] - tau[k]).vel),
+        );
+        return [PRIOR * Math.max(0, vEnd - P.softMaxSpeed)];
+      } });
     }
     // Touch impulse prior. Measured on broadcast footage, the reprojection
     // error of a short (<0.4 s) segment changes by ~0.1 px across 30 m of
@@ -2009,17 +2222,21 @@ function solveRally(
     // well-determined neighbours instead of zig-zagging, while a real touch
     // (10-40 m/s of change) is still far cheaper than misfitting its samples.
     for (let k = 1; k < n; k++) {
-      const vIn = segState(p, k - 1, tau[k] - tau[k - 1]).vel;
-      const vOut = segState(p, k, 0).vel;
-      for (let c = 0; c < 3; c++) r.push(P.touchImpulseWeight * (vOut[c] - vIn[c]));
+      blocks.push({ params: [...knotP(k - 1), ...knotP(k), ...knotP(k + 1), GK + k - 1, GK + k], eval: (p) => {
+        const vIn = segState(p, k - 1, tau[k] - tau[k - 1]).vel;
+        const vOut = segState(p, k, 0).vel;
+        return [0, 1, 2].map((c) => P.touchImpulseWeight * (vOut[c] - vIn[c]));
+      } });
     }
     // Player anchors: pull each knot towards the nearest candidate toucher.
     for (let k = 0; k <= n; k++) {
       const cands = anchors[k] ?? [];
-      if (cands.length === 0) { r.push(0); continue; }
-      let d = Infinity;
-      for (const [ax, az] of cands) d = Math.min(d, Math.hypot(p[3 * k] - ax, p[3 * k + 2] - az));
-      r.push(P.anchorWeight * d / Math.sqrt(1 + (d / P.anchorRobustM) ** 2));
+      blocks.push({ params: knotP(k), eval: (p) => {
+        if (cands.length === 0) return [0];
+        let d = Infinity;
+        for (const [ax, az] of cands) d = Math.min(d, Math.hypot(p[3 * k] - ax, p[3 * k + 2] - az));
+        return [P.anchorWeight * d / Math.sqrt(1 + (d / P.anchorRobustM) ** 2)];
+      } });
     }
     // Touch points must project onto the ball. A touch often falls in a short
     // detection gap (the ball is hidden by the player playing it), and without
@@ -2027,31 +2244,46 @@ function solveRally(
     // that was a 0.4 m dip below the net tape, 50 px off the ball.
     for (let k = 0; k <= n; k++) {
       const target = freeKnots.has(k) ? null : knotTargets[k];
-      if (!target) { r.push(0, 0); continue; }
-      const [pu, pv] = project(p[3 * k], p[3 * k + 1], p[3 * k + 2]);
-      r.push(P.knotImageWeight * (pu - target[0]) * hw, P.knotImageWeight * (pv - target[1]) * hh);
+      blocks.push({ params: knotP(k), eval: (p) => {
+        if (!target) return [0, 0];
+        const [pu, pv] = project(p[3 * k], p[3 * k + 1], p[3 * k + 2]);
+        return [P.knotImageWeight * (pu - target[0]) * hw, P.knotImageWeight * (pv - target[1]) * hh];
+      } });
+    }
+    // Hand-placed positions.
+    for (let k = 0; k <= n; k++) {
+      const pin = pins[k];
+      if (!pin) continue;
+      blocks.push({ params: knotP(k), eval: (p) => [0, 1, 2].map((c) => PIN_WEIGHT * (p[3 * k + c] - pin[c])) });
     }
     // Rule zones: the side of the net and distance from it for known touches.
+    // A hand-placed touch is where it is, whatever the rules expect.
     for (let k = 0; k <= n; k++) {
-      const zone = zones[k];
-      if (!zone) { r.push(0, 0); continue; }
-      const into = zone.side * p[3 * k + 2];
-      const y = p[3 * k + 1];
-      r.push(PRIOR * Math.max(0, zone.minAbsZ - into, into - zone.maxAbsZ));
-      r.push(PRIOR * Math.max(0, zone.minY - y, y - zone.maxY));
+      const zone = pins[k] ? null : zones[k];
+      blocks.push({ params: knotP(k), eval: (p) => {
+        if (!zone) return [0, 0];
+        const into = zone.side * p[3 * k + 2];
+        const y = p[3 * k + 1];
+        return [
+          PRIOR * Math.max(0, zone.minAbsZ - into, into - zone.maxAbsZ),
+          PRIOR * Math.max(0, zone.minY - y, y - zone.maxY),
+        ];
+      } });
     }
     // Net: a segment crossing the net plane between the antennae must clear it.
     for (let k = 0; k < n; k++) {
-      const z0 = p[3 * k + 2], z1 = p[3 * k + 5];
-      let viol = 0;
-      if (z0 * z1 < 0) {
-        const tc = tau[k] + (z0 / (z0 - z1)) * (tau[k + 1] - tau[k]);
-        const [xc, yc] = segPos(p, k, tc);
-        if (Math.abs(xc) <= COURT_HALF_W + 0.5) viol = Math.max(0, NET_CLEAR_M - yc);
-      }
-      r.push(PRIOR * viol);
+      blocks.push({ params: segP(k), eval: (p) => {
+        const z0 = p[3 * k + 2], z1 = p[3 * k + 5];
+        let viol = 0;
+        if (z0 * z1 < 0) {
+          const tc = tau[k] + (z0 / (z0 - z1)) * (tau[k + 1] - tau[k]);
+          const [xc, yc] = segPos(p, k, tc);
+          if (Math.abs(xc) <= COURT_HALF_W + 0.5) viol = Math.max(0, NET_CLEAR_M - yc);
+        }
+        return [PRIOR * viol];
+      } });
     }
-    return r;
+    return blocks;
   };
 
   // Image position at each knot time, from the nearest sample.
@@ -2080,7 +2312,7 @@ function solveRally(
     return [p.x, p.y, p.z];
   }), ...new Array<number>(n).fill(GRAVITY)];
 
-  const cost = (p: number[]) => residuals(p).reduce((s, v) => s + v * v, 0);
+  const cost = (p: number[]) => _blockResiduals(residualBlocks(), p).reduce((s, v) => s + v * v, 0);
   let best: number[] | null = null;
   let bestCost = Infinity;
   // Anchored seed: each touch starts where its most likely player stands, on
@@ -2119,8 +2351,11 @@ function solveRally(
   const seeds = [0.5, 1.5, 2.5, 3.5].map(seedAtHeight);
   const anchored = anchoredSeed();
   if (anchored) seeds.push(anchored);
+  // Every seed starts the hand-placed knots where they were placed.
+  for (const seed of seeds) pins.forEach((pin, k) => { if (pin) seed.splice(3 * k, 3, ...pin); });
+  const blocks = residualBlocks();
   for (const seed of seeds) {
-    const sol = _levenbergMarquardt(seed, residuals);
+    const sol = _levenbergMarquardt(seed, blocks);
     const c = cost(sol);
     if (c < bestCost) { bestCost = c; best = sol; }
   }
@@ -2140,7 +2375,7 @@ function solveRally(
       if (e == null || Math.abs(e) > P.sizeDepthOutlier) { sizeActive[i] = false; anyOutlier = true; }
     }
   });
-  if (anyOutlier) sol = _levenbergMarquardt(sol, residuals);
+  if (anyOutlier) sol = _levenbergMarquardt(sol, residualBlocks());
   if (hasSize) {
     const used = sizeActive.filter(Boolean).length;
     console.log(`[physicsReproj] rally size-depth: ${used}/${allObs.length} sizes used`);
@@ -2983,10 +3218,17 @@ function _solveBallTrajectories(
         const fPx = vH / 2 / Math.tan((effectiveFovY * Math.PI) / 360);
         courtMetresPerPx = cam.position.distanceTo(centre) / fPx;
       }
-      const rawArcs = splitArcsEx(obsEx, vW, vH);
+      const touchPins = options?.touchEdits?.pins ?? [];
+      const { arcs: rawArcs, starts: markedTouches } = splitAtMarkedTouches(
+        splitArcsEx(obsEx, vW, vH),
+        [...(options?.touchEdits?.touchAt ?? []), ...touchPins.map((pin) => pin.frame)],
+      );
+      const removedTouches = options?.touchEdits?.noTouchAt ?? [];
       const buildArcs = (skip: Set<number>, joined?: number[], log?: TouchSplitDecision[]) => {
         const split = joinOffscreenFlights(rawArcs, skip, joined);
-        return { split, arcs: hasPlayers ? mergeUntouchedSplits(split, playersByFrame, cam, vW / 2, vH / 2, log) : split };
+        const keep = new Set([...skip, ...markedTouches]);
+        const merged = hasPlayers ? mergeUntouchedSplits(split, playersByFrame, cam, vW / 2, vH / 2, log, keep) : split;
+        return { split, arcs: mergeAtRemovedTouches(merged, removedTouches, markedTouches) };
       };
       // Volleyball rules and player anchors on top of the rally solver.
       // Knots that are the ball above the picture, not touches (see below).
@@ -3041,9 +3283,17 @@ function _solveBallTrajectories(
           : contacts[k]?.t ?? 0.5 * (rally[k - 1][rally[k - 1].length - 1].t + seg[0].t));
         const rules: { state?: RulesState } = {};
         const zones = hasPlayers ? applyRallyRules(anchors, free, knotT, resume, rules) : [];
+        // Hand-placed touches: knot k sits between the last sample before it
+        // and the first after (the first sample itself for the rally start).
+        const pins = rally.map((seg, k) => {
+          const lo = (k === 0 ? seg[0].fi : rally[k - 1][rally[k - 1].length - 1].fi) - EDIT_TOUCH_SNAP_FRAMES;
+          const hi = seg[0].fi + EDIT_TOUCH_SNAP_FRAMES;
+          return touchPins.find((pin) => pin.frame >= lo && pin.frame <= hi)?.pos ?? null;
+        });
+        pins.forEach((pin, k) => { if (pin && anchors.length > k) anchors[k] = [[pin[0], pin[2]]]; });
         return {
           anchors, zones, free, contacts, rules: rules.state ?? null,
-          results: solveRally(rally, cam, vW, vH, anchors, zones, imageAt, free, contacts),
+          results: solveRally(rally, cam, vW, vH, anchors, zones, imageAt, free, contacts, pins),
         };
       };
       // A flight joined across the top of the picture that the solver cannot
@@ -3186,20 +3436,19 @@ function _solveBallTrajectories(
             ` ${seg.accepted ? "ACCEPTED" : `REJECTED: ${seg.rejectReason}`}`,
           );
           // A rejected sliver between two touches (attack straight into the
-          // block: two touches in five frames) is drawn as a straight line
-          // between its touch points, so the path does not break there.
+          // block: two touches in five frames) is drawn along its solved arc
+          // between its touch points, so the path does not break there. Not a
+          // straight line: that drops the gravity sag the net-clearance term
+          // was applied to (pol_ita_r3: a fast serve drawn under the net tape).
           const segIdx = results.indexOf(seg);
           const bridge = !seg.accepted && seg.obs.length <= P.bridgeMaxFrames &&
             segIdx > 0 && segIdx < results.length - 1 &&
             results[segIdx - 1].accepted && results[segIdx + 1].accepted;
           if (bridge) {
-            const a = seg.posAt(seg.tStart), b = seg.posAt(seg.tEnd);
-            const T = Math.max(1e-6, seg.tEnd - seg.tStart);
             for (const fr of frames) {
               if (fr.timestamp < seg.tStart - 1e-6 || fr.timestamp > seg.tEnd + 1e-6) continue;
               if (positions.has(fr.frame)) continue;
-              const w = (fr.timestamp - seg.tStart) / T;
-              positions.set(fr.frame, [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w, a[2] + (b[2] - a[2]) * w]);
+              positions.set(fr.frame, seg.posAt(fr.timestamp));
               methods.set(fr.frame, "physics-reprojection");
             }
           }

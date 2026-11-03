@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { getBackend, type AnalysisMessage } from "../platform/backend";
 
 /** Identifies which reconstruction method produced a ball_3d_pos value. */
 export type BallReconstructionMethod =
@@ -126,6 +125,11 @@ export function useAnalysis() {
   const startTimeRef = useRef<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [analysisDurationMs, setAnalysisDurationMs] = useState<number | null>(null);
+  /** Stops listening to the current run's messages. */
+  const unlistenRef = useRef<(() => void) | null>(null);
+  const videoRef = useRef("");
+  /** Last time the received frames were pushed to the UI. */
+  const lastFramesPushRef = useRef(0);
 
   // Tick the elapsed clock while running
   useEffect(() => {
@@ -136,43 +140,39 @@ export function useAnalysis() {
     return () => window.clearInterval(id);
   }, [status]);
 
-  useEffect(() => {
-    const unlisteners: Promise<UnlistenFn>[] = [];
+  useEffect(() => () => unlistenRef.current?.(), []);
 
-    unlisteners.push(
-      listen<FrameData>("analysis-frame", (event) => {
-        framesRef.current.push(event.payload);
+  const handleMessage = useCallback((msg: AnalysisMessage) => {
+    switch (msg.action) {
+      case "frame": {
+        framesRef.current.push(msg);
         // Collect court corners from frame data if present
-        const payload = event.payload;
-        if (payload.court_corners) {
+        if (msg.court_corners) {
           courtDataRef.current.push({
-            frame: payload.frame,
-            timestamp: payload.timestamp,
-            corners: payload.court_corners,
-            keypoints: payload.court_keypoints,
+            frame: msg.frame,
+            timestamp: msg.timestamp,
+            corners: msg.court_corners,
+            keypoints: msg.court_keypoints,
           });
         }
-        // Batch UI updates — update every 50 frames to avoid rendering overhead
-        if (framesRef.current.length % 50 === 0) {
+        // A replayed match delivers thousands of frames at once; copying the
+        // array for each would be quadratic, so the UI catches up a few times a second.
+        const now = performance.now();
+        if (now - lastFramesPushRef.current > 250) {
+          lastFramesPushRef.current = now;
           setFrames([...framesRef.current]);
         }
-      })
-    );
-
-    unlisteners.push(
-      listen<ProgressData>("analysis-progress", (event) => {
-        setProgress(event.payload.percent);
-        setProgressMessage(event.payload.message);
-      })
-    );
-
-    unlisteners.push(
-      listen<AnalysisComplete>("analysis-complete", (event) => {
+        break;
+      }
+      case "progress":
+        setProgress(msg.percent);
+        setProgressMessage(msg.message);
+        break;
+      case "complete": {
         setFrames([...framesRef.current]);
         // Use court_data from complete message if available, otherwise use incrementally collected data
-        const cd = event.payload.court_data ?? courtDataRef.current;
-        setCourtData(cd);
-        setResult(event.payload);
+        setCourtData(msg.court_data ?? courtDataRef.current);
+        setResult(msg);
         setStatus("complete");
         setProgress(100);
         if (startTimeRef.current !== null) {
@@ -180,26 +180,28 @@ export function useAnalysis() {
           setElapsedMs(ms);
           setAnalysisDurationMs(ms);
           console.log(
-            `[analysis] ${event.payload.total_frames} frames in ${(ms / 1000).toFixed(1)}s` +
-            ` (${(event.payload.total_frames / (ms / 1000)).toFixed(1)} fps)`
+            `[analysis] ${msg.total_frames} frames in ${(ms / 1000).toFixed(1)}s` +
+            ` (${(msg.total_frames / (ms / 1000)).toFixed(1)} fps)`
           );
         }
-      })
-    );
-
-    unlisteners.push(
-      listen<{ message: string }>("analysis-error", (event) => {
-        setError(event.payload.message);
+        unlistenRef.current?.();
+        unlistenRef.current = null;
+        break;
+      }
+      case "error":
+        setError(msg.message);
         setStatus("error");
-      })
-    );
-
-    return () => {
-      unlisteners.forEach((p) => p.then((unlisten) => unlisten()));
-    };
+        unlistenRef.current?.();
+        unlistenRef.current = null;
+        break;
+    }
   }, []);
 
-  const startAnalysis = useCallback(async (videoPath: string) => {
+  /** Analyse a video, or open its finished analysis (server). `rerun` analyses it again. */
+  const startAnalysis = useCallback(async (videoPath: string, opts?: { rerun?: boolean }) => {
+    unlistenRef.current?.();
+    unlistenRef.current = null;
+    videoRef.current = videoPath;
     setStatus("running");
     setProgress(0);
     setProgressMessage("Starting...");
@@ -214,20 +216,38 @@ export function useAnalysis() {
     setAnalysisDurationMs(null);
 
     try {
-      await invoke("start_analysis", { videoPath });
+      const backend = await getBackend();
+      const unlisten = await backend.analyze(videoPath, handleMessage, opts);
+      // Another analysis may have started while this one was starting.
+      if (videoRef.current === videoPath) unlistenRef.current = unlisten;
+      else unlisten();
     } catch (e) {
       setError(String(e));
       setStatus("error");
     }
-  }, []);
+  }, [handleMessage]);
 
   const stopAnalysis = useCallback(async () => {
+    unlistenRef.current?.();
+    unlistenRef.current = null;
     try {
-      await invoke("stop_analysis");
+      await (await getBackend()).stopAnalysis(videoRef.current);
     } catch (e) {
       console.error("Failed to stop analysis:", e);
     }
     setStatus("idle");
+  }, []);
+
+  /** Back to the start screen. */
+  const reset = useCallback(() => {
+    unlistenRef.current?.();
+    unlistenRef.current = null;
+    videoRef.current = "";
+    setStatus("idle");
+    setFrames([]);
+    setResult(null);
+    setError(null);
+    setCourtData([]);
   }, []);
 
   return {
@@ -242,5 +262,6 @@ export function useAnalysis() {
     analysisDurationMs,
     startAnalysis,
     stopAnalysis,
+    reset,
   };
 }

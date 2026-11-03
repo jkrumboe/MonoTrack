@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { getBackend } from "../platform/backend";
 
 interface VideoPlayerProps {
   videoPath: string;
@@ -30,24 +30,26 @@ export default function VideoPlayer({
   const rafRef = useRef<number>(0);
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
 
-  // Fetch the video as a blob to avoid cross-origin canvas taint
+  // A playable URL for the video: a local file (desktop) or the server's copy.
   useEffect(() => {
     if (isDemo) return;
-    let revoke: string | null = null;
-    const assetUrl = convertFileSrc(videoPath);
-    fetch(assetUrl)
-      .then((r) => r.blob())
-      .then((blob) => {
-        const url = URL.createObjectURL(blob);
-        revoke = url;
-        setBlobUrl(url);
+    let cancelled = false;
+    let release: (() => void) | undefined;
+    getBackend()
+      .then((b) => b.videoSource(videoPath))
+      .then((src) => {
+        if (cancelled) {
+          src.release?.();
+          return;
+        }
+        release = src.release;
+        setBlobUrl(src.url);
       })
-      .catch(() => {
-        // Fallback to asset URL if blob fetch fails
-        setBlobUrl(assetUrl);
-      });
+      .catch((e) => console.error("[video] cannot load:", e));
     return () => {
-      if (revoke) URL.revokeObjectURL(revoke);
+      cancelled = true;
+      release?.();
+      setBlobUrl(null);
     };
   }, [videoPath, isDemo]);
 
@@ -179,6 +181,9 @@ export default function VideoPlayer({
         className="video-element"
         muted
         playsInline
+        // A server video may come from another origin (the phone app); without
+        // CORS mode, drawing its frames to a canvas would taint it.
+        crossOrigin={/^https?:/.test(blobUrl) ? "anonymous" : undefined}
         preload="auto"
         onLoadedMetadata={handleLoadedMetadata}
         onCanPlay={onCanPlay}

@@ -1,6 +1,4 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { open, save } from "@tauri-apps/plugin-dialog";
-import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { useAnalysis } from "./hooks/useAnalysis";
 import SkeletonViewer from "./components/SkeletonViewer";
@@ -15,11 +13,23 @@ import PlaybackControls from "./components/PlaybackControls";
 import PlayerTrackingOverlay from "./components/PlayerTrackingOverlay";
 import BallDebugView from "./components/BallDebugView";
 import DepthFilterView from "./components/DepthFilterView";
-import { solveBallTrajectories, type BallFrameDebug, type BallTouch, type PhysicsReprojectionDebug, type TrajectoryMode } from "./utils/ballReconstruction";
+import RallyInspector, { type SaveState } from "./components/RallyInspector";
+import { MatchPanel, TimelineBar } from "./components/MatchTimeline";
+import RecordView from "./components/RecordView";
+import MatchLibrary from "./components/MatchLibrary";
+import {
+  backendKind, canRecord, getBackend, inTauri, isMobileDevice, loadSettings, saveSettings, type Backend,
+} from "./platform/backend";
+import { buildMatchTimeline, nextRallyAfter, rallyAt, type Side } from "./utils/matchTimeline";
+import { type BallFrameDebug, type BallTouch, type PhysicsReprojectionDebug, type TouchSplitDecision, type TrajectoryMode } from "./utils/ballReconstruction";
+import {
+  applyBallEdits, applyTouchEdits, EMPTY_EDITS, loadEdits, saveEdits, touchEditsForSolver, type RallyEdits,
+} from "./utils/rallyEdits";
 import type { FrameData, BallReconstructionMethod } from "./hooks/useAnalysis";
+import type { SolverRequest, SolverResponse } from "./utils/solverWorker";
 import "./App.css";
 
-type ViewMode = "side-by-side" | "overlay";
+type ViewMode = "side-by-side" | "overlay" | "inspect";
 
 const COURT_KEYPOINTS_3D: [number, number, number][] = [
   [-4.5, 0, -9.0], // far-left corner
@@ -100,7 +110,8 @@ function saveCourtForMatch(videoPath: string, cal: CalibrationResult, aspect: nu
     const v = new THREE.Vector3(x, 0, z).project(cam);
     return [(v.x + 1) / 2, (1 - v.y) / 2];
   });
-  invoke("save_court", { videoPath, frame: refFrame, corners })
+  getBackend()
+    .then((b) => b.saveCourt(videoPath, refFrame, corners))
     .then((r) => console.log("[court] saved for this match:", r))
     .catch((e) => console.warn("[court] could not save court:", e));
 }
@@ -186,7 +197,27 @@ function App() {
     analysisDurationMs,
     startAnalysis,
     stopAnalysis,
+    reset: resetAnalysis,
   } = useAnalysis();
+
+  /** Where analysis runs: this machine (desktop app) or the analysis server (web, phone). */
+  const [backend, setBackend] = useState<Backend | null>(null);
+  const [settings, setSettings] = useState(loadSettings);
+  useEffect(() => {
+    let cancelled = false;
+    getBackend().then((b) => { if (!cancelled) setBackend(b); });
+    return () => { cancelled = true; };
+  }, [settings]);
+  const onServer = backendKind() === "server";
+  /** The record screen, the match library, or the analysis (default). */
+  const [screen, setScreen] = useState<"analysis" | "record" | "library">("analysis");
+  /** Upload in progress (0..1), before the analysis starts. */
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Touch kinds picked in the Match tab; all when empty. */
+  const [matchKinds, setMatchKinds] = useState<Set<string>>(new Set());
+  /** Playback jumps over the breaks between rallies. */
+  const [ralliesOnly, setRalliesOnly] = useState(false);
 
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -194,7 +225,7 @@ function App() {
   /** Surfaces failures from the file dialog, which otherwise fail silently. */
   const [openError, setOpenError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("side-by-side");
-  const [sidebarTab, setSidebarTab] = useState<"stats" | "court" | "ball-debug" | "depth">("stats");
+  const [sidebarTab, setSidebarTab] = useState<"match" | "stats" | "court" | "ball-debug" | "depth">("match");
   const [_videoDuration, setVideoDuration] = useState<number | null>(null);
   const [videoSize, setVideoSize] = useState<{ width: number; height: number }>({ width: 0, height: 0 });
   const [calibration, setCalibration] = useState<CalibrationResult | null>(null);
@@ -211,6 +242,10 @@ function App() {
   const [physicsDebug, setPhysicsDebug] = useState<PhysicsReprojectionDebug[] | undefined>(undefined);
   /** Player touches (serve, reception, set, ...) placed by the rally solver. */
   const [ballTouches, setBallTouches] = useState<BallTouch[]>([]);
+  /** The solver's touch split decisions (for the problems list). */
+  const [touchSplits, setTouchSplits] = useState<TouchSplitDecision[] | undefined>(undefined);
+  /** A solve is running in the worker. */
+  const [solving, setSolving] = useState(false);
   /** True when physics-reprojection mode ran but produced zero fitted arcs. */
   const [physicsFailedWarning, setPhysicsFailedWarning] = useState(false);
   // ── Solver option state ──────────────────────────────────────────────────
@@ -224,8 +259,20 @@ function App() {
   const [minBallConfidence, setMinBallConfidence] = useState(0.6);
   /** Manual 2D correction mode — clicking the video sets ball centre for current frame. */
   const [correctionMode, setCorrectionMode] = useState(false);
-  /** Map<frameIndex, [normX, normY]> — user-overridden ball centre positions. */
-  const [manualBallCorrections, setManualBallCorrections] = useState<Map<number, [number, number]>>(new Map());
+  /**
+   * Hand corrections for this video (ball positions, touches, dismissed
+   * problems), saved per video and applied on every analysis of it.
+   */
+  const [edits, setEdits] = useState<RallyEdits>(EMPTY_EDITS);
+  /** Edits for the current video were loaded, so changes from here on are the user's and get saved. */
+  const editsReadyRef = useRef(false);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  /** Ball-centre corrections as a map, for the Ball Debug tab's overlay. */
+  const manualBallCorrections = useMemo(
+    () => new Map(Object.entries(edits.ball).flatMap(([f, p]) => (p ? [[Number(f), p] as [number, [number, number]]] : []))),
+    [edits.ball],
+  );
   const [calibrationViewTransform, setCalibrationViewTransform] = useState({ zoom: 1, panX: 0, panY: 0 });
   const [overlayEl, setOverlayEl] = useState<HTMLDivElement | null>(null);
   const [splitVideoEl, setSplitVideoEl] = useState<HTMLDivElement | null>(null);
@@ -246,19 +293,14 @@ function App() {
     return videoSize.width / videoSize.height;
   }, [videoSize]);
 
-  /** Frames with manual ball-centre corrections applied (passed to the solver). */
-  const framesForSolver = useMemo(() => {
-    if (manualBallCorrections.size === 0) return frames;
-    return frames.map((f) => {
-      const corr = manualBallCorrections.get(f.frame);
-      return corr ? { ...f, ball_img_pos: corr } : f;
-    });
-  }, [frames, manualBallCorrections]);
+  /** Frames with the hand ball corrections applied (passed to the solver). */
+  const framesForSolver = useMemo(() => applyBallEdits(frames, edits.ball), [frames, edits.ball]);
+  const solverTouchEdits = useMemo(() => touchEditsForSolver(edits.touches, edits.pins), [edits.touches, edits.pins]);
 
   /**
    * After analysis completes and camera calibration is available, run the
    * physics-based ballistic trajectory solver over all detected ball frames.
-   * The solver is CPU-intensive so it runs in a timeout to avoid blocking the UI.
+   * The solver is CPU-intensive so it runs in a Web Worker, keeping the UI live.
    */
   const solverOptions = useMemo(() => ({
     useBallisticSolver:  false as const,
@@ -270,20 +312,29 @@ function App() {
     useCalibrationFov,
     manualFovYDeg,
     minBallConfidence,
-  }), [videoSize, minBallConfidence]);
+    touchEdits:          solverTouchEdits,
+  }), [videoSize, minBallConfidence, solverTouchEdits]);
 
   useEffect(() => {
     if (status !== "complete" || !calibration || !videoAspect || frames.length === 0) return;
-    const handle = setTimeout(() => {
-      const { positions, methods, stats, debugRecords, physicsDebug: pd, touches,
- } = solveBallTrajectories(
-        framesForSolver, calibration, videoAspect, solverOptions,
-      );
+    // One worker per solve: when the inputs change mid-solve (a manual ball
+    // correction, say) the stale solve is terminated rather than awaited.
+    const worker = new Worker(new URL("./utils/solverWorker.ts", import.meta.url), { type: "module" });
+    setSolving(true);
+    worker.onmessage = (e: MessageEvent<SolverResponse>) => {
+      worker.terminate();
+      setSolving(false);
+      if ("error" in e.data) {
+        console.error("[ballSolver] failed:", e.data.error);
+        return;
+      }
+      const { positions, methods, stats, debugRecords, physicsDebug: pd, touches, touchSplits: splits } = e.data.result;
       setBall3dMap(positions);
       setBall3dMethods(methods);
       setBall3dDebug(debugRecords);
       setPhysicsDebug(pd);
       setBallTouches(touches ?? []);
+      setTouchSplits(splits);
 
       // Warn when physics mode produced zero fitted arcs despite having detections.
       if (solverOptions.trajectoryMode === "physics-reprojection") {
@@ -318,9 +369,29 @@ function App() {
           );
         }
       }
-    }, 0);
-    return () => clearTimeout(handle);
+    };
+    worker.onerror = (e) => { setSolving(false); console.error("[ballSolver] worker error:", e.message); };
+    worker.postMessage({ id: 0, args: [framesForSolver, calibration, videoAspect, solverOptions] } satisfies SolverRequest);
+    return () => { worker.terminate(); setSolving(false); };
   }, [status, calibration, videoAspect, framesForSolver, solverOptions]);
+
+  /** The solver's touches with the hand touch corrections applied. */
+  const displayTouches = useMemo(
+    () => applyTouchEdits(ballTouches, edits, ball3dMap, result?.fps ?? 30),
+    [ballTouches, edits, ball3dMap, result?.fps],
+  );
+
+  /** Rallies, points and score, from the touches (see utils/matchTimeline). */
+  const timeline = useMemo(
+    () => buildMatchTimeline({
+      touches: displayTouches,
+      positions: ball3dMap,
+      fps: result?.fps ?? 30,
+      totalFrames: frames.length,
+      pointOverrides: edits.points,
+    }),
+    [displayTouches, ball3dMap, result?.fps, frames.length, edits.points],
+  );
 
   /** Frames augmented with physics-solver 3D positions and methods where available. */
   const solvedFrames = useMemo<FrameData[]>(() => {
@@ -523,9 +594,42 @@ function App() {
     setBall3dMap(new Map());
     setBall3dMethods(new Map());
     setBall3dDebug([]);
-    setManualBallCorrections(new Map());
+    setBallTouches([]);
+    setTouchSplits(undefined);
     setCorrectionMode(false);
   }, [videoPath]);
+
+  // Load this video's saved corrections. Until they are in, nothing is saved,
+  // so an empty start cannot overwrite them.
+  useEffect(() => {
+    editsReadyRef.current = false;
+    setEdits(EMPTY_EDITS);
+    setSaveState("idle");
+    if (!isRealVideo) return;
+    let cancelled = false;
+    loadEdits(videoPath)
+      .then((e) => { if (!cancelled) setEdits(e); })
+      .catch((err) => console.warn("[edits] could not load:", err))
+      .finally(() => { if (!cancelled) editsReadyRef.current = true; });
+    return () => { cancelled = true; };
+  }, [videoPath, isRealVideo]);
+
+  /** Change the edits; they are saved shortly after. */
+  const updateEdits = useCallback((change: (e: RallyEdits) => RallyEdits) => {
+    if (!editsReadyRef.current && isRealVideo) return;
+    setEdits((e) => change(e));
+    if (isRealVideo) setSaveState("saving");
+  }, [isRealVideo]);
+
+  useEffect(() => {
+    if (saveState !== "saving" || !isRealVideo) return;
+    const id = window.setTimeout(() => {
+      saveEdits(videoPath, edits)
+        .then(() => { setSaveState("saved"); setSaveError(null); })
+        .catch((err) => { setSaveState("error"); setSaveError(String(err)); });
+    }, 500);
+    return () => window.clearTimeout(id);
+  }, [edits, saveState, videoPath, isRealVideo]);
 
   // Wheel zoom on video pane (non-passive so we can preventDefault)
   useEffect(() => {
@@ -613,12 +717,8 @@ function App() {
     const nx = (clickX - offsetX) / displayW;
     const ny = (clickY - offsetY) / displayH;
     if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return; // clicked letterbox
-    setManualBallCorrections((prev) => {
-      const next = new Map(prev);
-      next.set(currentFrame, [nx, ny]);
-      return next;
-    });
-  }, [correctionMode, currentFrame]);
+    updateEdits((e) => ({ ...e, ball: { ...e.ball, [currentFrame]: [nx, ny] } }));
+  }, [correctionMode, currentFrame, updateEdits]);
 
   /** Calibration log: project court keypoints through camera and measure reprojection error. */
   const calibrationLog = useMemo(() => {
@@ -660,32 +760,70 @@ function App() {
     };
   }, [calibration, videoSize, useCalibrationFov, manualFovYDeg, currentCourtEntry]);
 
+  /** Open a video: pick a local file (desktop), or upload one to the analysis server. */
   const handleSelectVideo = useCallback(async () => {
     setOpenError(null);
+    if (onServer) {
+      fileInputRef.current?.click();
+      return;
+    }
     try {
-      const selected = await open({
-        multiple: false,
-        filters: [{ name: "Video", extensions: ["mp4", "avi", "mov", "mkv"] }],
-      });
-
+      const selected = await (await getBackend()).pickLocalVideo?.();
       if (selected) {
-        setVideoPath(selected as string);
-        startAnalysis(selected as string);
+        setScreen("analysis");
+        setVideoPath(selected);
+        startAnalysis(selected);
       }
     } catch (e) {
-      // The dialog plugin only exists inside the Tauri runtime. Opened in a
-      // plain browser (`npm run dev` alone) this rejects and the button would
-      // otherwise appear to do nothing at all.
       console.error("Failed to open video picker:", e);
-      const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-      setOpenError(
-        inTauri
-          ? `Could not open the file picker: ${String(e)}`
-          : "The file picker needs the desktop app. Start it with `npm run tauri dev` " +
-            "instead of opening the Vite URL in a browser."
-      );
+      setOpenError(`Could not open the file picker: ${String(e)}`);
+    }
+  }, [startAnalysis, onServer]);
+
+  const handleFileChosen = useCallback(async (file: File) => {
+    setOpenError(null);
+    setScreen("analysis");
+    setUploadProgress(0);
+    try {
+      const b = await getBackend();
+      if (!b.uploadVideo) throw new Error("This backend cannot upload videos.");
+      const video = await b.uploadVideo(file, { name: file.name, onProgress: setUploadProgress });
+      setVideoPath(video);
+      startAnalysis(video);
+    } catch (e) {
+      setOpenError(`Upload failed: ${String(e)}`);
+    } finally {
+      setUploadProgress(null);
     }
   }, [startAnalysis]);
+
+  /** Open a match from the server: replays its analysis, or follows one in progress. */
+  const openMatch = useCallback((video: string) => {
+    setOpenError(null);
+    setScreen("analysis");
+    setVideoPath(video);
+    startAnalysis(video);
+  }, [startAnalysis]);
+
+  const goHome = useCallback(() => {
+    if (status === "running" && !onServer) void stopAnalysis();
+    resetAnalysis();
+    setVideoPath("");
+    setScreen("analysis");
+  }, [status, onServer, stopAnalysis, resetAnalysis]);
+
+  const setPointWinner = useCallback((rallyStart: number, side: Side | null) => {
+    updateEdits((e) => {
+      const points = { ...(e.points ?? {}) };
+      if (side) points[rallyStart] = side;
+      else delete points[rallyStart];
+      return { ...e, points };
+    });
+  }, [updateEdits]);
+
+  const renameTeam = useCallback((side: Side, name: string) => {
+    updateEdits((e) => ({ ...e, teams: { ...(e.teams ?? {}), [side]: name } }));
+  }, [updateEdits]);
 
   const handleDemoMode = useCallback(() => {
     setVideoPath("demo.mp4");
@@ -752,6 +890,21 @@ function App() {
 
   const stopPlayback = useCallback(() => setIsPlaying(false), []);
 
+  // "Play rallies only": while playing, jump over the breaks between rallies.
+  useEffect(() => {
+    if (!ralliesOnly || !isPlaying || !isRealVideo || !result || timeline.rallies.length === 0) return;
+    if (rallyAt(timeline.rallies, currentFrame)) return;
+    const next = nextRallyAfter(timeline.rallies, currentFrame);
+    if (!next) {
+      setIsPlaying(false);
+      return;
+    }
+    // The video owns the clock while playing, so move the video itself.
+    const video = videoElRef.current;
+    if (video) video.currentTime = (next.clipStart + 0.5) / result.fps;
+    setCurrentFrame(next.clipStart);
+  }, [ralliesOnly, isPlaying, isRealVideo, result, timeline, currentFrame]);
+
   // Scrubbing or stepping always pauses, so the video doesn't fight the slider.
   // The slider can fire several input events per screen refresh; re-rendering
   // the whole app for each is wasted work, so apply at most one per frame.
@@ -813,50 +966,142 @@ function App() {
     <div className="app">
       <header className="app-header">
         <div className="app-header-left">
-          <h1>Volleyball 3D Analyzer</h1>
-
+          <h1 onClick={goHome} style={{ cursor: "pointer" }} title="Home">Volleyball Analyzer</h1>
+          {status === "complete" && timeline.rallies.length > 0 && screen === "analysis" && (
+            <span className="header-score" title="Score from the rallies found">
+              {timeline.score.near} – {timeline.score.far}
+            </span>
+          )}
         </div>
         <div className="header-actions">
-          {status === "idle" && (
+          {screen === "analysis" && status === "idle" && uploadProgress === null && (
             <>
               <button className="btn btn-primary" onClick={handleSelectVideo}>
-                Open Video
+                {onServer ? "Upload Video" : "Open Video"}
               </button>
               <button className="btn btn-secondary" onClick={handleDemoMode}>
                 Demo Mode
               </button>
             </>
           )}
-          {status === "running" && (
-            <button className="btn btn-danger" onClick={stopAnalysis}>
-              Stop Analysis
-            </button>
+          {status === "running" && screen === "analysis" && (
+            <>
+              {onServer && (
+                <button className="btn btn-secondary" onClick={goHome} title="The server carries on; open the match later from Matches">
+                  Leave Running
+                </button>
+              )}
+              <button className="btn btn-danger" onClick={stopAnalysis}>
+                Stop Analysis
+              </button>
+            </>
           )}
-          {(status === "complete" || status === "error") && (
-            <button className="btn btn-primary" onClick={handleSelectVideo}>
-              Analyze Another
-            </button>
+          {(status === "complete" || status === "error") && screen === "analysis" && (
+            <>
+              {onServer && videoPath.startsWith("job:") && (
+                <button className="btn btn-secondary" onClick={() => startAnalysis(videoPath, { rerun: true })}>
+                  Re-analyse
+                </button>
+              )}
+              <button className="btn btn-primary" onClick={goHome}>
+                Home
+              </button>
+            </>
           )}
         </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="video/*"
+          hidden
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = "";
+            if (f) void handleFileChosen(f);
+          }}
+        />
       </header>
 
       <main className="app-main">
-        {status === "idle" && (
+        {screen === "record" && (
+          <RecordView backend={backend} onUploaded={openMatch} onClose={() => setScreen("analysis")} />
+        )}
+
+        {screen === "library" && backend && (
+          <MatchLibrary backend={backend} onOpen={openMatch} onClose={() => setScreen("analysis")} />
+        )}
+
+        {screen === "analysis" && status === "idle" && uploadProgress === null && (
           <div className="welcome">
-            <div className="welcome-icon">�</div>
-            <h2>Welcome to Volleyball 3D Analyzer</h2>
+            <div className="welcome-icon">🏐</div>
+            <h2>Volleyball match analysis</h2>
             <p>
-              Open a volleyball match video to analyze player poses, ball
-              trajectory, and match statistics.
+              Record a match with a phone on a tripod, or upload a video. Every rally,
+              point and touch — serve, reception, set, attack, block, dig — lands on
+              a timeline you can jump through.
             </p>
+            <div className="welcome-actions">
+              {onServer && canRecord() && (
+                <button className="btn btn-primary btn-big" onClick={() => setScreen("record")}>
+                  ● Record a match
+                </button>
+              )}
+              <button className={`btn ${onServer && canRecord() ? "btn-secondary" : "btn-primary"} btn-big`} onClick={handleSelectVideo}>
+                {onServer ? "Upload a video" : "Open a video"}
+              </button>
+              {onServer && (
+                <button className="btn btn-secondary btn-big" onClick={() => setScreen("library")}>
+                  Matches
+                </button>
+              )}
+            </div>
             <p className="hint">
-              Or try <strong>Demo Mode</strong> to see sample data without a
-              video file.
+              Or try <strong>Demo Mode</strong> to see sample data without a video file.
             </p>
+            <details className="settings">
+              <summary>Analysis server</summary>
+              <label>
+                Server address
+                <input
+                  value={settings.serverUrl}
+                  placeholder="the server of this page"
+                  onChange={(e) => setSettings({ ...settings, serverUrl: e.target.value.trim() })}
+                />
+              </label>
+              <label>
+                Access token
+                <input
+                  type="password"
+                  value={settings.token}
+                  placeholder="none"
+                  onChange={(e) => setSettings({ ...settings, token: e.target.value.trim() })}
+                />
+              </label>
+              {inTauri() && !isMobileDevice() && (
+                <label className="match-toggle">
+                  <input
+                    type="checkbox"
+                    checked={settings.useServerOnDesktop}
+                    onChange={(e) => setSettings({ ...settings, useServerOnDesktop: e.target.checked })}
+                  />
+                  Analyse on the server instead of this computer
+                </label>
+              )}
+              <button className="btn btn-secondary" onClick={() => { saveSettings(settings); setSettings({ ...settings }); }}>
+                Save
+              </button>
+            </details>
           </div>
         )}
 
-        {status === "running" && (
+        {screen === "analysis" && uploadProgress !== null && (
+          <div className="analysis-running">
+            <h2>Uploading video...</h2>
+            <ProgressBar percent={Math.round(uploadProgress * 100)} message="Sending the video to the analysis server" />
+          </div>
+        )}
+
+        {screen === "analysis" && status === "running" && (
           <div className="analysis-running">
             <h2>Analyzing Video...</h2>
             <ProgressBar percent={progress} message={progressMessage} elapsedMs={elapsedMs} />
@@ -865,21 +1110,21 @@ function App() {
           </div>
         )}
 
-        {openError && (
+        {screen === "analysis" && openError && (
           <div className="error-panel">
             <h2>Cannot Open Video</h2>
             <p className="error-message">{openError}</p>
           </div>
         )}
 
-        {status === "error" && (
+        {screen === "analysis" && status === "error" && (
           <div className="error-panel">
             <h2>Analysis Error</h2>
             <p className="error-message">{error}</p>
           </div>
         )}
 
-        {status === "complete" && result && (
+        {screen === "analysis" && status === "complete" && result && (
           <div className="results-layout">
             <div className="viewer-panel">
               <div className="view-toolbar">
@@ -895,7 +1140,14 @@ function App() {
                 >
                   Overlay
                 </button>
-                {isRealVideo && (status === "complete") && (
+                <button
+                  className={`view-btn ${viewMode === "inspect" ? "active" : ""}`}
+                  onClick={() => { setViewMode("inspect"); setShowCalibration(false); }}
+                  title="Check the rally and correct the ball path and touches"
+                >
+                  Inspect &amp; Edit
+                </button>
+                {isRealVideo && (status === "complete") && viewMode !== "inspect" && (
                   <button
                     className={`view-btn ${showCalibration ? "active" : ""}`}
                     onClick={() => setShowCalibration((v) => !v)}
@@ -1009,7 +1261,7 @@ function App() {
                       isRealVideo={isRealVideo}
                       resetViewTrigger={resetViewTrigger}
                       trajectoryMode={trajectoryMode}
-                      touches={ballTouches}
+                      touches={displayTouches}
                     />
                     <button
                       className="reset-view-btn"
@@ -1020,6 +1272,43 @@ function App() {
                     </button>
                   </div>
                 </div>
+              )}
+
+              {viewMode === "inspect" && (
+                <RallyInspector
+                  frames={framesForSolver}
+                  fps={result.fps}
+                  videoSize={videoSize}
+                  calibration={calibration}
+                  positions={ball3dMap}
+                  physicsDebug={physicsDebug}
+                  touchSplits={touchSplits}
+                  touches={displayTouches}
+                  // A hand-aligned court is checked by eye; its error against
+                  // the detected keypoints says nothing.
+                  courtErrPx={manualCalibrationLocked ? null : calibrationLog?.maxKpErr ?? null}
+                  edits={edits}
+                  onEdit={updateEdits}
+                  currentFrame={currentFrame}
+                  onSeek={seekToFrame}
+                  solving={solving}
+                  saveState={saveState}
+                  saveError={saveError}
+                  onAlignCourt={() => { setViewMode("side-by-side"); setShowCalibration(true); }}
+                  video={
+                    <VideoPlayer
+                      videoPath={videoPath}
+                      currentFrame={currentFrame}
+                      fps={result.fps}
+                      isPlaying={isPlaying}
+                      onTimeUpdate={handleVideoTimeUpdate}
+                      onMetadataLoaded={handleMetadataLoaded}
+                      onVideoElement={handleVideoElement}
+                      onCanPlay={handleCanPlay}
+                      onPlaybackStopped={stopPlayback}
+                    />
+                  }
+                />
               )}
 
               {viewMode === "overlay" && (
@@ -1048,7 +1337,7 @@ function App() {
                       isRealVideo={isRealVideo}
                       overlayVideoAspect={videoAspect}
                       trajectoryMode={trajectoryMode}
-                      touches={ballTouches}
+                      touches={displayTouches}
                     />
                   </div>
                   {currentKeypoints && (
@@ -1079,9 +1368,22 @@ function App() {
                 onFrameChange={seekToFrame}
                 onTogglePlay={togglePlay}
               />
+              {viewMode !== "inspect" && timeline.rallies.length > 0 && (
+                <TimelineBar
+                  timeline={timeline}
+                  totalFrames={frames.length}
+                  currentFrame={currentFrame}
+                  kinds={matchKinds}
+                  onSeek={seekToFrame}
+                />
+              )}
             </div>
-            <div className="sidebar">
+            {viewMode !== "inspect" && <div className="sidebar">
               <div className="sidebar-tabs">
+                <button
+                  className={`sidebar-tab ${sidebarTab === "match" ? "active" : ""}`}
+                  onClick={() => setSidebarTab("match")}
+                >Match</button>
                 <button
                   className={`sidebar-tab ${sidebarTab === "stats" ? "active" : ""}`}
                   onClick={() => setSidebarTab("stats")}
@@ -1100,6 +1402,27 @@ function App() {
                 >Depth</button>
               </div>
 
+              {sidebarTab === "match" && (
+                <MatchPanel
+                  timeline={timeline}
+                  fps={result.fps}
+                  currentFrame={currentFrame}
+                  teams={edits.teams}
+                  kinds={matchKinds}
+                  onKindsChange={setMatchKinds}
+                  ralliesOnly={ralliesOnly}
+                  onRalliesOnlyChange={setRalliesOnly}
+                  onSeek={seekToFrame}
+                  onSetWinner={setPointWinner}
+                  onRenameTeam={renameTeam}
+                  pending={
+                    !isRealVideo ? "Demo mode has no rallies."
+                      : !calibration ? "Align the court (Align Court) to find rallies and points."
+                      : solving ? "Solving the ball path…"
+                      : null
+                  }
+                />
+              )}
               {sidebarTab === "stats" && <StatsDisplay result={result} />}
               {sidebarTab === "court" && (
                 <CourtMapView
@@ -1155,18 +1478,16 @@ function App() {
                         <button
                           className="btn btn-secondary"
                           style={{ fontSize: 11, padding: "2px 6px" }}
-                          onClick={() => {
-                            setManualBallCorrections((prev) => {
-                              const next = new Map(prev);
-                              next.delete(currentFrame);
-                              return next;
-                            });
-                          }}
+                          onClick={() => updateEdits((e) => {
+                            const ball = { ...e.ball };
+                            delete ball[currentFrame];
+                            return { ...e, ball };
+                          })}
                         >Clear this frame</button>
                         <button
                           className="btn btn-secondary"
                           style={{ fontSize: 11, padding: "2px 6px" }}
-                          onClick={() => setManualBallCorrections(new Map())}
+                          onClick={() => updateEdits((e) => ({ ...e, ball: {} }))}
                         >Clear all</button>
                       </div>
                     )}
@@ -1266,10 +1587,7 @@ function App() {
                             arcs: physicsDebug ?? [],
                           };
                           const json = JSON.stringify(report, null, 2);
-                          void save({
-                            defaultPath: "ball_debug_report.json",
-                            filters: [{ name: "JSON", extensions: ["json"] }],
-                          }).then((path) => path ? invoke("write_text_file", { path, content: json }) : undefined);
+                          void getBackend().then((b) => b.saveTextFile("ball_debug_report.json", json));
                         }}
                       >
                         Export Debug Report ({ball3dMap.size} solved / {ball3dDebug.length} records)
@@ -1284,9 +1602,10 @@ function App() {
                   calibration={calibration}
                   currentFrame={currentFrame}
                   videoAspect={videoAspect}
+                  frameMapping={frameMapping}
                 />
               )}
-            </div>
+            </div>}
           </div>
         )}
       </main>

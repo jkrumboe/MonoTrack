@@ -7,6 +7,17 @@ interface DepthFilterViewProps {
   calibration?: CalibrationResult | null;
   currentFrame: number;
   videoAspect?: number;
+  /**
+   * Pan/zoom camera: maps between the shown frame and the reference frame the
+   * calibration belongs to, in video-normalised [0,1] coords. Null = static.
+   */
+  frameMapping?: FrameMapping | null;
+}
+
+type Pt = { x: number; y: number };
+interface FrameMapping {
+  toReference: (p: Pt) => Pt;
+  fromReference: (p: Pt) => Pt;
 }
 
 const COURT_HALF_W = 4.5;
@@ -52,15 +63,20 @@ function projectToCanvas(
   cam: THREE.PerspectiveCamera,
   CW: number,
   CH: number,
+  mapping?: FrameMapping | null,
 ): [number, number] {
   const p = pt3d.clone().project(cam);
-  return [((p.x + 1) / 2) * CW, ((1 - p.y) / 2) * CH];
+  let n = { x: (p.x + 1) / 2, y: (1 - p.y) / 2 };
+  // The camera projects into the reference frame; carry that into this one.
+  if (mapping) n = mapping.fromReference(n);
+  return [n.x * CW, n.y * CH];
 }
 
 interface DepthOverlayOptions {
   zMin: number;
   zMax: number;
   overlayAlpha: number;
+  mapping?: FrameMapping | null;
 }
 
 function drawDepthOverlay(
@@ -71,13 +87,16 @@ function drawDepthOverlay(
   CH: number,
   opts: DepthOverlayOptions,
 ): void {
-  const { zMin, zMax, overlayAlpha } = opts;
+  const { zMin, zMax, overlayAlpha, mapping } = opts;
   const target = new THREE.Vector3();
   ctx.save();
   for (let py = 0; py < CH; py += GRID_RES) {
     for (let px = 0; px < CW; px += GRID_RES) {
-      const ndcX = ((px + GRID_RES * 0.5) / CW) * 2 - 1;
-      const ndcY = 1 - ((py + GRID_RES * 0.5) / CH) * 2;
+      // This frame's pixel, moved to where it sits in the reference frame.
+      let n = { x: (px + GRID_RES * 0.5) / CW, y: (py + GRID_RES * 0.5) / CH };
+      if (mapping) n = mapping.toReference(n);
+      const ndcX = n.x * 2 - 1;
+      const ndcY = 1 - n.y * 2;
 
       const origin = cam.position.clone();
       const wp = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(cam);
@@ -102,11 +121,13 @@ function drawCourtLines(
   cam: THREE.PerspectiveCamera,
   CW: number,
   CH: number,
+  mapping?: FrameMapping | null,
 ): void {
   ctx.save();
   for (const [a, b] of COURT_LINES_3D) {
-    const [ax, ay] = projectToCanvas(new THREE.Vector3(...a), cam, CW, CH);
-    const [bx, by] = projectToCanvas(new THREE.Vector3(...b), cam, CW, CH);
+    // A homography keeps lines straight, so mapping the endpoints is enough.
+    const [ax, ay] = projectToCanvas(new THREE.Vector3(...a), cam, CW, CH, mapping);
+    const [bx, by] = projectToCanvas(new THREE.Vector3(...b), cam, CW, CH, mapping);
     const isNet = a[2] === 0 && b[2] === 0;
     ctx.strokeStyle = isNet ? "rgba(200,200,255,0.9)" : "rgba(255,255,255,0.75)";
     ctx.lineWidth = isNet ? 2 : 1.5;
@@ -127,11 +148,12 @@ function drawDepthRangeMarkers(
   CH: number,
   zMin: number,
   zMax: number,
+  mapping?: FrameMapping | null,
 ): void {
   ctx.save();
   for (const [zVal, colour] of [[zMin, "#00e5ff"], [zMax, "#ff6d00"]] as [number, string][]) {
-    const [lx, ly] = projectToCanvas(new THREE.Vector3(-COURT_HALF_W, 0, zVal), cam, CW, CH);
-    const [rx, ry] = projectToCanvas(new THREE.Vector3( COURT_HALF_W, 0, zVal), cam, CW, CH);
+    const [lx, ly] = projectToCanvas(new THREE.Vector3(-COURT_HALF_W, 0, zVal), cam, CW, CH, mapping);
+    const [rx, ry] = projectToCanvas(new THREE.Vector3( COURT_HALF_W, 0, zVal), cam, CW, CH, mapping);
     ctx.strokeStyle = colour;
     ctx.lineWidth = 2;
     ctx.setLineDash([6, 4]);
@@ -149,6 +171,7 @@ export default function DepthFilterView({
   calibration,
   currentFrame,
   videoAspect,
+  frameMapping,
 }: Readonly<DepthFilterViewProps>) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -189,10 +212,10 @@ export default function DepthFilterView({
     const cam = buildCamera(calibration, aspect);
     const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
-    drawDepthOverlay(ctx, cam, groundPlane, CW, CH, { zMin, zMax, overlayAlpha });
-    drawCourtLines(ctx, cam, CW, CH);
-    drawDepthRangeMarkers(ctx, cam, CW, CH, zMin, zMax);
-  }, [videoEl, calibration, currentFrame, videoAspect, zMin, zMax, overlayAlpha]);
+    drawDepthOverlay(ctx, cam, groundPlane, CW, CH, { zMin, zMax, overlayAlpha, mapping: frameMapping });
+    drawCourtLines(ctx, cam, CW, CH, frameMapping);
+    drawDepthRangeMarkers(ctx, cam, CW, CH, zMin, zMax, frameMapping);
+  }, [videoEl, calibration, currentFrame, videoAspect, zMin, zMax, overlayAlpha, frameMapping]);
 
   return (
     <div className="depth-filter-view">

@@ -225,19 +225,23 @@ function decomposeP(P: number[][], imgH: number): {
 // Nelder-Mead refinement
 // ---------------------------------------------------------------------------
 
-function projectPoint(
-  worldPt: THREE.Vector3,
+/** Camera for a parameter set; built once per cost evaluation, not per point. */
+function makeCamera(
   camPos: THREE.Vector3,
   lookAt: THREE.Vector3,
   fov: number,
   aspect: number
-): { x: number; y: number } | null {
+): THREE.PerspectiveCamera {
   const cam = new THREE.PerspectiveCamera(fov, aspect, 0.1, 500);
   cam.position.copy(camPos);
   cam.lookAt(lookAt);
   cam.updateMatrixWorld();
   cam.updateProjectionMatrix();
-  const v = worldPt.clone().project(cam);
+  return cam;
+}
+
+function projectPoint(worldPt: THREE.Vector3, cam: THREE.PerspectiveCamera): { x: number; y: number } | null {
+  const v = worldPt.project(cam);
   if (v.z > 1) return null;
   return { x: v.x, y: v.y };
 }
@@ -264,10 +268,12 @@ function reprojectionError(
   const camPos = new THREE.Vector3(cx, cy, cz);
   const lookAt = new THREE.Vector3(lx, ly, lz);
 
+  const cam = makeCamera(camPos, lookAt, fov, aspect);
+  const v = new THREE.Vector3();
   let totalErr = 0;
   for (let i = 0; i < worldPoints.length; i++) {
     const w = worldPoints[i];
-    const proj = projectPoint(new THREE.Vector3(w.x, w.y, w.z), camPos, lookAt, fov, aspect);
+    const proj = projectPoint(v.set(w.x, w.y, w.z), cam);
     if (!proj) return 1e9;
     const dx = proj.x - targetNDC[i].x;
     const dy = proj.y - targetNDC[i].y;
