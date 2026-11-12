@@ -3,22 +3,23 @@ import * as THREE from "three";
 import { useAnalysis } from "./hooks/useAnalysis";
 import SkeletonViewer from "./components/SkeletonViewer";
 import VideoPlayer from "./components/VideoPlayer";
-import { type CalibrationResult, solveCameraIterative } from "./utils/cameraSolver";
+import { aimCamera, type CalibrationResult, solveCameraIterative } from "./utils/cameraSolver";
 import CourtKeypointOverlay from "./components/CourtKeypointOverlay";
 import CourtCalibration from "./components/CourtCalibration";
 import CourtMapView from "./components/CourtMapView";
-import ProgressBar, { formatDuration } from "./components/ProgressBar";
+import ProgressBar from "./components/ProgressBar";
 import StatsDisplay from "./components/StatsDisplay";
 import PlaybackControls from "./components/PlaybackControls";
 import PlayerTrackingOverlay from "./components/PlayerTrackingOverlay";
 import BallDebugView from "./components/BallDebugView";
 import DepthFilterView from "./components/DepthFilterView";
 import RallyInspector, { type SaveState } from "./components/RallyInspector";
-import { MatchPanel, TimelineBar } from "./components/MatchTimeline";
+import { MatchPanel, Scoreboard } from "./components/MatchTimeline";
 import RecordView from "./components/RecordView";
-import MatchLibrary from "./components/MatchLibrary";
+import HomeScreen from "./components/HomeScreen";
+import { BrandMark, IconAlert, IconCheck, IconClose, IconEdit, IconLayers, IconRefresh, IconSplit, IconTarget } from "./components/Icons";
 import {
-  backendKind, canRecord, getBackend, inTauri, isMobileDevice, loadSettings, saveSettings, type Backend,
+  backendKind, canRecord, getBackend, loadSettings, type Backend,
 } from "./platform/backend";
 import { buildMatchTimeline, nextRallyAfter, rallyAt, type Side } from "./utils/matchTimeline";
 import { type BallFrameDebug, type BallTouch, type PhysicsReprojectionDebug, type TouchSplitDecision, type TrajectoryMode } from "./utils/ballReconstruction";
@@ -30,6 +31,10 @@ import type { SolverRequest, SolverResponse } from "./utils/solverWorker";
 import "./App.css";
 
 type ViewMode = "side-by-side" | "overlay" | "inspect";
+
+/** Width of the video pane in the side-by-side view, as a share of the stage. */
+const DEFAULT_SPLIT_PCT = 56;
+const MIN_SPLIT_PCT = 25;
 
 const COURT_KEYPOINTS_3D: [number, number, number][] = [
   [-4.5, 0, -9.0], // far-left corner
@@ -58,8 +63,7 @@ function projectKeypointsFromCalibration(
 
   const videoAR = vw / vh;
   const cam = new THREE.PerspectiveCamera(calibration.fov, videoAR, 0.1, 500);
-  cam.position.set(...calibration.position);
-  cam.lookAt(new THREE.Vector3(...calibration.lookAt));
+  aimCamera(cam, calibration);
   cam.updateMatrixWorld();
   cam.updateProjectionMatrix();
 
@@ -102,8 +106,7 @@ function referenceMapping(
  */
 function saveCourtForMatch(videoPath: string, cal: CalibrationResult, aspect: number, refFrame: number) {
   const cam = new THREE.PerspectiveCamera(cal.fov, aspect, 0.1, 500);
-  cam.position.set(...cal.position);
-  cam.lookAt(new THREE.Vector3(...cal.lookAt));
+  aimCamera(cam, cal);
   cam.updateMatrixWorld();
   cam.updateProjectionMatrix();
   const corners = [[-4.5, -9], [4.5, -9], [4.5, 9], [-4.5, 9]].map(([x, z]) => {
@@ -209,8 +212,8 @@ function App() {
     return () => { cancelled = true; };
   }, [settings]);
   const onServer = backendKind() === "server";
-  /** The record screen, the match library, or the analysis (default). */
-  const [screen, setScreen] = useState<"analysis" | "record" | "library">("analysis");
+  /** The record screen, or the analysis (default; the start screen until a video is open). */
+  const [screen, setScreen] = useState<"analysis" | "record">("analysis");
   /** Upload in progress (0..1), before the analysis starts. */
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -222,6 +225,9 @@ function App() {
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [videoPath, setVideoPath] = useState("");
+  /** The match's name when it is known; a server video's reference does not tell it. */
+  const [matchName, setMatchName] = useState("");
+  const [splitPct, setSplitPct] = useState(DEFAULT_SPLIT_PCT);
   /** Surfaces failures from the file dialog, which otherwise fail silently. */
   const [openError, setOpenError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("side-by-side");
@@ -338,7 +344,7 @@ function App() {
 
       // Warn when physics mode produced zero fitted arcs despite having detections.
       if (solverOptions.trajectoryMode === "physics-reprojection") {
-        setPhysicsFailedWarning(positions.size === 0 && stats.detectedFrames > 0);
+        setPhysicsFailedWarning(![...methods.values()].includes("physics-reprojection") && stats.detectedFrames > 0);
       } else {
         setPhysicsFailedWarning(false);
       }
@@ -359,7 +365,7 @@ function App() {
 
       // Hard assertion: in physics mode every exported position must be physics-fitted.
       if (solverOptions.trajectoryMode === "physics-reprojection" && methods.size > 0) {
-        const nonPhysics = [...methods.values()].filter((m) => m !== "physics-reprojection");
+        const nonPhysics = [...methods.values()].filter((m) => m !== "physics-reprojection" && m !== "estimated");
         if (nonPhysics.length > 0) {
           console.error(
             "BUG: physics mode exported non-physics trajectory —",
@@ -381,16 +387,22 @@ function App() {
     [ballTouches, edits, ball3dMap, result?.fps],
   );
 
+  /** Positions the solver fitted, without the estimates that keep the line going. */
+  const fittedBall3dMap = useMemo(
+    () => new Map([...ball3dMap].filter(([f]) => ball3dMethods.get(f) !== "estimated")),
+    [ball3dMap, ball3dMethods],
+  );
+
   /** Rallies, points and score, from the touches (see utils/matchTimeline). */
   const timeline = useMemo(
     () => buildMatchTimeline({
       touches: displayTouches,
-      positions: ball3dMap,
+      positions: fittedBall3dMap,
       fps: result?.fps ?? 30,
       totalFrames: frames.length,
       pointOverrides: edits.points,
     }),
-    [displayTouches, ball3dMap, result?.fps, frames.length, edits.points],
+    [displayTouches, fittedBall3dMap, result?.fps, frames.length, edits.points],
   );
 
   /** Frames augmented with physics-solver 3D positions and methods where available. */
@@ -728,8 +740,7 @@ function App() {
     const vh = videoSize.height;
     const aspect = vw / vh;
     const cam = new THREE.PerspectiveCamera(effectiveFovY, aspect, 0.1, 500);
-    cam.position.set(...calibration.position);
-    cam.lookAt(new THREE.Vector3(...calibration.lookAt));
+    aimCamera(cam, calibration);
     cam.updateMatrixWorld();
     cam.updateProjectionMatrix();
 
@@ -783,6 +794,7 @@ function App() {
   const handleFileChosen = useCallback(async (file: File) => {
     setOpenError(null);
     setScreen("analysis");
+    setMatchName(file.name);
     setUploadProgress(0);
     try {
       const b = await getBackend();
@@ -792,14 +804,16 @@ function App() {
       startAnalysis(video);
     } catch (e) {
       setOpenError(`Upload failed: ${String(e)}`);
+      setMatchName("");
     } finally {
       setUploadProgress(null);
     }
   }, [startAnalysis]);
 
   /** Open a match from the server: replays its analysis, or follows one in progress. */
-  const openMatch = useCallback((video: string) => {
+  const openMatch = useCallback((video: string, name = "") => {
     setOpenError(null);
+    setMatchName(name);
     setScreen("analysis");
     setVideoPath(video);
     startAnalysis(video);
@@ -809,6 +823,8 @@ function App() {
     if (status === "running" && !onServer) void stopAnalysis();
     resetAnalysis();
     setVideoPath("");
+    setMatchName("");
+    setOpenError(null);
     setScreen("analysis");
   }, [status, onServer, stopAnalysis, resetAnalysis]);
 
@@ -962,51 +978,36 @@ function App() {
     return undefined;
   }, [showCalibration, calibrationViewTransform, videoZoomTransform]);
 
+  const matchTitle = matchName
+    || (videoPath === "demo.mp4" ? "Demo data" : videoPath && !videoPath.startsWith("job:") ? videoPath.split(/[\\/]/).pop() ?? "" : videoPath ? "Match" : "");
+  const inMatch = screen === "analysis" && status === "complete" && !!result;
+  const diagnosticsTab = sidebarTab === "ball-debug" || sidebarTab === "depth";
+
   return (
     <div className="app">
       <header className="app-header">
         <div className="app-header-left">
-          <h1 onClick={goHome} style={{ cursor: "pointer" }} title="Home">Volleyball Analyzer</h1>
-          {status === "complete" && timeline.rallies.length > 0 && screen === "analysis" && (
-            <span className="header-score" title="Score from the rallies found">
-              {timeline.score.near} – {timeline.score.far}
-            </span>
+          <button className={`brand ${matchTitle ? "has-match" : ""}`} onClick={goHome} title="Home">
+            <BrandMark />
+            <span className="brand-name">Volleyball Analyzer</span>
+          </button>
+          {matchTitle && screen === "analysis" && (
+            <>
+              <span className="crumb-sep" aria-hidden>/</span>
+              <span className="crumb" title={matchTitle}>{matchTitle}</span>
+            </>
           )}
         </div>
         <div className="header-actions">
-          {screen === "analysis" && status === "idle" && uploadProgress === null && (
-            <>
-              <button className="btn btn-primary" onClick={handleSelectVideo}>
-                {onServer ? "Upload Video" : "Open Video"}
-              </button>
-              <button className="btn btn-secondary" onClick={handleDemoMode}>
-                Demo Mode
-              </button>
-            </>
+          {status === "complete" && screen === "analysis" && onServer && videoPath.startsWith("job:") && (
+            <button className="btn btn-ghost" onClick={() => startAnalysis(videoPath, { rerun: true })}>
+              <IconRefresh size={14} /><span className="btn-label">Re-analyse</span>
+            </button>
           )}
-          {status === "running" && screen === "analysis" && (
-            <>
-              {onServer && (
-                <button className="btn btn-secondary" onClick={goHome} title="The server carries on; open the match later from Matches">
-                  Leave Running
-                </button>
-              )}
-              <button className="btn btn-danger" onClick={stopAnalysis}>
-                Stop Analysis
-              </button>
-            </>
-          )}
-          {(status === "complete" || status === "error") && screen === "analysis" && (
-            <>
-              {onServer && videoPath.startsWith("job:") && (
-                <button className="btn btn-secondary" onClick={() => startAnalysis(videoPath, { rerun: true })}>
-                  Re-analyse
-                </button>
-              )}
-              <button className="btn btn-primary" onClick={goHome}>
-                Home
-              </button>
-            </>
+          {inMatch && (
+            <button className="btn btn-secondary" onClick={goHome} title="Close this match and go back to the start">
+              <IconClose size={14} /><span className="btn-label">Close match</span>
+            </button>
           )}
         </div>
         <input
@@ -1027,100 +1028,55 @@ function App() {
           <RecordView backend={backend} onUploaded={openMatch} onClose={() => setScreen("analysis")} />
         )}
 
-        {screen === "library" && backend && (
-          <MatchLibrary backend={backend} onOpen={openMatch} onClose={() => setScreen("analysis")} />
-        )}
-
         {screen === "analysis" && status === "idle" && uploadProgress === null && (
-          <div className="welcome">
-            <div className="welcome-icon">🏐</div>
-            <h2>Volleyball match analysis</h2>
-            <p>
-              Record a match with a phone on a tripod, or upload a video. Every rally,
-              point and touch — serve, reception, set, attack, block, dig — lands on
-              a timeline you can jump through.
-            </p>
-            <div className="welcome-actions">
-              {onServer && canRecord() && (
-                <button className="btn btn-primary btn-big" onClick={() => setScreen("record")}>
-                  ● Record a match
-                </button>
-              )}
-              <button className={`btn ${onServer && canRecord() ? "btn-secondary" : "btn-primary"} btn-big`} onClick={handleSelectVideo}>
-                {onServer ? "Upload a video" : "Open a video"}
-              </button>
-              {onServer && (
-                <button className="btn btn-secondary btn-big" onClick={() => setScreen("library")}>
-                  Matches
-                </button>
-              )}
-            </div>
-            <p className="hint">
-              Or try <strong>Demo Mode</strong> to see sample data without a video file.
-            </p>
-            <details className="settings">
-              <summary>Analysis server</summary>
-              <label>
-                Server address
-                <input
-                  value={settings.serverUrl}
-                  placeholder="the server of this page"
-                  onChange={(e) => setSettings({ ...settings, serverUrl: e.target.value.trim() })}
-                />
-              </label>
-              <label>
-                Access token
-                <input
-                  type="password"
-                  value={settings.token}
-                  placeholder="none"
-                  onChange={(e) => setSettings({ ...settings, token: e.target.value.trim() })}
-                />
-              </label>
-              {inTauri() && !isMobileDevice() && (
-                <label className="match-toggle">
-                  <input
-                    type="checkbox"
-                    checked={settings.useServerOnDesktop}
-                    onChange={(e) => setSettings({ ...settings, useServerOnDesktop: e.target.checked })}
-                  />
-                  Analyse on the server instead of this computer
-                </label>
-              )}
-              <button className="btn btn-secondary" onClick={() => { saveSettings(settings); setSettings({ ...settings }); }}>
-                Save
-              </button>
-            </details>
-          </div>
+          <HomeScreen
+            onServer={onServer}
+            canRecord={canRecord()}
+            backend={backend}
+            error={openError}
+            settings={settings}
+            onSettingsChange={setSettings}
+            onRecord={() => setScreen("record")}
+            onSelectVideo={handleSelectVideo}
+            onDemo={handleDemoMode}
+            onOpenMatch={openMatch}
+          />
         )}
 
         {screen === "analysis" && uploadProgress !== null && (
-          <div className="analysis-running">
-            <h2>Uploading video...</h2>
+          <div className="task-card">
+            <h2>Uploading video</h2>
+            {matchTitle && <p className="task-subject">{matchTitle}</p>}
             <ProgressBar percent={Math.round(uploadProgress * 100)} message="Sending the video to the analysis server" />
           </div>
         )}
 
         {screen === "analysis" && status === "running" && (
-          <div className="analysis-running">
-            <h2>Analyzing Video...</h2>
+          <div className="task-card">
+            <h2>Analysing match</h2>
+            {matchTitle && <p className="task-subject">{matchTitle}</p>}
             <ProgressBar percent={progress} message={progressMessage} elapsedMs={elapsedMs} />
             {/* Frames arrive all at once at the end; until then the progress message counts them. */}
             {frames.length > 0 && <p className="frame-count">{frames.length} frames received</p>}
-          </div>
-        )}
-
-        {screen === "analysis" && openError && (
-          <div className="error-panel">
-            <h2>Cannot Open Video</h2>
-            <p className="error-message">{openError}</p>
+            <div className="task-actions">
+              {onServer && (
+                <button className="btn btn-secondary" onClick={goHome} title="The server carries on; open the match later from Matches">
+                  Leave running
+                </button>
+              )}
+              <button className="btn btn-danger" onClick={stopAnalysis}>Stop analysis</button>
+            </div>
           </div>
         )}
 
         {screen === "analysis" && status === "error" && (
-          <div className="error-panel">
-            <h2>Analysis Error</h2>
+          <div className="task-card task-card-error">
+            <h2><IconAlert size={20} />Analysis failed</h2>
             <p className="error-message">{error}</p>
+            <div className="task-actions">
+              <button className="btn btn-secondary" onClick={goHome}>Back to start</button>
+              {videoPath && <button className="btn btn-primary" onClick={() => startAnalysis(videoPath)}>Try again</button>}
+            </div>
           </div>
         )}
 
@@ -1128,50 +1084,49 @@ function App() {
           <div className="results-layout">
             <div className="viewer-panel">
               <div className="view-toolbar">
-                <button
-                  className={`view-btn ${viewMode === "side-by-side" ? "active" : ""}`}
-                  onClick={() => setViewMode("side-by-side")}
-                >
-                  Side by Side
-                </button>
-                <button
-                  className={`view-btn ${viewMode === "overlay" ? "active" : ""}`}
-                  onClick={() => setViewMode("overlay")}
-                >
-                  Overlay
-                </button>
-                <button
-                  className={`view-btn ${viewMode === "inspect" ? "active" : ""}`}
-                  onClick={() => { setViewMode("inspect"); setShowCalibration(false); }}
-                  title="Check the rally and correct the ball path and touches"
-                >
-                  Inspect &amp; Edit
-                </button>
-                {isRealVideo && (status === "complete") && viewMode !== "inspect" && (
+                <div className="segmented" role="group" aria-label="View">
                   <button
-                    className={`view-btn ${showCalibration ? "active" : ""}`}
-                    onClick={() => setShowCalibration((v) => !v)}
+                    className={`view-btn ${viewMode === "side-by-side" ? "active" : ""}`}
+                    onClick={() => setViewMode("side-by-side")}
                   >
-                    {showCalibration ? "Close Calibration" : "Align Court"}
+                    <IconSplit size={14} />Side by side
                   </button>
-                )}
-                {viewMode === "side-by-side" && isRealVideo && calibration && !showCalibration && (
-                  <span className="view-btn disabled" style={{ opacity: 0.6, cursor: "default" }}>
-                    Court Aligned ✓
-                  </span>
-                )}
-                {analysisDurationMs !== null && (
-                  <span
-                    className="analysis-duration"
-                    title={`${result.total_frames} frames · ${(result.total_frames / (analysisDurationMs / 1000)).toFixed(1)} frames/s`}
+                  <button
+                    className={`view-btn ${viewMode === "overlay" ? "active" : ""}`}
+                    onClick={() => { setViewMode("overlay"); setShowCalibration(false); }}
                   >
-                    Analyzed in {formatDuration(analysisDurationMs)}
-                  </span>
-                )}
+                    <IconLayers size={14} />Overlay
+                  </button>
+                  <button
+                    className={`view-btn ${viewMode === "inspect" ? "active" : ""}`}
+                    onClick={() => { setViewMode("inspect"); setShowCalibration(false); }}
+                    title="Check the rally and correct the ball path and touches"
+                  >
+                    <IconEdit size={14} />Inspect &amp; edit
+                  </button>
+                </div>
+                <div className="view-toolbar-status">
+                  {solving && (
+                    <span className="status-chip"><span className="spinner" />Solving ball path</span>
+                  )}
+                  {isRealVideo && viewMode !== "inspect" && (
+                    <button
+                      className={`court-status ${showCalibration ? "open" : calibration ? "ok" : "warn"}`}
+                      onClick={() => {
+                        setViewMode("side-by-side");
+                        setShowCalibration((v) => !v);
+                      }}
+                      title={showCalibration ? "Close the court alignment" : calibration ? "Check or adjust the court alignment" : "The court is needed to find rallies and points"}
+                    >
+                      {showCalibration ? <IconClose size={14} /> : calibration ? <IconCheck size={14} /> : <IconTarget size={14} />}
+                      {showCalibration ? "Close alignment" : calibration ? "Court aligned" : "Align court"}
+                    </button>
+                  )}
+                </div>
               </div>
 
               {viewMode === "side-by-side" && (
-                <div className="split-view">
+                <div className="split-view" style={{ "--split": `${splitPct}%` } as React.CSSProperties}>
                   <div
                     className="split-pane"
                     ref={setSplitVideoEl}
@@ -1250,7 +1205,24 @@ function App() {
                         />
                       )}
                     </div>
+                    {!showCalibration && <span className="pane-label">Video</span>}
                   </div>
+                  {/* Calibration maps clicks through the pane's size, so it stays put meanwhile. */}
+                  {!showCalibration && (
+                    <div
+                      className="split-handle"
+                      role="separator"
+                      aria-orientation="vertical"
+                      title="Drag to resize · double-click to reset"
+                      onPointerDown={(e) => e.currentTarget.setPointerCapture(e.pointerId)}
+                      onPointerMove={(e) => {
+                        if (!e.currentTarget.hasPointerCapture(e.pointerId)) return;
+                        const r = e.currentTarget.parentElement!.getBoundingClientRect();
+                        setSplitPct(Math.max(MIN_SPLIT_PCT, Math.min(100 - MIN_SPLIT_PCT, (100 * (e.clientX - r.left)) / r.width)));
+                      }}
+                      onDoubleClick={() => setSplitPct(DEFAULT_SPLIT_PCT)}
+                    />
+                  )}
                   <div className="split-pane">
                     <SkeletonViewer
                       calibration={calibration}
@@ -1263,12 +1235,13 @@ function App() {
                       trajectoryMode={trajectoryMode}
                       touches={displayTouches}
                     />
+                    <span className="pane-label">3D reconstruction</span>
                     <button
                       className="reset-view-btn"
-                      title="Reset to video-aligned view"
+                      title="Back to the video's point of view"
                       onClick={() => setResetViewTrigger((v) => v + 1)}
                     >
-                      ⟳ Reset View
+                      <IconRefresh size={13} />Reset view
                     </button>
                   </div>
                 </div>
@@ -1281,6 +1254,7 @@ function App() {
                   videoSize={videoSize}
                   calibration={calibration}
                   positions={ball3dMap}
+                  fittedPositions={fittedBall3dMap}
                   physicsDebug={physicsDebug}
                   touchSplits={touchSplits}
                   touches={displayTouches}
@@ -1365,43 +1339,50 @@ function App() {
                 totalFrames={frames.length}
                 isPlaying={isPlaying}
                 fps={isRealVideo ? result.fps : undefined}
+                timeline={timeline}
+                kinds={matchKinds}
+                ralliesOnly={ralliesOnly}
+                onRalliesOnlyChange={setRalliesOnly}
                 onFrameChange={seekToFrame}
                 onTogglePlay={togglePlay}
               />
-              {viewMode !== "inspect" && timeline.rallies.length > 0 && (
-                <TimelineBar
-                  timeline={timeline}
-                  totalFrames={frames.length}
-                  currentFrame={currentFrame}
-                  kinds={matchKinds}
-                  onSeek={seekToFrame}
-                />
-              )}
             </div>
             {viewMode !== "inspect" && <div className="sidebar">
-              <div className="sidebar-tabs">
+              <Scoreboard timeline={timeline} teams={edits.teams} onRenameTeam={renameTeam} />
+              <div className="sidebar-tabs" role="tablist">
                 <button
+                  role="tab"
+                  aria-selected={sidebarTab === "match"}
                   className={`sidebar-tab ${sidebarTab === "match" ? "active" : ""}`}
                   onClick={() => setSidebarTab("match")}
-                >Match</button>
+                >Rallies</button>
                 <button
+                  role="tab"
+                  aria-selected={sidebarTab === "stats"}
                   className={`sidebar-tab ${sidebarTab === "stats" ? "active" : ""}`}
                   onClick={() => setSidebarTab("stats")}
                 >Stats</button>
                 <button
+                  role="tab"
+                  aria-selected={sidebarTab === "court"}
                   className={`sidebar-tab ${sidebarTab === "court" ? "active" : ""}`}
                   onClick={() => setSidebarTab("court")}
-                >Court Map</button>
+                >Court</button>
                 <button
-                  className={`sidebar-tab ${sidebarTab === "ball-debug" ? "active" : ""}`}
+                  role="tab"
+                  aria-selected={diagnosticsTab}
+                  className={`sidebar-tab ${diagnosticsTab ? "active" : ""}`}
                   onClick={() => setSidebarTab("ball-debug")}
-                >Ball Debug</button>
-                <button
-                  className={`sidebar-tab ${sidebarTab === "depth" ? "active" : ""}`}
-                  onClick={() => setSidebarTab("depth")}
-                >Depth</button>
+                >Diagnostics</button>
               </div>
 
+              <div className="sidebar-body">
+              {diagnosticsTab && (
+                <div className="segmented segmented-full" role="group" aria-label="Diagnostic">
+                  <button className={`view-btn ${sidebarTab === "ball-debug" ? "active" : ""}`} onClick={() => setSidebarTab("ball-debug")}>Ball tracking</button>
+                  <button className={`view-btn ${sidebarTab === "depth" ? "active" : ""}`} onClick={() => setSidebarTab("depth")}>Depth filter</button>
+                </div>
+              )}
               {sidebarTab === "match" && (
                 <MatchPanel
                   timeline={timeline}
@@ -1410,20 +1391,19 @@ function App() {
                   teams={edits.teams}
                   kinds={matchKinds}
                   onKindsChange={setMatchKinds}
-                  ralliesOnly={ralliesOnly}
-                  onRalliesOnlyChange={setRalliesOnly}
                   onSeek={seekToFrame}
                   onSetWinner={setPointWinner}
-                  onRenameTeam={renameTeam}
                   pending={
-                    !isRealVideo ? "Demo mode has no rallies."
-                      : !calibration ? "Align the court (Align Court) to find rallies and points."
+                    !isRealVideo ? "Demo data has no rallies."
+                      : !calibration ? "Align the court to find rallies and points."
                       : solving ? "Solving the ball path…"
                       : null
                   }
                 />
               )}
-              {sidebarTab === "stats" && <StatsDisplay result={result} />}
+              {sidebarTab === "stats" && (
+                <StatsDisplay result={result} timeline={timeline} teams={edits.teams} analysisDurationMs={analysisDurationMs} />
+              )}
               {sidebarTab === "court" && (
                 <CourtMapView
                   frames={solvedFrames}
@@ -1458,26 +1438,24 @@ function App() {
                     {/* ── Manual 2D correction mode ─────────────────── */}
                     <div className="control-row">
                       <button
-                        className={`btn ${correctionMode ? "btn-danger" : "btn-secondary"}`}
-                        style={{ fontSize: 12 }}
+                        className={`btn btn-sm ${correctionMode ? "btn-danger" : "btn-secondary"}`}
                         onClick={() => setCorrectionMode((v) => !v)}
                       >
-                        {correctionMode ? "Exit Correction Mode" : "Manual Ball Correction"}
+                        {correctionMode ? "Exit correction mode" : "Manual ball correction"}
                       </button>
                       {correctionMode && (
-                        <span style={{ fontSize: 11, color: "#aaa", marginLeft: 6 }}>
-                          Click video to set ball centre for frame {currentFrame}
+                        <span className="match-dim">
+                          Click the video to set the ball centre for frame {currentFrame}
                         </span>
                       )}
                     </div>
                     {manualBallCorrections.size > 0 && (
-                      <div className="control-row" style={{ flexWrap: "wrap", gap: 4 }}>
-                        <span style={{ fontSize: 11, color: "#ccc" }}>
+                      <div className="control-row">
+                        <span className="match-dim">
                           {manualBallCorrections.size} correction(s)
                         </span>
                         <button
-                          className="btn btn-secondary"
-                          style={{ fontSize: 11, padding: "2px 6px" }}
+                          className="btn btn-sm btn-secondary"
                           onClick={() => updateEdits((e) => {
                             const ball = { ...e.ball };
                             delete ball[currentFrame];
@@ -1485,8 +1463,7 @@ function App() {
                           })}
                         >Clear this frame</button>
                         <button
-                          className="btn btn-secondary"
-                          style={{ fontSize: 11, padding: "2px 6px" }}
+                          className="btn btn-sm btn-secondary"
                           onClick={() => updateEdits((e) => ({ ...e, ball: {} }))}
                         >Clear all</button>
                       </div>
@@ -1521,17 +1498,23 @@ function App() {
                       wrong, and every 3D position downstream inherits that. */}
                   {calibrationLog?.avgKpErr != null && calibrationLog.avgKpErr > 25 && (
                     <div className="physics-failed-warning">
-                      ⚠ Court calibration is unreliable ({calibrationLog.avgKpErr.toFixed(0)} px error).
-                      The auto-detected court does not match a real camera, so 3D ball
-                      positions cannot be trusted. Fix the court corners with{" "}
-                      <strong>Align Court</strong> and re-check.
+                      <IconAlert />
+                      <span>
+                        Court calibration is unreliable ({calibrationLog.avgKpErr.toFixed(0)} px error).
+                        The auto-detected court does not match a real camera, so 3D ball
+                        positions cannot be trusted. Fix the court corners with{" "}
+                        <strong>Align court</strong> and re-check.
+                      </span>
                     </div>
                   )}
                   {physicsFailedWarning && (
                     <div className="physics-failed-warning">
-                      ⚠ Physics reprojection failed — no arc could be fitted from the detected ball positions.
-                      The 3D trajectory is empty. Check confidence threshold, camera calibration, and ensure
-                      at least 4 consecutive ball detections exist.
+                      <IconAlert />
+                      <span>
+                        Physics reprojection failed — no arc could be fitted from the detected ball positions.
+                        The 3D trajectory is empty. Check confidence threshold, camera calibration, and ensure
+                        at least 4 consecutive ball detections exist.
+                      </span>
                     </div>
                   )}
                   <BallDebugView
@@ -1550,7 +1533,7 @@ function App() {
                           document containing calibration, the solved
                           trajectory, per-frame records and every arc. */}
                       <button
-                        className="btn btn-secondary"
+                        className="btn btn-sm btn-secondary"
                         onClick={() => {
                           const report = {
                             generatedAt: new Date().toISOString(),
@@ -1590,7 +1573,7 @@ function App() {
                           void getBackend().then((b) => b.saveTextFile("ball_debug_report.json", json));
                         }}
                       >
-                        Export Debug Report ({ball3dMap.size} solved / {ball3dDebug.length} records)
+                        Export debug report ({ball3dMap.size} solved / {ball3dDebug.length} records)
                       </button>
                     </div>
                   )}
@@ -1605,6 +1588,7 @@ function App() {
                   frameMapping={frameMapping}
                 />
               )}
+              </div>
             </div>}
           </div>
         )}

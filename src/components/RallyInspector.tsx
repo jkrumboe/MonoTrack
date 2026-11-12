@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
 import type { FrameData } from "../hooks/useAnalysis";
-import type { CalibrationResult } from "../utils/cameraSolver";
+import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
 import type { PhysicsReprojectionDebug, TouchSplitDecision } from "../utils/ballReconstruction";
 import { TOUCH_KINDS, touchColor, touchMatchFrames, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
 import { inspectRally, type Fix, type Problem } from "../utils/rallyInspection";
@@ -27,6 +27,8 @@ interface Props {
   videoSize: { width: number; height: number };
   calibration: CalibrationResult | null;
   positions: Map<number, V3>;
+  /** `positions` without the estimates that keep the line going: what the problem list judges. */
+  fittedPositions: Map<number, V3>;
   physicsDebug?: PhysicsReprojectionDebug[];
   touchSplits?: TouchSplitDecision[];
   /** Touches with the touch edits applied. */
@@ -61,8 +63,7 @@ function useProjector(calibration: CalibrationResult | null, aspect: number, fra
   return useMemo(() => {
     if (!calibration || !aspect) return null;
     const cam = new THREE.PerspectiveCamera(calibration.fov, aspect, 0.1, 500);
-    cam.position.set(...calibration.position);
-    cam.lookAt(new THREE.Vector3(...calibration.lookAt));
+    aimCamera(cam, calibration);
     cam.updateMatrixWorld();
     cam.updateProjectionMatrix();
     const moving = frames.some((f) => f.ref_from_frame);
@@ -119,9 +120,9 @@ export default function RallyInspector(p: Readonly<Props>) {
   const [innerSize, setInnerSize] = useState({ w: 0, h: 0 });
 
   const insp = useMemo(() => inspectRally({
-    frames, fps, positions: p.positions, physicsDebug: p.physicsDebug, touches, touchSplits: p.touchSplits,
+    frames, fps, positions: p.fittedPositions, physicsDebug: p.physicsDebug, touches, touchSplits: p.touchSplits,
     edits, courtErrPx: p.courtErrPx, hasCalibration: !!p.calibration,
-  }), [frames, fps, p.positions, p.physicsDebug, touches, p.touchSplits, edits, p.courtErrPx, p.calibration]);
+  }), [frames, fps, p.fittedPositions, p.physicsDebug, touches, p.touchSplits, edits, p.courtErrPx, p.calibration]);
   const dismissed = useMemo(() => new Set(edits.dismissed), [edits.dismissed]);
 
   const aspect = videoSize.width && videoSize.height ? videoSize.width / videoSize.height : 0;
@@ -636,7 +637,7 @@ function Timeline(p: Readonly<{
     const faint = "rgba(255,255,255,.05)", grid = "rgba(255,255,255,.14)";
     const colW = Math.max(1, (width - GUTTER - 8) / Math.max(1, f1 - f0));
     const L = Object.fromEntries(lanes.map((l) => [l.id, l]));
-    ctx.font = "11px -apple-system, Segoe UI, sans-serif";
+    ctx.font = "11px 'Inter Variable', -apple-system, 'Segoe UI', sans-serif";
     for (const l of lanes) {
       ctx.fillStyle = faint; ctx.fillRect(GUTTER, l.y, width - GUTTER - 8, l.h);
       ctx.fillStyle = muted; ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillText(l.name, GUTTER - 8, l.y + l.h / 2);
@@ -693,7 +694,7 @@ function Timeline(p: Readonly<{
 
     // Touches across the lanes
     const t0 = lanes[0].y, t1 = lanes[lanes.length - 1].y + lanes[lanes.length - 1].h;
-    ctx.font = "600 11px -apple-system, Segoe UI, sans-serif"; ctx.textBaseline = "alphabetic";
+    ctx.font = "600 11px 'Inter Variable', -apple-system, 'Segoe UI', sans-serif"; ctx.textBaseline = "alphabetic";
     for (const t of p.touches) {
       if (t.frame < from || t.frame > to) continue;
       const x = X(t.frame), c = touchColor(t.label);
@@ -712,7 +713,7 @@ function Timeline(p: Readonly<{
     // Playhead and ticks
     const px = X(p.cur);
     ctx.strokeStyle = fg; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px, t0 - 4); ctx.lineTo(px, t1 + 2); ctx.stroke();
-    ctx.fillStyle = muted; ctx.font = "11px -apple-system, Segoe UI, sans-serif";
+    ctx.fillStyle = muted; ctx.font = "11px 'Inter Variable', -apple-system, 'Segoe UI', sans-serif";
     const step = [1, 5, 10, 25, 50, 100, 250, 500].find((s) => (f1 - f0) / s < 14) ?? 1000;
     for (let f = Math.ceil(f0 / step) * step; f <= f1; f += step) ctx.fillText(String(f), X(f) - 6, height - 2);
   }, [width, height, lanes, f0, f1, X, p.frames, p.positions, p.touches, p.edits, p.problems, p.rally, p.cur]);

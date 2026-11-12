@@ -1,7 +1,8 @@
 import { useMemo } from "react";
 import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
 import { imageToCourtHomography, applyHomography } from "../utils/courtHomography";
-import { estimateBallWorldPosition } from "../utils/ballReconstruction";
+import { estimateBallWorldPosition, playersOnCourt } from "../utils/ballReconstruction";
+import { SIDE_COLORS, sideOf } from "../utils/matchTimeline";
 import type { CalibrationResult } from "../utils/cameraSolver";
 
 // FIVB volleyball court dimensions (metres)
@@ -116,6 +117,11 @@ export default function CourtMapView({
       )
     : null;
 
+  const players = useMemo(
+    () => (frame && calibration && videoAspect ? playersOnCourt(frame, calibration, videoAspect) : []),
+    [frame, calibration, videoAspect],
+  );
+
   // Trail positions
   const trail1: [number, number][] = [];
   const trail2: [number, number][] = [];
@@ -195,13 +201,11 @@ export default function CourtMapView({
     <div className="court-map-panel">
       <h3>Court Map</h3>
       <svg
-        width={svgW}
-        height={svgH}
+        className="court-map-svg"
         viewBox={`0 0 ${svgW} ${svgH}`}
-        style={{ display: "block", margin: "0 auto" }}
       >
         {/* Court surface */}
-        <rect x={pad} y={pad} width={cW} height={cH} fill="#1a3d6e" rx={2} />
+        <rect x={pad} y={pad} width={cW} height={cH} fill="#22384d" rx={2} />
 
         {/* Half-court shading: subtle fill for each half to aid spatial orientation */}
         {(() => {
@@ -210,16 +214,16 @@ export default function CourtMapView({
             <>
               {/* Far half (top) – slightly lighter */}
               <rect x={pad} y={pad} width={cW} height={sy_net - pad}
-                fill="#1e4a80" rx={1} opacity={0.5} />
+                fill="#2b4560" rx={1} opacity={0.5} />
               {/* Near half (bottom) – baseline shade */}
               <rect x={pad} y={sy_net} width={cW} height={pad + cH - sy_net}
-                fill="#152f55" rx={1} opacity={0.5} />
+                fill="#1c2f42" rx={1} opacity={0.5} />
               {/* Zone labels */}
               <text x={pad + cW / 2} y={pad + (sy_net - pad) / 2 + 3}
-                textAnchor="middle" fontSize={8} fill="#7eb3e8" opacity={0.65}
+                textAnchor="middle" fontSize={8} fill="#9aa2ad" opacity={0.65}
                 fontFamily="monospace">FAR HALF</text>
               <text x={pad + cW / 2} y={sy_net + (pad + cH - sy_net) / 2 + 3}
-                textAnchor="middle" fontSize={8} fill="#7eb3e8" opacity={0.65}
+                textAnchor="middle" fontSize={8} fill="#9aa2ad" opacity={0.65}
                 fontFamily="monospace">NEAR HALF</text>
             </>
           );
@@ -235,7 +239,7 @@ export default function CourtMapView({
             <line
               key={i}
               x1={sx1} y1={sy1} x2={sx2} y2={sy2}
-              stroke={isNet ? "#ccc" : isAttack ? "#facc15" : "#fff"}
+              stroke={isNet ? "#ccc" : isAttack ? "#c6f135" : "#fff"}
               strokeWidth={isNet ? 1.5 : 1}
               opacity={isNet ? 0.9 : isAttack ? 0.8 : 0.65}
               strokeDasharray={isAttack ? "4 3" : undefined}
@@ -244,8 +248,14 @@ export default function CourtMapView({
         })}
 
         {/* Trails */}
-        {trailPath(trail1, "#4fc3f7")}
-        {trailPath(trail2, "#ff8a65")}
+        {trailPath(trail1, "#3d8ee6")}
+        {trailPath(trail2, "#e4623c")}
+
+        {/* Everyone on court this frame, the same players as the 3D view. */}
+        {players.map((pl, i) => {
+          const [sx, sy] = toSvg(...worldToNorm(pl.x, pl.z));
+          return <circle key={i} cx={sx} cy={sy} r={5} fill={SIDE_COLORS[sideOf(pl.z)]} stroke="#0b0d10" strokeWidth={1.5} />;
+        })}
 
         {/* Team 1 all-player dots (real video) */}
         {frame?.team1_img_positions?.map((imgPos, i) => {
@@ -256,7 +266,7 @@ export default function CourtMapView({
           })() : null;
           if (!pos) return null;
           const [sx, sy] = toSvg(pos[0], pos[1]);
-          return <circle key={i} cx={sx} cy={sy} r={6} fill="#4fc3f7" stroke="#0288d1" strokeWidth={1.5} opacity={0.85} />;
+          return <circle key={i} cx={sx} cy={sy} r={6} fill="#3d8ee6" stroke="#2268b5" strokeWidth={1.5} opacity={0.85} />;
         })}
         {/* Team 2 all-player dots (real video) */}
         {frame?.team2_img_positions?.map((imgPos, i) => {
@@ -267,7 +277,7 @@ export default function CourtMapView({
           })() : null;
           if (!pos) return null;
           const [sx, sy] = toSvg(pos[0], pos[1]);
-          return <circle key={i} cx={sx} cy={sy} r={6} fill="#ff8a65" stroke="#e64a19" strokeWidth={1.5} opacity={0.85} />;
+          return <circle key={i} cx={sx} cy={sy} r={6} fill="#e4623c" stroke="#b5461f" strokeWidth={1.5} opacity={0.85} />;
         })}
 
         {/* Fallback: representative player per team (dummy mode or when team arrays absent) */}
@@ -275,7 +285,7 @@ export default function CourtMapView({
           const [sx, sy] = toSvg(p1Pos[0], p1Pos[1]);
           return (
             <g>
-              <circle cx={sx} cy={sy} r={9} fill="#4fc3f7" stroke="#0288d1" strokeWidth={2} />
+              <circle cx={sx} cy={sy} r={9} fill="#3d8ee6" stroke="#2268b5" strokeWidth={2} />
               <text x={sx} y={sy + 4} textAnchor="middle" fontSize={9} fontWeight="bold" fill="#000">T1</text>
             </g>
           );
@@ -284,7 +294,7 @@ export default function CourtMapView({
           const [sx, sy] = toSvg(p2Pos[0], p2Pos[1]);
           return (
             <g>
-              <circle cx={sx} cy={sy} r={9} fill="#ff8a65" stroke="#e64a19" strokeWidth={2} />
+              <circle cx={sx} cy={sy} r={9} fill="#e4623c" stroke="#b5461f" strokeWidth={2} />
               <text x={sx} y={sy + 4} textAnchor="middle" fontSize={9} fontWeight="bold" fill="#000">T2</text>
             </g>
           );
@@ -369,16 +379,12 @@ export default function CourtMapView({
 
         return (
           <>
-            <div style={{ textAlign: "center", fontSize: 11, color: "#7eb3e8",
-              fontFamily: "monospace", marginTop: 6, marginBottom: 2 }}>
-              SIDE VIEW
-            </div>
-            <svg width={sW} height={sH} viewBox={`0 0 ${sW} ${sH}`}
-              style={{ display: "block", margin: "0 auto" }}>
+            <h3 className="court-map-subtitle">Side view</h3>
+            <svg className="court-map-svg" viewBox={`0 0 ${sW} ${sH}`}>
 
               {/* Background halves */}
-              <rect x={sPL} y={sPT} width={netX - sPL} height={sCH} fill="#1e4a80" rx={1} opacity={0.9} />
-              <rect x={netX} y={sPT} width={sPL + sCW - netX} height={sCH} fill="#152f55" rx={1} opacity={0.9} />
+              <rect x={sPL} y={sPT} width={netX - sPL} height={sCH} fill="#2b4560" rx={1} opacity={0.9} />
+              <rect x={netX} y={sPT} width={sPL + sCW - netX} height={sCH} fill="#1c2f42" rx={1} opacity={0.9} />
 
               {/* Height grid lines */}
               {heightMarks.map(m => {
@@ -387,25 +393,25 @@ export default function CourtMapView({
                 return (
                   <g key={m}>
                     <line x1={sPL} y1={gy} x2={sPL + sCW} y2={gy}
-                      stroke={isNetH ? "#f59e0b" : "#2a5080"}
+                      stroke={isNetH ? "#f59e0b" : "#2b333d"}
                       strokeWidth={isNetH ? 1 : 0.75}
                       strokeDasharray={isNetH ? "5 3" : "3 4"}
                       opacity={isNetH ? 0.75 : 0.5} />
                     <text x={sPL - 3} y={gy + 3} textAnchor="end"
-                      fontSize={7} fill="#8ab0d8" fontFamily="monospace">{m}m</text>
+                      fontSize={7} fill="#9aa2ad" fontFamily="monospace">{m}m</text>
                   </g>
                 );
               })}
 
               {/* Ground / border */}
               <rect x={sPL} y={sPT} width={sCW} height={sCH}
-                fill="none" stroke="#3a6090" strokeWidth={1} />
+                fill="none" stroke="#3b4552" strokeWidth={1} />
 
               {/* Attack zone lines */}
               <line x1={atkFarX} y1={sPT} x2={atkFarX} y2={groundY}
-                stroke="#facc15" strokeWidth={1} strokeDasharray="4 3" opacity={0.7} />
+                stroke="#c6f135" strokeWidth={1} strokeDasharray="4 3" opacity={0.7} />
               <line x1={atkNearX} y1={sPT} x2={atkNearX} y2={groundY}
-                stroke="#facc15" strokeWidth={1} strokeDasharray="4 3" opacity={0.7} />
+                stroke="#c6f135" strokeWidth={1} strokeDasharray="4 3" opacity={0.7} />
 
               {/* Net height indicator line */}
               <line x1={sPL} y1={netLineY} x2={sPL + sCW} y2={netLineY}
@@ -445,11 +451,11 @@ export default function CourtMapView({
                   <g>
                     {/* Vertical stem to ground */}
                     <line x1={cx} y1={groundY} x2={cx} y2={cy}
-                      stroke={aboveNet ? "#4fc3f7" : "#ff7043"}
+                      stroke={aboveNet ? "#3d8ee6" : "#ff7043"}
                       strokeWidth={1} strokeDasharray="2 2" opacity={0.5} />
                     <circle cx={cx} cy={cy} r={8}
-                      fill={interpolated ? "#ccc" : (aboveNet ? "#ffe082" : "#ff8a65")}
-                      stroke={aboveNet ? "#ffb300" : "#e64a19"}
+                      fill={interpolated ? "#ccc" : (aboveNet ? "#ffe082" : "#e4623c")}
+                      stroke={aboveNet ? "#ffb300" : "#b5461f"}
                       strokeWidth={1.5}
                       strokeDasharray={interpolated ? "3 2" : undefined}
                       opacity={0.95} />
@@ -462,22 +468,22 @@ export default function CourtMapView({
               {/* No-calibration placeholder */}
               {!hasBall && !calibration && (
                 <text x={sPL + sCW / 2} y={sPT + sCH / 2 + 4}
-                  textAnchor="middle" fontSize={8} fill="#4a6a90"
+                  textAnchor="middle" fontSize={8} fill="#7c8591"
                   fontFamily="monospace">calibrate camera for height</text>
               )}
 
               {/* X-axis labels */}
-              <text x={sPL + 4} y={sH - 3} fontSize={7} fill="#7eb3e8" fontFamily="monospace">FAR</text>
+              <text x={sPL + 4} y={sH - 3} fontSize={7} fill="#9aa2ad" fontFamily="monospace">FAR</text>
               <text x={netX} y={sH - 3} textAnchor="middle" fontSize={7} fill="#ccc" fontFamily="monospace">NET</text>
-              <text x={sPL + sCW - 4} y={sH - 3} textAnchor="end" fontSize={7} fill="#7eb3e8" fontFamily="monospace">NEAR</text>
+              <text x={sPL + sCW - 4} y={sH - 3} textAnchor="end" fontSize={7} fill="#9aa2ad" fontFamily="monospace">NEAR</text>
             </svg>
           </>
         );
       })()}
 
       <div className="court-map-legend">
-        <span className="legend-p1">Team 1</span>
-        <span className="legend-p2">Team 2</span>
+        <span><i style={{ background: SIDE_COLORS.near }} />Near side</span>
+        <span><i style={{ background: SIDE_COLORS.far }} />Far side</span>
       </div>
     </div>
   );

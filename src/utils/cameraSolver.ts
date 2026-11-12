@@ -19,6 +19,19 @@ export interface CalibrationResult {
   lookAt: [number, number, number];
   /** Vertical field of view in degrees */
   fov: number;
+  /**
+   * Turn about the viewing axis in radians (0 keeps the horizon level, the
+   * default). Broadcast cameras are up to a degree or so off level, about 17 px
+   * at the edge of a 1080p frame, which no position or aim can make up for.
+   */
+  roll?: number;
+}
+
+/** Point a camera as a calibration says, roll included. */
+export function aimCamera(cam: THREE.PerspectiveCamera, cal: Pick<CalibrationResult, "position" | "lookAt" | "roll">) {
+  cam.position.set(...cal.position);
+  cam.lookAt(new THREE.Vector3(...cal.lookAt));
+  if (cal.roll) cam.rotateZ(cal.roll);
 }
 
 // ---------------------------------------------------------------------------
@@ -230,11 +243,13 @@ function makeCamera(
   camPos: THREE.Vector3,
   lookAt: THREE.Vector3,
   fov: number,
-  aspect: number
+  aspect: number,
+  roll = 0,
 ): THREE.PerspectiveCamera {
   const cam = new THREE.PerspectiveCamera(fov, aspect, 0.1, 500);
   cam.position.copy(camPos);
   cam.lookAt(lookAt);
+  if (roll) cam.rotateZ(roll);
   cam.updateMatrixWorld();
   cam.updateProjectionMatrix();
   return cam;
@@ -252,7 +267,7 @@ function reprojectionError(
   aspect: number,
   worldPoints: { x: number; y: number; z: number }[]
 ): number {
-  const [cx, cy, cz, lx, ly, lz, fov] = params;
+  const [cx, cy, cz, lx, ly, lz, fov, roll = 0] = params;
   // Bounds only exclude physically absurd cameras. They were previously tight
   // enough that solutions came back sitting exactly on the cz limit, which is a
   // sign the optimiser was pinned rather than converged.
@@ -268,7 +283,7 @@ function reprojectionError(
   const camPos = new THREE.Vector3(cx, cy, cz);
   const lookAt = new THREE.Vector3(lx, ly, lz);
 
-  const cam = makeCamera(camPos, lookAt, fov, aspect);
+  const cam = makeCamera(camPos, lookAt, fov, aspect, roll);
   const v = new THREE.Vector3();
   let totalErr = 0;
   for (let i = 0; i < worldPoints.length; i++) {
@@ -509,7 +524,17 @@ function calibrationFromHomography(
   const fov = (2 * Math.atan(imgH / (2 * f)) * 180) / Math.PI;
   if (!Number.isFinite(fov) || fov <= 0) return null;
 
-  return { fov, position: C, lookAt };
+  // Roll: where the image's right axis (first row of R) lies relative to the
+  // right and up axes of a level camera with this aim.
+  const dot = (a: number[], b: number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross = (a: number[], b: number[]) => [
+    a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0],
+  ];
+  const levelRight = nrm(cross(lookDir, [0, 1, 0]));
+  const levelUp = cross(levelRight, lookDir);
+  const roll = Math.atan2(dot(R[0], levelUp), dot(R[0], levelRight));
+
+  return { fov, position: C, lookAt, roll };
 }
 
 export function solveCameraIterative(
@@ -548,10 +573,10 @@ export function solveCameraIterative(
     const H = homographyFromPlanar(floor.map((i) => [modelPoints[i].x, modelPoints[i].z]), floor.map((i) => pts2d[i]));
     const hCal = H ? calibrationFromHomography(H, imgW, imgH) : null;
     if (hCal) {
-      const { fov, position, lookAt } = hCal;
-      dltSeed = [position[0], position[1], position[2], lookAt[0], lookAt[1], lookAt[2], fov];
+      const { fov, position, lookAt, roll = 0 } = hCal;
+      dltSeed = [position[0], position[1], position[2], lookAt[0], lookAt[1], lookAt[2], fov, roll];
       log.push(
-        `Homography seed: fov=${fov.toFixed(1)}°, pos=[${position.map((v) => (+v).toFixed(2)).join(", ")}]`,
+        `Homography seed: fov=${fov.toFixed(1)}°, roll=${((roll * 180) / Math.PI).toFixed(2)}°, pos=[${position.map((v) => (+v).toFixed(2)).join(", ")}]`,
       );
     } else {
       log.push("Homography seed failed — falling back to search");
@@ -564,7 +589,7 @@ export function solveCameraIterative(
         const { fov, position, lookAt } = decomp;
         if (fov >= 5 && fov <= 80 && position[1] >= 1 && position[1] <= 40 &&
             position[2] >= 5 && position[2] <= 80 && Math.abs(position[0]) <= 20) {
-          dltSeed = [position[0], position[1], position[2], lookAt[0], lookAt[1], lookAt[2], fov];
+          dltSeed = [position[0], position[1], position[2], lookAt[0], lookAt[1], lookAt[2], fov, 0];
           log.push(`DLT seed: fov=${fov.toFixed(1)}°, pos=[${position.map(v => (+v).toFixed(2)).join(", ")}]`);
         }
       }
@@ -597,8 +622,8 @@ export function solveCameraIterative(
     [0, 10, 50,             0, 0,    -3, 8],
   ];
 
-  const starts = dltSeed ? [dltSeed, ...fallbackStarts] : fallbackStarts;
-  const scales = [1, 1, 3, 1, 0.5, 2, 5];
+  const starts = dltSeed ? [dltSeed, ...fallbackStarts.map((s) => [...s, 0])] : fallbackStarts.map((s) => [...s, 0]);
+  const scales = [1, 1, 3, 1, 0.5, 2, 5, 0.02];
 
   let bestParams = starts[0];
   let bestCost = Infinity;
@@ -641,7 +666,7 @@ export function solveCameraIterative(
     );
   }
 
-  const [cx, cy, cz, lx, ly, lz, fov] = bestParams;
+  const [cx, cy, cz, lx, ly, lz, fov, roll = 0] = bestParams;
   const quality = bestCost < 1e-4 ? "excellent" : bestCost < 1e-2 ? "good" : bestCost < 0.1 ? "fair" : "poor";
   log.push(`SUCCESS: Best error=${bestCost.toExponential(2)} (${quality})`);
   log.push(`Camera pos=[${cx.toFixed(2)}, ${Math.abs(cy).toFixed(2)}, ${cz.toFixed(2)}], fov=${fov.toFixed(1)}°`);
@@ -650,6 +675,7 @@ export function solveCameraIterative(
       position: [cx, Math.abs(cy), cz],
       lookAt: [lx, ly, lz],
       fov,
+      roll,
     },
     log,
   };

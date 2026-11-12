@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { solveCameraIterative, type CalibrationResult } from "../utils/cameraSolver";
+import { aimCamera, solveCameraIterative, type CalibrationResult } from "../utils/cameraSolver";
 import {
   solveBallTrajectories,
   type BallReconstructionOptions,
@@ -52,8 +52,7 @@ export function calibrate(fx: Fixture, court?: CourtLabel): CalibrationResult | 
 /** A three.js camera matching a calibration (same construction as the solver). */
 export function cameraFor(cal: CalibrationResult, aspect: number): THREE.PerspectiveCamera {
   const cam = new THREE.PerspectiveCamera(cal.fov, aspect, 0.1, 500);
-  cam.position.set(...cal.position);
-  cam.lookAt(new THREE.Vector3(...cal.lookAt));
+  aimCamera(cam, cal);
   cam.updateMatrixWorld();
   cam.updateProjectionMatrix();
   return cam;

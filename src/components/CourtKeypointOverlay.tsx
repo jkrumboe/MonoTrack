@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useReducer, useRef } from "react";
 
 /**
  * Volleyball court keypoints (10 total):
@@ -20,11 +20,11 @@ const COURT_LINES: [number, number][] = [
   [8, 9],  // net
 ];
 
-const DOT_RADIUS = 5;
-const DOT_COLOR = "#00ff88";
-const LINE_COLOR = "rgba(0, 255, 136, 0.7)";
-const NET_COLOR  = "rgba(255, 200, 0, 0.85)";
-const LINE_WIDTH = 2.0;
+const DOT_RADIUS = 3;
+const DOT_COLOR = "#c6f135";
+const LINE_COLOR = "rgba(198, 241, 53, 0.55)";
+const NET_COLOR  = "rgba(255, 255, 255, 0.8)";
+const LINE_WIDTH = 1.25;
 
 interface CourtKeypointOverlayProps {
   keypoints: (number[] | null)[];
@@ -34,6 +34,14 @@ interface CourtKeypointOverlayProps {
 
 export default function CourtKeypointOverlay({ keypoints, videoEl, containerEl }: CourtKeypointOverlayProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [resized, redraw] = useReducer((n: number) => n + 1, 0);
+
+  useEffect(() => {
+    if (!containerEl) return;
+    const ro = new ResizeObserver(redraw);
+    ro.observe(containerEl);
+    return () => ro.disconnect();
+  }, [containerEl]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -79,7 +87,7 @@ export default function CourtKeypointOverlay({ keypoints, videoEl, containerEl }
     // Draw filled court polygon using the 4 outer corners (kp 0,1,3,2)
     const outerCorners = [keypoints[0], keypoints[1], keypoints[3], keypoints[2]];
     if (outerCorners.every(Boolean)) {
-      ctx.fillStyle = "rgba(30, 100, 220, 0.18)";
+      ctx.fillStyle = "rgba(198, 241, 53, 0.05)";
       ctx.beginPath();
       const [fx, fy] = toPixel(outerCorners[0]!);
       ctx.moveTo(fx, fy);
@@ -115,11 +123,11 @@ export default function CourtKeypointOverlay({ keypoints, videoEl, containerEl }
       ctx.arc(px, py, DOT_RADIUS, 0, Math.PI * 2);
       ctx.fillStyle = DOT_COLOR;
       ctx.fill();
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.6)";
+      ctx.lineWidth = 1;
       ctx.stroke();
     }
-  }, [keypoints, videoEl, containerEl]);
+  }, [keypoints, videoEl, containerEl, resized]);
 
   return (
     <canvas

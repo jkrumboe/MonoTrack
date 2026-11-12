@@ -19,8 +19,8 @@ export type TouchKind = (typeof TOUCH_KINDS)[number];
 
 /** Marker colour per touch type (a solver "block/dig" takes its first kind's). */
 export const TOUCH_COLORS: Record<string, string> = {
-  toss: "#7fb3e6", serve: "#2f86d6", reception: "#4caf50", set: "#e0b800", attack: "#e2463f",
-  block: "#9b42b5", dig: "#ff8f00", touch: "#9a9a9a",
+  toss: "#7fb3e6", serve: "#3a88d8", reception: "#17a085", set: "#b38d0c", attack: "#e0443f",
+  block: "#a860d2", dig: "#d67a14", touch: "#9a9a9a",
 };
 export const touchColor = (label: string) => TOUCH_COLORS[label] ?? TOUCH_COLORS[label.split("/")[0]] ?? TOUCH_COLORS.touch;
 
@@ -166,7 +166,7 @@ const unit = (a: V3): V3 => { const l = Math.hypot(...a) || 1; return [a[0] / l,
 export function ballRay(
   frames: FrameData[],
   frame: number,
-  calibration: { position: V3; lookAt: V3; fov: number },
+  calibration: { position: V3; lookAt: V3; fov: number; roll?: number },
   aspect: number,
 ): { origin: V3; dir: V3 } | null {
   const f = frames[frame];
@@ -174,10 +174,14 @@ export function ballRay(
   const img = frames.some((x) => x.ref_from_frame) ? f?.ball_ref_pos : f?.ball_img_pos;
   if (!img) return null;
   const fwd = unit(sub(calibration.lookAt, calibration.position));
-  const right = unit(cross(fwd, [0, 1, 0]));
-  const up = cross(right, fwd);
+  const levelRight = unit(cross(fwd, [0, 1, 0]));
+  const levelUp = cross(levelRight, fwd);
   const th = Math.tan((calibration.fov * Math.PI) / 360);
-  const u = (img[0] * 2 - 1) * th * aspect, v = (1 - img[1] * 2) * th;
+  const u0 = (img[0] * 2 - 1) * th * aspect, v0 = (1 - img[1] * 2) * th;
+  const c = Math.cos(calibration.roll ?? 0), s = Math.sin(calibration.roll ?? 0);
+  // The image axes, turned by the camera's roll, in terms of the level ones.
+  const u = u0 * c - v0 * s, v = u0 * s + v0 * c;
+  const right = levelRight, up = levelUp;
   return {
     origin: calibration.position,
     dir: unit([0, 1, 2].map((c) => fwd[c] + right[c] * u + up[c] * v) as V3),

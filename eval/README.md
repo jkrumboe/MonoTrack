@@ -23,6 +23,40 @@ By hand:
 ## Seeing where a clip goes wrong
 `npm run inspect` opens http://127.0.0.1:8766: pick a clip (real or synthetic) and the solver runs on it, drawn over the video stage by stage: detections, camera motion, the fitted court, the solved ball reprojected with its floor shadow, arcs, touch splits and touches against the labels. A list of likely problems names the stage each comes from (e.g. "split rejected, Δv 2.1 < touchMinDvMps 3.55" or "ball not detected for 27 frames"); click one to jump there. Every Run rebuilds the solver, so code edits show without restarting. Parameter overrides can be tried on one clip, or on all clips against the baseline.
 
+## Estimated stretches of the line
+The rally solver refuses flights it cannot fit, often fast serves and attacks with most of their detections present. So the line still runs through the rally, `fillLineGaps` fills those frames after the solve, with method `estimated`, drawn dashed in the 3D view:
+- A refused flight keeps its solved arc, which shares knots with its neighbours, moved onto the detections' lines of sight (depth from the arc, the rest from the video).
+- A hole of up to 2.5 s between flights gets a ballistic arc, unless the ball was on the floor or the next thing is a toss or serve.
+- Otherwise the last flight is followed under gravity for up to 1.5 s or until it reaches the floor.
+
+Estimates are shapes, not measurements. Touches are decided before the fill, and point winners and the inspector's problems read fitted frames only. Synthetic path metrics do include them. Where the camera could not see the ball at all, nothing but the arc says where it was.
+
+## Choosing the ball detector
+The analyzer runs one of three multi-frame networks, picked with `BALL_DETECTOR` (weights download on first use, pinned and checked by SHA-256). Best real-clip score on replay, with motion stabilisation:
+
+| `BALL_DETECTOR` | Network | Frames per window | Weights | Score |
+|---|---|---|---|---|
+| `tracknetv2` (default) | TrackNetV2 | 3 RGB | [WASB-SBDT](https://github.com/nttcom/WASB-SBDT) volleyball, broadcast indoor | 71 |
+| `vballnet` | VballNetV4c (ONNX, CPU) | 9 grayscale | [asigatchov/fast-volleyball-tracking-inference](https://github.com/asigatchov/fast-volleyball-tracking-inference) | 55 |
+| `tracknetv3` | TrackNetV3 | 8 RGB + the clip's median frame | [deadfast/beach-volley-vision-models](https://huggingface.co/deadfast/beach-volley-vision-models), beach | 28 |
+
+Windows are warped to cancel camera motion before detection (`BALL_STABILIZE=0` turns that off): the networks read the ball from what changes between frames, and on a panning camera everything does. `BALL_THRESHOLD` overrides the heatmap threshold (0.5) and `BALL_STRIDE` how far a window advances. `train_ball.py` fine-tunes TrackNetV2 only.
+
+A full export takes a minute or more a clip, nearly all of it on things a ball-detector change doesn't affect. `python/bench_ball.py` caches each network's heatmaps once and rebuilds fixtures from them in seconds, for any threshold, tracker setting or mix of networks:
+```
+python python/bench_ball.py cache --detector vballnet+stab --stride 3
+python python/bench_ball.py replay --detector vballnet+stab --stride 3 --threshold 0.5 --out runs/fx_vball
+EVAL_FIXTURES_DIR=runs/fx_vball npm run eval -- --real
+```
+Check a final choice with real exports (`export_fixture.py --out-dir runs/fx`): replay came out about a point above them.
+
+## What the score does and doesn't tell you
+- **Read the real-clip line**, `Real clips: 69.8  95% CI 64.8-74.6`. The "Overall" line above it also averages the synthetic scenarios, which a detector change can't move. The CI is about ±5 because there are only 11 clips from 2 matches, so compare options clip by clip rather than by their means.
+- **Which court.** By default real clips are solved on the labelled court, which isolates ball tracking. `EVAL_COURT=detected` uses the analyzer's court, as the app does; the two should agree. Truth positions always come from the labelled court.
+- **The score barely sees small court errors**: halving the court error from 14 to 7 px moved it by under a point. Judge the court by `court error` and the `on-line share` the analyzer logs (share of the court model on lines that persist across the clip), not by the score.
+- **Labelled courts aren't exact.** Those copied with `propagate_court.py` are up to ~45 px off at the far end of a clip's view, and the analyzer's court sits on the painted lines better than the label on all 11 clips. A large `court error` on one clip can be the label's.
+- `npm run eval:audit` checks the score itself: what a pipeline with no information scores (22) and how it falls with fewer, noisier or false detections. It falls steadily on all three, and the solver is deterministic, so differences on the same fixtures are real. No ball positions are labelled, so detector accuracy is only measured through the touches it leads to; `python/label_ball.py` would give a direct measure.
+
 ## Retraining the ball detector
 TrackNet's published weights miss fast, motion-blurred balls on this footage (a spike is a streak several ball widths long per frame). Retrain it on your own labels:
 1. `python python/label_ball.py eval/videos/clip.mp4` → `eval/ball_labels/clip.json`. Suggestions are pre-marked (yellow: the analyzer's ball, magenta 1-9: moving yellow blobs), so most frames take one key: Enter accepts yellow, a number accepts a magenta candidate, a click places the ball, `n` means no ball visible. `g` jumps to the next frame where the detector lost the ball during play; those matter most. Label runs of consecutive frames, and include some easy and some no-ball frames. A few hundred frames across several clips is a useful start.

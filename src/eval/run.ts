@@ -1,5 +1,6 @@
 /**
- * npm run eval [-- --only name1,name2] [-- --params file.json] [-- --save-baseline]
+ * npm run eval [-- --only name1,name2] [-- --real] [-- --params file.json] [-- --save-baseline]
+ * EVAL_COURT=detected scores real clips on the analyzer's court instead of the labelled one.
  *
  * Runs the 3D solver on every synthetic scenario and every real fixture,
  * prints a score table, and writes eval/report.html and eval/last.json.
@@ -7,7 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { allCases, EVAL_DIR } from "./dataset";
-import { aggregateScore, evaluateCase, type CaseResult, type RallyParamsOverride } from "./evaluate";
+import { aggregateScore, evaluateCase, realSummary, type CaseResult, type RallyParamsOverride } from "./evaluate";
 import { writeReport } from "./report";
 
 function arg(name: string): string | undefined {
@@ -21,7 +22,7 @@ const params: RallyParamsOverride | undefined = paramsFile
   ? JSON.parse(fs.readFileSync(paramsFile, "utf8"))
   : undefined;
 
-const cases = allCases().filter((c) => !only || only.includes(c.name));
+const cases = allCases().filter((c) => (!only || only.includes(c.name)) && !(process.argv.includes("--real") && c.synthetic));
 const results: CaseResult[] = [];
 for (const c of cases) {
   const r = evaluateCase(c, params);
@@ -34,19 +35,29 @@ for (const c of cases) {
     (m
       ? `score ${m.score.toFixed(1).padStart(5)}  touches ${m.touchesMatched}/${m.touchesTrue} (found ${m.touchesFound})` +
         `  type ${fmt(m.typeAccuracy)}  pos ${fmt(m.touchPosErrM)} m  h ${fmt(m.touchHeightErrM)} m  dt ${fmt(m.touchFrameErr)} f` +
-        `  path ${fmt(m.pathRmsM)} m  cov ${fmt(m.pathCoverage)}  reproj ${fmt(m.reprojMedianPx, 1)} px`
+        `  path ${fmt(m.pathRmsM)} m  cov ${fmt(m.pathCoverage)}  reproj ${fmt(m.reprojMedianPx, 1)} px  court ${fmt(m.courtErrPx, 1)} px`
       : `unlabelled: ${r.run?.result.touches?.length ?? 0} touches found`) +
     `  (${r.run?.millis ?? 0} ms)`,
   );
 }
 const total = aggregateScore(results);
 console.log(`\nOverall score (labelled, excluding known limits): ${total.toFixed(1)}`);
+const real = realSummary(results);
+if (real) {
+  console.log(
+    `Real clips (${process.env.EVAL_COURT === "detected" ? "analyzer's court" : "labelled court"}): ${real.mean.toFixed(1)}` +
+    `  95% CI ${real.ci95[0].toFixed(1)}-${real.ci95[1].toFixed(1)} over ${real.clips} clips` +
+    `  touches: recall ${real.recall.toFixed(2)} precision ${real.precision.toFixed(2)}` +
+    (real.courtErrPx != null ? `  court error ${real.courtErrPx.toFixed(1)} px` : ""),
+  );
+}
 
 fs.mkdirSync(EVAL_DIR, { recursive: true });
 const summary = {
   when: new Date().toISOString(),
   params: params ?? "defaults",
   overall: total,
+  real,
   cases: results.map((r) => ({ name: r.case.name, synthetic: r.case.synthetic, knownLimit: r.case.knownLimit, metrics: r.metrics })),
 };
 fs.writeFileSync(path.join(EVAL_DIR, "last.json"), JSON.stringify(summary, null, 2));

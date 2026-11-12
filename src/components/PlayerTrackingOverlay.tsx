@@ -1,12 +1,12 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useReducer, useRef } from "react";
 import type { FrameData } from "../hooks/useAnalysis";
 
 const TRAIL_LENGTH = 60; // frames to trail
 const BALL_TRAIL_LENGTH = 30; // shorter trail for ball
 
 const PLAYER_COLORS = {
-  p1: { fill: "#4fc3f7", stroke: "#0288d1" },
-  p2: { fill: "#ff8a65", stroke: "#e64a19" },
+  p1: { fill: "#3d8ee6", stroke: "#2268b5" },
+  p2: { fill: "#e4623c", stroke: "#b5461f" },
 };
 
 interface PlayerTrackingOverlayProps {
@@ -23,6 +23,14 @@ export default function PlayerTrackingOverlay({
   containerEl,
 }: PlayerTrackingOverlayProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [resized, redraw] = useReducer((n: number) => n + 1, 0);
+
+  useEffect(() => {
+    if (!containerEl) return;
+    const ro = new ResizeObserver(redraw);
+    ro.observe(containerEl);
+    return () => ro.disconnect();
+  }, [containerEl]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -165,7 +173,7 @@ export default function PlayerTrackingOverlay({
 
 
     }
-  }, [frames, currentFrame, videoEl, containerEl]);
+  }, [frames, currentFrame, videoEl, containerEl, resized]);
 
   return (
     <canvas

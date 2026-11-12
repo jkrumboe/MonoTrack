@@ -419,6 +419,69 @@ def refine_camera(H, dist, img_w, img_h, caps=(12.0, 5.0)):
     return unpack(x0)
 
 
+def persistent_line_mask(masks_and_homographies, w, h, min_share=0.3):
+    """Line pixels that stay put across a clip, in the reference image.
+
+    masks_and_homographies: [(white_line_mask of a frame, 3x3 frame -> reference
+    in normalised coords)]. Warped into one image the painted lines coincide
+    while players and the ball do not, and a line a player hides on one frame
+    shows on the others.
+    """
+    N = np.diag([float(w), float(h), 1.0])
+    total, seen = np.zeros((h, w), np.float32), np.zeros((h, w), np.float32)
+    grow = np.ones((3, 3), np.uint8)
+    for mask, Hn in masks_and_homographies:
+        Hp = N @ Hn @ np.linalg.inv(N)
+        m = cv2.warpPerspective(mask, Hp, (w, h), flags=cv2.INTER_NEAREST)
+        # Thin lines warped by a slightly wrong estimate miss each other: widen a little.
+        total += cv2.dilate(m, grow).astype(np.float32) / 255.0
+        v = np.ones(mask.shape[:2], np.uint8)
+        seen += cv2.warpPerspective(v, Hp, (w, h), flags=cv2.INTER_NEAREST).astype(np.float32)
+    share = total / np.maximum(seen, 1.0)
+    # Pixels seen by only one or two frames can't show persistence.
+    enough = seen >= min(3, len(masks_and_homographies))
+    return ((share >= min_share) & enough).astype(np.uint8) * 255
+
+
+def line_support(H, line_mask, tol=2.5):
+    """Share of the visible court model on painted line pixels, H mapping centred
+    court (x, z, 1) to pixels. With a persistent mask little is occluded, so a
+    right court approaches 1 and a shifted one falls fast."""
+    h, w = line_mask.shape[:2]
+    dist = cv2.distanceTransform((line_mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    p = H @ _SAMPLES_H
+    ok = p[2] > 1e-9
+    u = np.where(ok, p[0] / np.where(ok, p[2], 1), -1)
+    v = np.where(ok, p[1] / np.where(ok, p[2], 1), -1)
+    vis = ok & (u >= 2) & (u < w - 2) & (v >= 2) & (v < h - 2)
+    if vis.sum() < 40:
+        return 0.0
+    return float((dist[v[vis].astype(int), u[vis].astype(int)] <= tol).mean())
+
+
+def snap_court_to_lines(corners, line_mask):
+    """Fit a court (normalised corners) to a persistent line mask.
+
+    Returns (corners, support before, support after). The refined court is kept
+    only if more of it lands on the lines, so a good court can't be dragged
+    onto a stray one.
+    """
+    h, w = line_mask.shape[:2]
+    H, _ = cv2.findHomography(_CORNERS_CENTRED, np.array(corners, np.float64) * [w, h])
+    if H is None:
+        return corners, 0.0, 0.0
+    before = line_support(H, line_mask)
+    dist = cv2.distanceTransform((line_mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    R = refine_camera(H, dist, w, h)
+    after = line_support(R, line_mask)
+    if after <= before:
+        return corners, before, before
+    S = np.diag([1.0 / w, 1.0 / h, 1.0])
+    c = S @ R @ np.concatenate([_CORNERS_CENTRED.T, np.ones((1, 4))])
+    out = [[round(float(c[0, i] / c[2, i]), 6), round(float(c[1, i] / c[2, i]), 6)] for i in range(4)]
+    return out, before, after
+
+
 def detect_court_lines(frame, debug=False):
     """Detect the court from its lines.
 

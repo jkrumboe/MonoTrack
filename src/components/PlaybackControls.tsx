@@ -1,12 +1,24 @@
+import { nextRallyAfter, rallyAt, type MatchTimeline } from "../utils/matchTimeline";
+import { IconNextRally, IconPause, IconPlay, IconPrevRally, IconStepBack, IconStepForward } from "./Icons";
+import { Scrubber } from "./MatchTimeline";
+
 interface PlaybackControlsProps {
   currentFrame: number;
   totalFrames: number;
   isPlaying: boolean;
   /** When given, the counter shows clip time as well as the frame number. */
   fps?: number;
+  timeline?: MatchTimeline;
+  /** Touch kinds to mark on the scrubber; all when empty. */
+  kinds?: ReadonlySet<string>;
+  ralliesOnly?: boolean;
+  onRalliesOnlyChange?: (v: boolean) => void;
   onFrameChange: (frame: number) => void;
   onTogglePlay: () => void;
 }
+
+/** Past this far into a rally, "previous" goes to its start rather than the rally before. */
+const RESTART_RALLY_S = 1;
 
 function formatTime(seconds: number): string {
   const s = Math.max(0, seconds);
@@ -19,41 +31,84 @@ export default function PlaybackControls({
   totalFrames,
   isPlaying,
   fps,
+  timeline,
+  kinds,
+  ralliesOnly,
+  onRalliesOnlyChange,
   onFrameChange,
   onTogglePlay,
 }: PlaybackControlsProps) {
+  const rallies = timeline?.rallies ?? [];
+  const current = rallyAt(rallies, currentFrame);
+  const next = nextRallyAfter(rallies, currentFrame);
+  const restartFrames = RESTART_RALLY_S * (fps ?? 30);
+  const prev = [...rallies].reverse().find((r) => r.clipStart < currentFrame - restartFrames);
+
   return (
     <div className="playback-controls">
-      <button
-        className="play-btn"
-        onClick={onTogglePlay}
-        title={isPlaying ? "Pause (Space)" : "Play (Space)"}
-      >
-        {isPlaying ? "⏸" : "▶"}
-      </button>
-      <input
-        type="range"
-        min={0}
-        max={Math.max(0, totalFrames - 1)}
-        value={currentFrame}
-        onChange={(e) => onFrameChange(Number(e.target.value))}
-        className="frame-slider"
-        title="Drag to scrub · ←/→ step a frame · Shift for 10"
-      />
-      <span className="frame-counter">
-        {fps ? (
-          <>
-            {formatTime(currentFrame / fps)} / {formatTime(totalFrames / fps)}
-            <span className="frame-counter-sub">
-              {" "}· f{currentFrame + 1}/{totalFrames}
-            </span>
-          </>
-        ) : (
-          <>
-            {currentFrame + 1} / {totalFrames}
-          </>
+      <div className="transport">
+        <div className="transport-buttons">
+          {rallies.length > 0 && (
+            <button className="icon-btn" onClick={() => prev && onFrameChange(prev.clipStart)} disabled={!prev} title="Previous rally" aria-label="Previous rally">
+              <IconPrevRally />
+            </button>
+          )}
+          <button className="icon-btn" onClick={() => onFrameChange(currentFrame - 1)} title="Back one frame (←)" aria-label="Back one frame">
+            <IconStepBack />
+          </button>
+          <button
+            className="play-btn"
+            onClick={onTogglePlay}
+            title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+            aria-label={isPlaying ? "Pause" : "Play"}
+          >
+            {isPlaying ? <IconPause size={15} /> : <IconPlay size={15} />}
+          </button>
+          <button className="icon-btn" onClick={() => onFrameChange(currentFrame + 1)} title="Forward one frame (→)" aria-label="Forward one frame">
+            <IconStepForward />
+          </button>
+          {rallies.length > 0 && (
+            <button className="icon-btn" onClick={() => next && onFrameChange(next.clipStart)} disabled={!next} title="Next rally" aria-label="Next rally">
+              <IconNextRally />
+            </button>
+          )}
+        </div>
+
+        <span className="frame-counter">
+          {fps ? (
+            <>
+              <b>{formatTime(currentFrame / fps)}</b> / {formatTime(totalFrames / fps)}
+              <span className="frame-counter-sub">Frame {currentFrame + 1}</span>
+            </>
+          ) : (
+            <>
+              <b>{currentFrame + 1}</b> / {totalFrames}
+            </>
+          )}
+        </span>
+
+        {rallies.length > 0 && (
+          <span className="transport-rally">
+            {current ? `Rally ${current.index} of ${rallies.length}` : `${rallies.length} ${rallies.length === 1 ? "rally" : "rallies"}`}
+          </span>
         )}
-      </span>
+
+        {rallies.length > 0 && onRalliesOnlyChange && (
+          <label className="switch" title="Playback jumps over the breaks between rallies">
+            <input type="checkbox" checked={!!ralliesOnly} onChange={(e) => onRalliesOnlyChange(e.target.checked)} />
+            <span className="switch-track" />
+            Rallies only
+          </label>
+        )}
+      </div>
+      <Scrubber
+        timeline={timeline}
+        totalFrames={totalFrames}
+        currentFrame={currentFrame}
+        fps={fps}
+        kinds={kinds}
+        onSeek={onFrameChange}
+      />
     </div>
   );
 }

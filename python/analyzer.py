@@ -167,6 +167,57 @@ def _get_pose_model():
     return _pose_model
 
 
+# Line masks spread over a clip for the multi-frame court fit.
+COURT_FIT_MASKS = 16
+
+
+def _fit_court_to_lines(entry, candidates, all_frame_data, line_masks, motion, fh, fw):
+    """Pick the court the painted lines support best, and snap it onto them.
+
+    Lines that persist across the clip are measured against, not any one frame:
+    a player's shirt or a board can pull a single-frame fit onto the wrong line
+    (one clip's best-agreeing candidate was 47 px off, its best-supported 4 px),
+    and a court carried from another clip of the match is typically 15-25 px
+    off. candidates are the other courts found, as (frame, corners).
+    """
+    try:
+        from court_lines import _CORNERS_CENTRED, line_support, persistent_line_mask, snap_court_to_lines
+        pairs = [(m, motion.ref_from_frame(fi)) for fi, m in line_masks.items()]
+        pairs = [(m, H) for m, H in pairs if H is not None]
+        if len(pairs) < 3:
+            return
+        mask = persistent_line_mask(pairs, fw, fh)
+        S = np.diag([float(fw), float(fh), 1.0])
+
+        def homography(corners):
+            H, _ = cv2.findHomography(_CORNERS_CENTRED, np.array(corners, np.float64))
+            return H
+
+        best, best_support = entry["corners"], line_support(S @ homography(entry["corners"]), mask)
+        start = best_support
+        for fi, corners in candidates:
+            Hf = motion.ref_from_frame(fi)
+            if Hf is None:
+                continue
+            H = Hf @ homography(corners)
+            sup = line_support(S @ H, mask)
+            if sup > best_support:
+                c = H @ np.concatenate([_CORNERS_CENTRED.T, np.ones((1, 4))])
+                best = [[round(float(c[0, i] / c[2, i]), 6), round(float(c[1, i] / c[2, i]), 6)] for i in range(4)]
+                best_support = sup
+        corners, _before, after = snap_court_to_lines(best, mask)
+        print(f"[court] Fit to {len(pairs)} frames' lines: on-line share "
+              f"{start:.2f} -> {after:.2f}", file=sys.stderr)
+        if corners != entry["corners"]:
+            kps = _reproject_keypoints_from_corners(corners, fh, fw)
+            for fd in all_frame_data:
+                if fd["corners"] is entry["corners"]:
+                    fd["corners"], fd["keypoints"] = corners, kps
+            entry["corners"], entry["keypoints"] = corners, kps
+    except Exception as e:
+        print(f"[court] Fit to lines failed: {e}", file=sys.stderr)
+
+
 # COCO class index for "sports ball" (includes volleyball)
 _SPORTS_BALL_CLASS = 32
 
@@ -175,10 +226,17 @@ _tracknet_tried = False
 
 
 def _get_tracknet_detector():
-    """Lazy-load the TrackNetV2 volleyball ball detector. Returns None if unavailable.
+    """Lazy-load the multi-frame volleyball ball detector. Returns None if unavailable.
 
-    Preferred over YOLO: it sees 3 frames at once, so a fast, blurred ball is
-    found by its motion instead of its (very weak) single-frame appearance.
+    Preferred over YOLO: it sees several frames at once, so a fast, blurred
+    ball is found by its motion instead of its (very weak) single-frame
+    appearance. BALL_DETECTOR picks the network:
+      tracknetv2  TrackNetV2, WASB-SBDT weights, 3 frames (default: 71 on the eval)
+      vballnet    VballNet ONNX, 9 grayscale frames (55 on the eval, but CPU only)
+      tracknetv3  TrackNetV3, beach-volleyball weights, 8 frames + background
+    BALL_THRESHOLD overrides its heatmap threshold (default 0.5), BALL_STRIDE how
+    many frames the window advances (each network has its default) and
+    BALL_STABILIZE=0 turns off warping windows to cancel camera motion.
     """
     global _tracknet_detector, _tracknet_tried
     if _tracknet_detector is not None or _tracknet_tried:
@@ -186,8 +244,19 @@ def _get_tracknet_detector():
     _tracknet_tried = True
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from ball_tracknet import TrackNetBallDetector
-        _tracknet_detector = TrackNetBallDetector()
+        kind = os.environ.get("BALL_DETECTOR", "tracknetv2").lower()
+        kw = {"threshold": float(os.environ["BALL_THRESHOLD"])} if os.environ.get("BALL_THRESHOLD") else {}
+        if kind == "tracknetv2":
+            from ball_tracknet import TrackNetBallDetector as Detector
+        elif kind == "tracknetv3":
+            from ball_tracknetv3 import TrackNetV3BallDetector as Detector
+        elif kind == "vballnet":
+            from ball_vballnet import VballNetBallDetector as Detector
+        else:
+            raise ValueError(f"unknown BALL_DETECTOR {kind!r}")
+        _tracknet_detector = Detector(**kw)
+        if os.environ.get("BALL_STRIDE"):
+            _tracknet_detector.stride = int(os.environ["BALL_STRIDE"])
         return _tracknet_detector
     except Exception as e:
         print(f"[tracknet] Unavailable ({e}) — falling back to YOLO", file=sys.stderr)
@@ -2126,10 +2195,24 @@ def analyze_video_cv(video_path: str):
     ball_tracker = _BallTracker()
     ball_diam = {}  # frame_idx -> apparent ball diameter (px), TrackNet only
     n_ball_candidates = 0
-    # TrackNet consumes non-overlapping 3-frame windows, so frames are buffered
-    # here and the whole window is detected at once.
-    tn_buf, tn_idx = [], []
-    detector_name = "tracknet" if tracknet is not None else "yolo"
+    detector_name = tracknet.name if tracknet is not None else "yolo"
+
+    def _take_ball(finished):
+        nonlocal n_ball_candidates
+        for fi_w, frm, hm in finished:
+            cands = tracknet.candidates(hm, frm.shape[1], frm.shape[0])
+            n_ball_candidates += len(cands)
+            det = ball_tracker.update(fi_w, cands)
+            if det is None:
+                continue
+            ball_raw[fi_w] = det
+            d_px = measure_ball_diameter(frm, det[0], det[1])
+            if d_px is not None:
+                ball_diam[fi_w] = d_px
+            if fi_w in all_players:
+                ball_players[fi_w] = _players_near_ball(all_players[fi_w], frm.shape[1] / frm.shape[0], det[0], det[1])
+            if fi_w < 3 or fi_w % 50 == 0:
+                print(f"[{tracknet.name}] Frame {fi_w}: ball at {det[0]:.3f}, {det[1]:.3f} conf={det[2]:.3f}", file=sys.stderr)
     
     if tracknet is None and yolo_model is None:
         print("[ball] No detector available — skipping ball detection", file=sys.stderr)
@@ -2147,6 +2230,10 @@ def analyze_video_cv(video_path: str):
     COURT_SEARCH_LAST_FRAME = 300
     court_candidates = []  # (camera centre, frame_idx, timestamp, corners)
     court_quality = {}     # frame_idx -> line detector's fit quality
+    # A court is fitted to the lines that stay put over the clip, so a few
+    # masks spread over all of it; players hide different lines on each.
+    line_masks = {}        # frame_idx -> white_line_mask
+    LINE_MASK_STRIDE = max(1, total_frames // COURT_FIT_MASKS)
     frame_idx = 0
     # Pan/zoom from a fixed spot: measure each frame's homography so ball,
     # sizes and players can be expressed in the court-calibration frame.
@@ -2179,10 +2266,9 @@ def analyze_video_cv(video_path: str):
     decode_thread.start()
     motion_thread.start()
 
-    # A court placed by hand on an earlier clip of the same match (same
-    # camera spot, so the venue matches) beats automatic detection, which
-    # cannot handle side views at all. Looked up first, so the automatic
-    # search is skipped when it is found.
+    # A court placed by hand on an earlier clip of the same match (same camera
+    # spot, so the venue matches) is the starting point when there is one. The
+    # automatic search still runs: the two compete in _fit_court_to_lines.
     saved_corners = None
 
     while True:
@@ -2202,12 +2288,19 @@ def analyze_video_cv(video_path: str):
             except Exception as e:
                 print(f"[court] Saved-court lookup failed: {e}", file=sys.stderr)
 
+        if frame_idx % LINE_MASK_STRIDE == 0:
+            try:
+                from court_lines import white_line_mask
+                line_masks[frame_idx] = white_line_mask(frame)
+            except Exception as e:
+                print(f"[court] Line mask at frame {frame_idx}: {e}", file=sys.stderr)
+
         frame_court_corners = None
         frame_court_keypoints = None
         # Sample several frames rather than trusting whichever quad frame 0
         # happened to produce: a single bad detection there poisons the
         # calibration and therefore every 3D position in the clip.
-        if saved_corners is None and frame_idx <= COURT_SEARCH_LAST_FRAME                 and frame_idx % COURT_SEARCH_STRIDE == 0:
+        if frame_idx <= COURT_SEARCH_LAST_FRAME                 and frame_idx % COURT_SEARCH_STRIDE == 0:
             try:
                 corners = None
                 # Painted-line fit first: it handles side cameras and courts
@@ -2258,31 +2351,7 @@ def analyze_video_cv(video_path: str):
                 print(f"[players] Frame {frame_idx} error: {e}", file=sys.stderr)
 
         # ── Ball detection ───────────────────────────────────────────────
-        if tracknet is not None:
-            tn_buf.append(frame)
-            tn_idx.append(frame_idx)
-            if len(tn_buf) == 3:
-                try:
-                    per_frame = tracknet.detect_window(tn_buf)
-                    for fi_w, cands, frm in zip(tn_idx, per_frame, tn_buf):
-                        n_ball_candidates += len(cands)
-                        det = ball_tracker.update(fi_w, cands)
-                        if det is not None:
-                            ball_raw[fi_w] = det
-                            d_px = measure_ball_diameter(frm, det[0], det[1])
-                            if d_px is not None:
-                                ball_diam[fi_w] = d_px
-                            if fi_w in all_players:
-                                ball_players[fi_w] = _players_near_ball(all_players[fi_w], frm.shape[1] / frm.shape[0], det[0], det[1])
-                            if fi_w < 3 or fi_w % 50 == 0:
-                                print(f"[tracknet] Frame {fi_w}: ball at {det[0]:.3f}, {det[1]:.3f} conf={det[2]:.3f}", file=sys.stderr)
-                except Exception as e:
-                    print(f"[tracknet] Window at frame {frame_idx} error: {e}", file=sys.stderr)
-                    if frame_idx < 6:
-                        import traceback
-                        traceback.print_exc(file=sys.stderr)
-                tn_buf, tn_idx = [], []
-        elif yolo_model is not None:
+        if tracknet is None and yolo_model is not None:
             try:
                 cands = _detect_ball_candidates(frame, yolo_model)
                 n_ball_candidates += len(cands)
@@ -2307,30 +2376,10 @@ def analyze_video_cv(video_path: str):
         percent = int((frame_idx + 1) / max(total_frames, 1) * 100)
         if percent % 5 == 0 and frame_idx > 0:
             send_progress(
-                min(percent // 2, 48),
+                percent // 3,
                 f"Detecting: frame {frame_idx + 1}/{total_frames}"
             )
         frame_idx += 1
-
-    if tracknet is not None and tn_buf:
-        # Pad the trailing partial window with its last frame so the final
-        # 1-2 frames still get detections; only the real indices are consumed.
-        pad = list(tn_buf) + [tn_buf[-1]] * (3 - len(tn_buf))
-        try:
-            per_frame = tracknet.detect_window(pad)
-            for fi_w, cands, frm in zip(tn_idx, per_frame[:len(tn_idx)], tn_buf):
-                n_ball_candidates += len(cands)
-                det = ball_tracker.update(fi_w, cands)
-                if det is not None:
-                    ball_raw[fi_w] = det
-                    d_px = measure_ball_diameter(frm, det[0], det[1])
-                    if d_px is not None:
-                        ball_diam[fi_w] = d_px
-                    if fi_w in all_players:
-                        ball_players[fi_w] = _players_near_ball(all_players[fi_w], frm.shape[1] / frm.shape[0], det[0], det[1])
-        except Exception as e:
-            print(f"[tracknet] Tail window error: {e}", file=sys.stderr)
-        tn_buf, tn_idx = [], []
 
     to_motion.put(_DONE)
     motion_thread.join()
@@ -2393,6 +2442,9 @@ def analyze_video_cv(video_path: str):
     ref_frame = court_data[0]["frame"] if court_data else 0
     motion.set_reference(ref_frame)
     camera_moving = not motion.is_static()
+    if court_data and line_masks:
+        _fit_court_to_lines(court_data[0], [(c[1], c[3]) for c in court_candidates],
+                            all_frame_data, line_masks, motion, fh, fw)
     if camera_moving:
         zooms = [z for z in (motion.zoom(i) for i in range(frame_idx)) if z]
         n_bad = sum(1 for i in range(frame_idx) if motion.ref_from_frame(i) is None)
@@ -2400,6 +2452,38 @@ def analyze_video_cv(video_path: str):
               f"{n_bad}/{frame_idx} frames without a trusted motion estimate", file=sys.stderr)
     else:
         print("[camera] Static camera", file=sys.stderr)
+
+    # ── Pass 2: ball, on windows with the camera motion cancelled ──────────
+    # Its own decode of the video because it needs the motion measured above:
+    # the networks read the ball from what changes between frames, and on a
+    # panning camera everything does. Took the labelled clips from 67 to 71,
+    # and touch positions from 2.3 to 1.6 m off.
+    if tracknet is not None:
+        from ball_tracknet import WindowStream
+        stabilize = camera_moving and os.environ.get("BALL_STABILIZE") != "0"
+        ball_motion = motion.ref_from_frame if stabilize else None
+        try:
+            if hasattr(tracknet, "begin_clip"):
+                tracknet.begin_clip(video_path, ball_motion)
+            stream = WindowStream(tracknet, getattr(tracknet, "stride", None), ball_motion)
+            cap2 = cv2.VideoCapture(video_path)
+            fi2 = 0
+            while True:
+                ret2, frame2 = cap2.read()
+                if not ret2:
+                    break
+                _take_ball(stream.push(frame2))
+                fi2 += 1
+                percent = int(fi2 / max(total_frames, 1) * 100)
+                if percent % 5 == 0:
+                    send_progress(33 + percent // 7, f"Tracking the ball: frame {fi2}/{total_frames}")
+            _take_ball(stream.flush())
+            cap2.release()
+        except Exception as e:
+            # Nothing tracked: the safety net below then retries with YOLO.
+            print(f"[{tracknet.name}] Ball pass failed: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
 
     # ── Safety net: fall back to YOLO if TrackNet found almost nothing ─────
     # TrackNet is trained on real broadcast volleyball; if this footage is far
@@ -2409,7 +2493,7 @@ def analyze_video_cv(video_path: str):
         coverage = len(ball_raw) / frame_idx
         print(f"[tracknet] Peak heatmap response over the clip: "
               f"{getattr(tracknet, 'max_peak', 0.0):.3f} "
-              f"(detection threshold {0.5})", file=sys.stderr)
+              f"(detection threshold {tracknet.threshold})", file=sys.stderr)
         if coverage < 0.05:
             print(f"[ball] TrackNet covered only {coverage*100:.1f}% of frames — "
                   f"retrying with YOLO", file=sys.stderr)
@@ -2420,7 +2504,7 @@ def analyze_video_cv(video_path: str):
                 ball_players = {}
                 ball_tracker = _BallTracker()
                 n_ball_candidates = 0
-                detector_name = "yolo (tracknet fallback)"
+                detector_name = f"yolo ({tracknet.name} fallback)"
                 cap2 = cv2.VideoCapture(video_path)
                 fi2 = 0
                 while True:

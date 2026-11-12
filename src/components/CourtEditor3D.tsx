@@ -52,7 +52,7 @@ export default function CourtEditor3D(p: Readonly<Props>) {
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setW(Math.floor((el.clientWidth - 10) / 2)));
+    const ro = new ResizeObserver(() => setW(Math.floor((el.clientWidth - 20) / 2)));
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
@@ -82,7 +82,7 @@ export default function CourtEditor3D(p: Readonly<Props>) {
       cv.style.width = `${w}px`; cv.style.height = `${h}px`;
       const ctx = cv.getContext("2d")!;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = css("--bg-secondary", "#1a1a2e"); ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = css("--bg-stage", "#0d1014"); ctx.fillRect(0, 0, w, h);
       const line = (pts: V3[], color: string, width = 1, dash: number[] = []) => {
         ctx.beginPath(); ctx.setLineDash(dash); ctx.strokeStyle = color; ctx.lineWidth = width;
         pts.forEach((q, i) => (i ? ctx.lineTo(...px(q)) : ctx.moveTo(...px(q))));
@@ -90,7 +90,7 @@ export default function CourtEditor3D(p: Readonly<Props>) {
       };
       const courtLine = "rgba(255,255,255,.45)";
       if (view === "top") {
-        ctx.fillStyle = "rgba(201,138,75,.18)";
+        ctx.fillStyle = "rgba(61,94,128,.32)";
         const [x0, y0] = px([-4.5, 0, -9]), [x1, y1] = px([4.5, 0, 9]);
         ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
         line([[-4.5, 0, -9], [-4.5, 0, 9], [4.5, 0, 9], [4.5, 0, -9], [-4.5, 0, -9]], courtLine);
@@ -98,9 +98,9 @@ export default function CourtEditor3D(p: Readonly<Props>) {
         line([[-5, 0, 0], [5, 0, 0]], "rgba(255,220,90,.9)", 2);
       } else {
         line([[0, 0, -Z_MAX], [0, 0, Z_MAX]], courtLine);
-        line([[0, 0, -9], [0, 0, 9]], "rgba(201,138,75,.8)", 3);
+        line([[0, 0, -9], [0, 0, 9]], "rgba(93,113,134,.9)", 3);
         line([[0, 0, 0], [0, 2.43, 0]], "rgba(255,220,90,.9)", 2);
-        ctx.fillStyle = "rgba(255,255,255,.4)"; ctx.font = "10px -apple-system, Segoe UI, sans-serif";
+        ctx.fillStyle = "rgba(255,255,255,.4)"; ctx.font = "10px 'Inter Variable', -apple-system, 'Segoe UI', sans-serif";
         ctx.fillText("net 2.43 m", px([0, 2.43, 0])[0] + 4, px([0, 2.43, 0])[1] - 2);
         line([[0, 2.43, -Z_MAX], [0, 2.43, Z_MAX]], "rgba(255,255,255,.08)", 1, [3, 4]);
       }
@@ -110,7 +110,7 @@ export default function CourtEditor3D(p: Readonly<Props>) {
         const [cx, cy] = px(c);
         const inView = cx >= 0 && cx <= w && cy >= 0 && cy <= h;
         const [ex, ey] = [Math.max(8, Math.min(w - 8, cx)), Math.max(8, Math.min(h - 8, cy))];
-        ctx.fillStyle = "rgba(255,255,255,.6)"; ctx.font = "11px -apple-system, Segoe UI, sans-serif";
+        ctx.fillStyle = "rgba(255,255,255,.6)"; ctx.font = "11px 'Inter Variable', -apple-system, 'Segoe UI', sans-serif";
         ctx.fillText(inView ? "◉ camera" : "▸ camera", ex - (ex > w / 2 ? 56 : 0), ey + 4);
       }
       // Line of sight through the ball at the selected touch.

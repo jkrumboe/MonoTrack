@@ -4,8 +4,8 @@ import { describe, expect, it } from "vitest";
 import { __test__ } from "../utils/ballReconstruction";
 import { EVAL_DIR, realCases, syntheticCases } from "./dataset";
 import { aggregateScore, evaluateCase } from "./evaluate";
-import { calibrate, cameraFor, projectNorm } from "./pipeline";
-import type { Fixture } from "./types";
+import { calibrate, cameraFor, projectNorm, runFixture } from "./pipeline";
+import type { CourtLabel, Fixture } from "./types";
 
 describe("helpers", () => {
   it("fits a parabola exactly", () => {
@@ -24,6 +24,31 @@ describe("helpers", () => {
     expect(zones[0]?.label).toBe("toss");
     expect(zones[2]?.label).toBe("reception");
     expect(anchors[2]).toEqual([[-2.6, -4.7]]);
+  });
+});
+
+describe("camera roll", () => {
+  // 1 degree off level, as on real broadcast cameras.
+  const truth = { position: [-24, 9, 1] as [number, number, number], lookAt: [0, 0.5, 0] as [number, number, number], fov: 30, roll: (1 * Math.PI) / 180 };
+  const cam = cameraFor(truth, 16 / 9);
+  const fx: Fixture = { clip: "t", video: { width: 1920, height: 1080, fps: 25 }, courtCorners: null, frames: [] };
+  const world: [number, number][] = [[4.5, -9], [4.5, 0], [4.5, 9], [-4.5, -9], [-4.5, 0], [-4.5, 9]];
+  const points = world.map(([x, z], i) => ({ id: i, name: "", world: [x, z] as [number, number], frame: 0, pt: projectNorm(cam, [x, 0, z]) }));
+
+  it("is recovered, and the court then reprojects onto its points", () => {
+    const c = calibrate(fx, { view: "side", points })!;
+    expect(c.roll!).toBeCloseTo(truth.roll, 3);
+    const solved = cameraFor(c, 16 / 9);
+    for (const p of points) {
+      const q = projectNorm(solved, [p.world[0], 0, p.world[1]]);
+      expect(Math.hypot((q[0] - p.pt[0]) * 1920, (q[1] - p.pt[1]) * 1080)).toBeLessThan(0.5);
+    }
+  });
+
+  it("is about zero for a level camera", () => {
+    const level = cameraFor({ ...truth, roll: 0 }, 16 / 9);
+    const pts = world.map(([x, z], i) => ({ id: i, name: "", world: [x, z] as [number, number], frame: 0, pt: projectNorm(level, [x, 0, z]) }));
+    expect(Math.abs(calibrate(fx, { view: "side", points: pts })!.roll!)).toBeLessThan(1e-3);
   });
 });
 
@@ -60,6 +85,43 @@ describe("France vs Japan fixture", () => {
     expect(Math.abs(byLabel("set").position[2])).toBeLessThan(1.5);   // at the net
     expect(Math.abs(byLabel("attack").position[2])).toBeLessThan(1.6);
     expect(Math.abs(byLabel("block").position[2])).toBeLessThan(1);
+  });
+});
+
+describe("ball line", () => {
+  // Between the first solved frame of play and the last touch, as the 3D view draws it.
+  const holesInPlay = (fx: Fixture, c: { truth: { touches: { frame: number }[]; court?: CourtLabel } | null }) => {
+    const pos = runFixture(fx, undefined, false, c.truth!.court)!.result.positions;
+    const labelled = c.truth!.touches.map((t) => t.frame);
+    const first = Math.max(Math.min(...labelled), Math.min(...pos.keys())), last = Math.max(...labelled);
+    const holes: number[] = [];
+    for (let f = first; f <= last; f++) if (!pos.has(f)) holes.push(f);
+    return holes;
+  };
+  const labelled = realCases().filter((c) => c.truth?.touches.length);
+
+  for (const c of labelled) {
+    it(`${c.name} has no holes through the rally`, async () => {
+      await new Promise((r) => setImmediate(r));
+      expect(holesInPlay(c.fixture, c)).toEqual([]);
+    });
+  }
+
+  it("runs through a serve the detector never saw, marked as estimated", () => {
+    const c = labelled.find((x) => x.name === "pol_ita_r4");
+    if (!c) return;
+    const serve = c.truth!.touches.findIndex((t) => t.type === "serve");
+    const [a, b] = [c.truth!.touches[serve].frame, c.truth!.touches[serve + 1].frame];
+    const fx: Fixture = JSON.parse(JSON.stringify(c.fixture));
+    for (const f of fx.frames) {
+      if (f.frame <= a || f.frame >= b) continue;
+      f.ball_img_pos = undefined; f.ball_ref_pos = undefined; f.ball_interpolated = undefined;
+      f.ball_conf = undefined; f.ball_bbox = undefined; f.ball_diameter_px = undefined;
+      f.ball_ref_diameter_px = undefined; f.players_near_ball = undefined;
+    }
+    expect(holesInPlay(fx, c)).toEqual([]);
+    const { methods } = runFixture(fx, undefined, false, c.truth!.court)!.result;
+    expect(methods.get(Math.round((a + b) / 2))).toBe("estimated");
   });
 });
 

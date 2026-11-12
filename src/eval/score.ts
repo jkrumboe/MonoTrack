@@ -1,5 +1,6 @@
 import type { BallTouch } from "../utils/ballReconstruction";
-import { cameraFor, floorPoint, type PipelineRun } from "./pipeline";
+import type * as THREE from "three";
+import { calibrate, cameraFor, floorPoint, projectNorm, type PipelineRun } from "./pipeline";
 import type { ClipMetrics, Fixture, Truth } from "./types";
 
 /** A found touch counts as the true one if it is within this many seconds. */
@@ -23,12 +24,42 @@ export interface TouchMatch {
   heightErrM?: number;
 }
 
+function truthCalibration(fx: Fixture, truth: Truth) {
+  return truth.court ? calibrate(fx, truth.court) : null;
+}
+
+const COURT_POINTS: [number, number][] = [-4.5, 4.5].flatMap((x) => [-9, -3, 0, 3, 9].map((z): [number, number] => [x, z]));
+
+/**
+ * Mean distance in 1920x1080 pixels between the scored court and the labelled
+ * one, over court points in view of the reference image. A court is symmetric
+ * under a half turn, so a detected one may legitimately be labelled that way
+ * round: `flipped` says it is, and touch positions are then compared turned too.
+ */
+function courtError(a: THREE.PerspectiveCamera, b: THREE.PerspectiveCamera): { px: number | null; flipped: boolean } {
+  const dist = (s: number) => {
+    const es: number[] = [];
+    for (const [x, z] of COURT_POINTS) {
+      const t = projectNorm(a, [x, 0, z]);
+      if (t[0] < 0 || t[0] > 1 || t[1] < 0 || t[1] > 1) continue;
+      const p = projectNorm(b, [s * x, 0, s * z]);
+      es.push(Math.hypot((t[0] - p[0]) * 1920, (t[1] - p[1]) * 1080));
+    }
+    return es.length ? mean(es) : Infinity;
+  };
+  const same = dist(1), turned = dist(-1);
+  const px = Math.min(same, turned);
+  return { px: Number.isFinite(px) ? px : null, flipped: turned < same };
+}
+
 /** Greedy one-to-one matching of found touches to true ones by time. */
 export function matchTouches(fx: Fixture, truth: Truth, run: PipelineRun): TouchMatch[] {
   const fps = fx.video.fps;
   const found = [...(run.result.touches ?? [])];
   const used = new Set<number>();
-  const cam = cameraFor(run.calibration, fx.video.width / fx.video.height);
+  // Truth comes from the labelled court when there is one, never from the court
+  // being scored: otherwise a wrong court moves the truth along with the answer.
+  const cam = cameraFor(truthCalibration(fx, truth) ?? run.calibration, fx.video.width / fx.video.height);
   return truth.touches.map((tt) => {
     let best = -1, bestD = Infinity;
     found.forEach((f, i) => {
@@ -79,12 +110,20 @@ export function scoreClip(fx: Fixture, truth: Truth, run: PipelineRun | null): {
       metrics: {
         clip: fx.clip, synthetic, touchesTrue: truth.touches.length, touchesFound: 0, touchesMatched: 0,
         recall: 0, precision: 0, typeAccuracy: 0, touchPosErrM: null, touchHeightErrM: null, touchFrameErr: null,
-        pathRmsM: null, pathCoverage: synthetic ? 0 : null, reprojMedianPx: null, score: 0,
+        pathRmsM: null, pathCoverage: synthetic ? 0 : null, reprojMedianPx: null, courtErrPx: null, score: 0,
       },
     };
   }
   const matches = matchTouches(fx, truth, run);
   const matched = matches.filter((m) => m.found);
+  const aspect = fx.video.width / fx.video.height;
+  const labelCal = truthCalibration(fx, truth);
+  const court = labelCal ? courtError(cameraFor(labelCal, aspect), cameraFor(run.calibration, aspect)) : { px: null, flipped: false };
+  if (court.flipped) {
+    for (const m of matched) {
+      if (m.truePos) m.posErrM = Math.hypot(m.found!.position[0] + m.truePos[0], m.found!.position[2] + m.truePos[1]);
+    }
+  }
   const nFound = run.result.touches?.length ?? 0;
   const recall = truth.touches.length ? matched.length / truth.touches.length : 1;
   const precision = nFound ? matched.length / nFound : 0;
@@ -129,7 +168,7 @@ export function scoreClip(fx: Fixture, truth: Truth, run: PipelineRun | null): {
       recall, precision, typeAccuracy,
       touchPosErrM, touchHeightErrM: hErrs.length ? mean(hErrs) : null,
       touchFrameErr: matched.length ? mean(matched.map((m) => Math.abs(m.found!.frame - m.trueFrame))) : null,
-      pathRmsM, pathCoverage, reprojMedianPx: reproj.length ? median(reproj) : null,
+      pathRmsM, pathCoverage, reprojMedianPx: reproj.length ? median(reproj) : null, courtErrPx: court.px,
       score,
     },
   };

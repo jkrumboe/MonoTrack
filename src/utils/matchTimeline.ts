@@ -18,6 +18,8 @@ import type { BallTouch } from "./ballReconstruction";
 
 export type Side = "near" | "far";
 export const SIDES: readonly Side[] = ["near", "far"];
+/** One colour per side, everywhere it shows: panels, timeline, video and 3D players (--near, --far in App.css). */
+export const SIDE_COLORS: Record<Side, string> = { near: "#3d8ee6", far: "#e4623c" };
 export const otherSide = (s: Side): Side => (s === "near" ? "far" : "near");
 /** The half of the court a point lies in (the net is at z = 0). */
 export const sideOf = (z: number): Side => (z >= 0 ? "near" : "far");

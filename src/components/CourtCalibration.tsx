@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import * as THREE from "three";
 import { getBackend } from "../platform/backend";
-import { type CalibrationResult, solveCameraIterative } from "../utils/cameraSolver";
+import { aimCamera, type CalibrationResult, solveCameraIterative } from "../utils/cameraSolver";
 import { computeHomography, applyHomography } from "../utils/courtHomography";
 
 /** Top of the net tape (m), men's height. */
@@ -214,8 +214,7 @@ export default function CourtCalibration({
     if (!adjusting || !initialCalibration) return;
     const aspect = getVideoAspect();
     const cam = new THREE.PerspectiveCamera(initialCalibration.fov, aspect, 0.1, 500);
-    cam.position.set(...initialCalibration.position);
-    cam.lookAt(new THREE.Vector3(...initialCalibration.lookAt));
+    aimCamera(cam, initialCalibration);
     cam.updateMatrixWorld();
     cam.updateProjectionMatrix();
     // A camera along a sideline is a side view: name the points that way.
@@ -418,8 +417,7 @@ export default function CourtCalibration({
 
     // ── Step 6 ─ reprojection ─────────────────────────────────────────────────
     const rCam = new THREE.PerspectiveCamera(result.fov, videoAR, 0.1, 500);
-    rCam.position.set(...result.position);
-    rCam.lookAt(new THREE.Vector3(...result.lookAt));
+    aimCamera(rCam, result);
     rCam.updateMatrixWorld();
     rCam.updateProjectionMatrix();
 

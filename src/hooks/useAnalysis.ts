@@ -8,7 +8,9 @@ export type BallReconstructionMethod =
   | "ground-intersection"
   | "bbox-bottom-ray"
   | "ballistic-arc"
-  | "physics-reprojection";
+  | "physics-reprojection"
+  /** Filling a hole in the fitted path, so the line runs through the rally. Not a fit. */
+  | "estimated";
 
 export interface FrameData {
   action: "frame";

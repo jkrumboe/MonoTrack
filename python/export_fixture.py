@@ -36,6 +36,8 @@ def main():
     ap.add_argument("video")
     ap.add_argument("--from-jsonl", help="analyzer stdout saved earlier, instead of running it")
     ap.add_argument("--name", help="clip name (default: video file name)")
+    ap.add_argument("--out-dir", default=os.path.join(EVAL_DIR, "fixtures"),
+                    help="where to write it (default eval/fixtures; score another folder with EVAL_FIXTURES_DIR)")
     args = ap.parse_args()
 
     if args.from_jsonl:
@@ -69,9 +71,8 @@ def main():
         "cameraMoving": bool(done.get("camera_moving", False)),
         "frames": frames,
     }
-    out_dir = os.path.join(EVAL_DIR, "fixtures")
-    os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, name + ".json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    out = os.path.join(args.out_dir, name + ".json")
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(fixture, fh, separators=(",", ":"))
     n_ball = sum(1 for f in frames if f.get("ball_img_pos") and not f.get("ball_interpolated"))

@@ -92,6 +92,8 @@ export interface ClipMetrics {
   pathCoverage: number | null;
   /** Median reprojection error of solved positions onto detections (px). */
   reprojMedianPx: number | null;
+  /** Scored court vs the labelled court, px at 1920x1080. Null when unlabelled. */
+  courtErrPx: number | null;
   /** Combined 0-100 score used for gating and tuning (higher is better). */
   score: number;
 }

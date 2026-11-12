@@ -197,6 +197,36 @@ def ensure_weights(path=None):
     return path if os.path.isfile(path) else None
 
 
+def download_checked(url, path, sha256):
+    """Return path, downloading url there first if missing; None on failure.
+
+    The file is written under a temporary name and kept only if its SHA-256
+    matches, so a truncated download or a changed upstream file never loads.
+    """
+    if os.path.isfile(path):
+        return path
+    import hashlib
+    import urllib.request
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    print(f"[ball] Downloading {os.path.basename(path)}", file=sys.stderr)
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        h = hashlib.sha256()
+        with open(tmp, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != sha256:
+            raise ValueError(f"checksum mismatch ({h.hexdigest()})")
+        os.replace(tmp, path)
+        return path
+    except Exception as e:
+        print(f"[ball] Download of {url} failed: {e}", file=sys.stderr)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return None
+
+
 # Pixels of anti-aliased rim lost on the two sides of the ball by the colour
 # mask. Checked on broadcast 1080p footage against two known positions (a
 # toss above a server at the near baseline, a serve from behind the far
@@ -278,8 +308,117 @@ def _detect_blobs(hm, threshold=SCORE_THRESHOLD):
     return out
 
 
+def warp_normalised(img, Hn, border=cv2.BORDER_REPLICATE):
+    """Warp an image by a homography given in normalised [0,1] coordinates."""
+    h, w = img.shape[:2]
+    S = np.diag([float(w), float(h), 1.0])
+    return cv2.warpPerspective(img, S @ Hn @ np.diag([1.0 / w, 1.0 / h, 1.0]), (w, h),
+                               flags=cv2.INTER_LINEAR, borderMode=border)
+
+
+def candidates_from_heatmap(hm, threshold, to_norm):
+    """Blobs of one heatmap as [cx_norm, cy_norm, conf, x1, y1, x2, y2] (normalised).
+
+    The blob is the ball's blurred response, not its true silhouette, so the
+    bbox is only a rough extent. to_norm maps heatmap pixels to the frame.
+    """
+    out = []
+    for (x, y, peak, _area, x1, y1, x2, y2) in _detect_blobs(hm, threshold):
+        cx, cy = to_norm(x, y)
+        bx1, by1 = to_norm(x1, y1)
+        bx2, by2 = to_norm(x2 + 1, y2 + 1)
+        out.append([round(cx, 6), round(cy, 6), round(peak, 4),
+                    round(bx1, 6), round(by1, 6), round(bx2, 6), round(by2, 6)])
+    return out
+
+
+class WindowStream:
+    """Feeds a video through a detector in windows and yields each frame's heatmap.
+
+    With stride < window the windows overlap and every frame's heatmap is the
+    average over the windows that saw it, weighted towards the window centre
+    (TrackNetV3's temporal ensemble, "weight" mode). A ball one window misses
+    at its edge is usually seen by the next. stride == window is the plain
+    non-overlapping pass. The trailing frames are padded by repeating the last.
+
+    motion, if given, maps a frame index to its homography into a common
+    reference image (normalised coords, or None if unknown). Each window is then
+    warped into the view of its centre frame before detection, and the heatmaps
+    warped back: these networks read the ball from what changes between frames,
+    and on a panning camera everything does.
+    """
+
+    def __init__(self, detector, stride=None, motion=None):
+        self.det = detector
+        self.motion = motion
+        self.n = detector.window
+        self.stride = stride or self.n
+        self.weights = [float(min(i + 1, self.n - i)) for i in range(self.n)]
+        self.frames = {}     # frame index -> frame, until its heatmap is final
+        self.sums = {}       # frame index -> (weighted heatmap sum, weight sum)
+        self.next_start = 0
+        self.count = 0
+
+    def _run(self, start):
+        idx = [min(start + i, self.count - 1) for i in range(self.n)]
+        frames = [self.frames[i] for i in idx]
+        views = self._views(idx) if self.motion is not None else None
+        if views is not None:
+            frames = [warp_normalised(f, M) for f, M in zip(frames, views)]
+        hms = self.det.window_heatmaps(frames)
+        for j, f in enumerate(idx):
+            if f != start + j:
+                break        # padding: the repeated frame isn't this frame
+            hm = hms[j] if views is None else warp_normalised(hms[j], np.linalg.inv(views[j]), border=cv2.BORDER_CONSTANT)
+            s = self.sums.get(f)
+            w = self.weights[j]
+            self.sums[f] = (hm * w, w) if s is None else (s[0] + hm * w, s[1] + w)
+
+    def _views(self, idx):
+        """Per frame of a window, its homography into the centre frame's view."""
+        H_centre = self.motion(idx[len(idx) // 2])
+        if H_centre is None:
+            return None
+        if hasattr(self.det, "set_view"):
+            self.det.set_view(H_centre)
+        to_centre = np.linalg.inv(H_centre)
+        views = []
+        for i in idx:
+            H = self.motion(i)
+            views.append(np.eye(3) if H is None else to_centre @ H)
+        return views
+
+    def _emit(self, before):
+        out = []
+        for f in sorted(k for k in self.sums if k < before):
+            hm, w = self.sums.pop(f)
+            out.append((f, self.frames.pop(f), hm / w))
+        return out
+
+    def push(self, frame):
+        """Add the next frame; returns [(frame index, frame, heatmap)] now final."""
+        self.frames[self.count] = frame
+        self.count += 1
+        out = []
+        while self.next_start + self.n <= self.count:
+            self._run(self.next_start)
+            self.next_start += self.stride
+            out += self._emit(self.next_start)
+        return out
+
+    def flush(self):
+        """The remaining frames, once the video has ended."""
+        while self.next_start < self.count:
+            self._run(self.next_start)
+            self.next_start += self.stride
+        return self._emit(self.count)
+
+
 class TrackNetBallDetector:
-    """Runs TrackNetV2 over a video in non-overlapping 3-frame windows."""
+    """Runs TrackNetV2 over a video in 3-frame windows."""
+
+    name = "tracknetv2"
+    window = FRAMES_IN
 
     def __init__(self, model_path=None, device=None, threshold=SCORE_THRESHOLD):
         if not HAS_TORCH:
@@ -338,6 +477,24 @@ class TrackNetBallDetector:
         return torch.sigmoid(logits)[0].cpu().numpy()
 
     @torch.no_grad()
+    def window_heatmaps(self, frames_bgr):
+        """Sigmoid heatmaps (3, 288, 512) for a window of 3 consecutive frames."""
+        inp = self._preprocess(frames_bgr)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=self.half):
+            logits = self.model(inp).float()
+        hms = torch.sigmoid(logits)[0].cpu().numpy()
+        self.last_heatmaps = hms
+        # Track the strongest response seen, so a run that detects nothing can
+        # be diagnosed as "model never fired" vs "model fired but was gated".
+        self.last_peak = float(hms.max())
+        self.max_peak = max(getattr(self, "max_peak", 0.0), self.last_peak)
+        return hms
+
+    def candidates(self, hm, w, h):
+        """Ball candidates in one frame's heatmap, for a frame of w x h."""
+        return candidates_from_heatmap(
+            hm, self.threshold, lambda x, y: heatmap_to_image_norm(x, y, self.affine, w, h))
+
     def detect_window(self, frames_bgr):
         """Detect the ball in a window of 3 consecutive frames.
 
@@ -347,28 +504,4 @@ class TrackNetBallDetector:
         if len(frames_bgr) != FRAMES_IN:
             raise ValueError(f"expected {FRAMES_IN} frames, got {len(frames_bgr)}")
         h, w = frames_bgr[0].shape[:2]
-        inp = self._preprocess(frames_bgr)
-        with torch.autocast("cuda", dtype=torch.float16, enabled=self.half):
-            logits = self.model(inp).float()
-        hms = torch.sigmoid(logits)[0].cpu().numpy()  # (3, H, W)
-        self.last_heatmaps = hms
-        # Track the strongest response seen, so a run that detects nothing can
-        # be diagnosed as "model never fired" vs "model fired but was gated".
-        self.last_peak = float(hms.max())
-        self.max_peak = max(getattr(self, "max_peak", 0.0), self.last_peak)
-
-        per_frame = []
-        for j in range(hms.shape[0]):
-            cands = []
-            for (x, y, peak, _area, x1, y1, x2, y2) in _detect_blobs(hms[j], self.threshold):
-                # The blob is the ball's blurred response, not its true
-                # silhouette, so this bbox is only a rough extent.
-                cx, cy = heatmap_to_image_norm(x, y, self.affine, w, h)
-                bx1, by1 = heatmap_to_image_norm(x1, y1, self.affine, w, h)
-                bx2, by2 = heatmap_to_image_norm(x2 + 1, y2 + 1, self.affine, w, h)
-                cands.append([
-                    round(cx, 6), round(cy, 6), round(peak, 4),
-                    round(bx1, 6), round(by1, 6), round(bx2, 6), round(by2, 6),
-                ])
-            per_frame.append(cands)
-        return per_frame
+        return [self.candidates(hm, w, h) for hm in self.window_heatmaps(frames_bgr)]

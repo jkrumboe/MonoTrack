@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import type { CalibrationResult } from "../utils/cameraSolver";
+import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
 
 interface DepthFilterViewProps {
   videoEl: HTMLVideoElement | null;
@@ -51,8 +51,7 @@ function depthToRgb(t: number): [number, number, number] {
 
 function buildCamera(calibration: CalibrationResult, aspect: number): THREE.PerspectiveCamera {
   const cam = new THREE.PerspectiveCamera(calibration.fov, aspect, 0.1, 500);
-  cam.position.set(...calibration.position);
-  cam.lookAt(new THREE.Vector3(...calibration.lookAt));
+  aimCamera(cam, calibration);
   cam.updateMatrixWorld();
   cam.updateProjectionMatrix();
   return cam;

@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { FrameData, BallReconstructionMethod } from "../hooks/useAnalysis";
-import type { CalibrationResult } from "./cameraSolver";
+import { aimCamera, type CalibrationResult } from "./cameraSolver";
 import { applyHomography, imageToCourtHomography } from "./courtHomography";
 
 // FIVB volleyball: 65–67 cm circumference → ~0.21 m diameter.
@@ -266,8 +266,7 @@ function createCamera(
 ): THREE.PerspectiveCamera {
   const fov = fovYDeg ?? calibration.fov;
   const cam = new THREE.PerspectiveCamera(fov, aspect, 0.1, 500);
-  cam.position.set(...calibration.position);
-  cam.lookAt(new THREE.Vector3(...calibration.lookAt));
+  aimCamera(cam, calibration);
   cam.updateMatrixWorld();
   cam.updateProjectionMatrix();
   return cam;
@@ -2415,6 +2414,142 @@ function solveRally(
   });
 }
 
+// ─── Line fill ───────────────────────────────────────────────────────────────
+//
+// The rally solver rightly refuses to call a poor fit a measurement, but a
+// refused flight is not an absent ball: fast serves and attacks are rejected
+// with most of their detections present. Their frames are filled here so the
+// line runs through the rally, marked "estimated" so nothing reads them as
+// fitted: touches are decided before this runs, and the score and point
+// winners use fitted frames only.
+
+/** A detection further than this (m) from the estimated arc is a false one. */
+const FILL_MAX_CORRECTION_M = 4;
+/** Frames over which a correction fades in from a knot, so the flights still meet. */
+const FILL_TAPER_FRAMES = 3;
+/** Half-width (frames) of the median over corrections: one wild detection must not kink the line. */
+const FILL_MEDIAN_RADIUS = 2;
+/** Longest hole (s) bridged between flights: as long as a very high pass stays up. */
+const FILL_BRIDGE_MAX_S = 2.5;
+/** A bridging arc rises no higher than this (m): a long hole is rarely one flight. */
+const FILL_BRIDGE_MAX_Y_M = 8;
+/** How long (s) the last flight of a rally is followed on after the ball is lost. */
+const FILL_FOLLOW_MAX_S = 1.5;
+/** Fastest launch a followed flight may have (m/s), as for the solver's speed prior. */
+const FILL_FOLLOW_MAX_SPEED = 30;
+/** Frames the launch velocity of a followed flight is averaged over. */
+const FILL_FOLLOW_VEL_FRAMES = 4;
+
+type V3 = [number, number, number];
+
+function fillLineGaps(
+  rallies: RallySegmentResult[][],
+  frames: SolverFrame[],
+  cam: THREE.PerspectiveCamera,
+  touches: BallTouch[],
+  positions: Map<number, V3>,
+  methods: Map<number, BallReconstructionMethod>,
+): void {
+  const set = (fr: SolverFrame, p: V3) => {
+    positions.set(fr.frame, [
+      Math.max(-RALLY_MAX_ABS_X_M - 1, Math.min(RALLY_MAX_ABS_X_M + 1, p[0])),
+      Math.max(HALF_BALL, Math.min(SEG_MAX_Y_M, p[1])),
+      Math.max(-RALLY_MAX_ABS_Z_M - 1, Math.min(RALLY_MAX_ABS_Z_M + 1, p[2])),
+    ]);
+    methods.set(fr.frame, "estimated");
+  };
+
+  // Places a run of frames on `base`, moved onto the detections' lines of
+  // sight: the depth comes from the arc, the rest from what the video shows.
+  const follow = (run: SolverFrame[], base: (t: number) => V3, taperStart: boolean, taperEnd: boolean) => {
+    if (run.length === 0) return;
+    const corr: (V3 | null)[] = run.map((fr) => {
+      if (!fr.ball_img_pos || fr.ball_interpolated) return null;
+      const { origin, dir } = rayFromImagePos(cam, fr.ball_img_pos);
+      const b = new THREE.Vector3(...base(fr.timestamp));
+      const c = origin.clone().addScaledVector(dir, b.clone().sub(origin).dot(dir)).sub(b);
+      return c.length() <= FILL_MAX_CORRECTION_M ? [c.x, c.y, c.z] : null;
+    });
+    const at = (i: number, axis: number): number => {
+      const near: number[] = [];
+      for (let j = Math.max(0, i - FILL_MEDIAN_RADIUS); j <= Math.min(run.length - 1, i + FILL_MEDIAN_RADIUS); j++) {
+        const c = corr[j];
+        if (c) near.push(c[axis]);
+      }
+      if (near.length) return _median(near);
+      // No detection nearby: carry between the nearest on each side.
+      let lo = i, hi = i;
+      while (lo >= 0 && !corr[lo]) lo--;
+      while (hi < run.length && !corr[hi]) hi++;
+      const a = lo >= 0 ? corr[lo]![axis] : null, b = hi < run.length ? corr[hi]![axis] : null;
+      if (a == null || b == null) return a ?? b ?? 0;
+      return a + ((b - a) * (i - lo)) / (hi - lo);
+    };
+    run.forEach((fr, i) => {
+      const fade = Math.min(
+        taperStart ? (i + 1) / FILL_TAPER_FRAMES : 1,
+        taperEnd ? (run.length - i) / FILL_TAPER_FRAMES : 1,
+        1,
+      );
+      const b = base(fr.timestamp);
+      set(fr, [b[0] + fade * at(i, 0), b[1] + fade * at(i, 1), b[2] + fade * at(i, 2)]);
+    });
+  };
+
+  // Flights the solver refused: their arcs share knots with their neighbours,
+  // so they already join up.
+  for (const rally of rallies) {
+    rally.forEach((seg, k) => {
+      if (seg.accepted) return;
+      const run = frames.filter((fr) =>
+        fr.timestamp >= seg.tStart - 1e-6 && fr.timestamp <= seg.tEnd + 1e-6 && !positions.has(fr.frame));
+      follow(run, seg.posAt, k > 0, k < rally.length - 1);
+    });
+  }
+
+  // Holes left between rallies, and where the ball was lost for good.
+  const solved = (i: number) => (i >= 0 && i < frames.length ? positions.get(frames[i].frame) : undefined);
+  const opensPlay = (from: number, to: number) =>
+    touches.some((t) => t.frame >= from && t.frame <= to && /^(toss|serve)/.test(t.label));
+  for (let a = 0; a < frames.length; a++) {
+    const pa = solved(a);
+    if (!pa || solved(a + 1) || a + 1 >= frames.length) continue;
+    let b = a + 1;
+    while (b < frames.length && !solved(b)) b++;
+    // The ball is on the floor, or the next point has started: nothing connects them.
+    if (pa[1] <= FLOOR_CONTACT_Y_M) continue;
+    const hasNext = b < frames.length;
+    const T = hasNext ? frames[b].timestamp - frames[a].timestamp : Infinity;
+    if (hasNext && T <= FILL_BRIDGE_MAX_S && !opensPlay(frames[b].frame, frames[b].frame + FILL_TAPER_FRAMES)) {
+      const pb = solved(b)!;
+      const t0 = frames[a].timestamp;
+      const g = Math.min(GRAVITY, (8 * Math.max(0, FILL_BRIDGE_MAX_Y_M - Math.max(pa[1], pb[1]))) / (T * T));
+      follow(frames.slice(a + 1, b), (t) => {
+        const s = t - t0, w = s / T;
+        return [pa[0] + (pb[0] - pa[0]) * w, pa[1] + (pb[1] - pa[1]) * w + 0.5 * g * s * (T - s), pa[2] + (pb[2] - pa[2]) * w];
+      }, true, true);
+      continue;
+    }
+    // Follow the last flight on under gravity until it reaches the floor.
+    const back = Math.max(0, a - FILL_FOLLOW_VEL_FRAMES);
+    const p0 = solved(back);
+    const span = frames[a].timestamp - frames[back].timestamp;
+    if (!p0 || span <= 0) continue;
+    const v: V3 = [(pa[0] - p0[0]) / span, (pa[1] - p0[1]) / span - (GRAVITY * span) / 2, (pa[2] - p0[2]) / span];
+    const speed = Math.hypot(...v);
+    if (speed > FILL_FOLLOW_MAX_SPEED) { for (let c = 0; c < 3; c++) v[c] *= FILL_FOLLOW_MAX_SPEED / speed; }
+    for (let i = a + 1; i < b; i++) {
+      const s = frames[i].timestamp - frames[a].timestamp;
+      if (s > FILL_FOLLOW_MAX_S) break;
+      const y = pa[1] + v[1] * s - 0.5 * GRAVITY * s * s;
+      const x = pa[0] + v[0] * s, z = pa[2] + v[2] * s;
+      if (y < HALF_BALL || Math.abs(x) > RALLY_MAX_ABS_X_M + 1 || Math.abs(z) > RALLY_MAX_ABS_Z_M + 1) break;
+      set(frames[i], [x, y, z]);
+    }
+    a = b - 1;
+  }
+}
+
 // ─── Physics-reprojection arc solver ─────────────────────────────────────────
 
 /** Extended arc observation: includes confidence and optional smoothed depth prior. */
@@ -3337,6 +3472,7 @@ function _solveBallTrajectories(
 
       let totalFittedArcs = 0;
       const allErrPx: number[] = [];
+      const solvedRallies: RallySegmentResult[][] = [];
 
       // Segments shorter than two samples cannot carry a touch-to-touch arc on
       // their own, but they still constrain the rally they sit in.
@@ -3369,6 +3505,7 @@ function _solveBallTrajectories(
 
         const { anchors, zones, free, contacts, rules, results } = solveRuled(rally, carry);
         carry = rules;
+        solvedRallies.push(results);
         // Which knots are touches. Measured on 11 labelled broadcast clips,
         // false touches came from three places, each handled here:
         //  - a rally's first point is only where the ball came into view (or
@@ -3511,6 +3648,10 @@ function _solveBallTrajectories(
           });
         }
       }
+      const fitted = positions.size;
+      fillLineGaps(solvedRallies, frames, cam, touches, positions, methods);
+      console.log(`[physicsReproj] line fill: ${positions.size - fitted} estimated frames on ${fitted} fitted`);
+
       // Emit physicsDebug records for detected frames NOT covered by any arc
       // (low-confidence detections filtered out before arc splitting)
       const processedFrames = new Set(physicsDebug.map((d) => d.frame));

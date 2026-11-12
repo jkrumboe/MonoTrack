@@ -5,7 +5,9 @@ import type { FrameData, CourtDataEntry } from "../hooks/useAnalysis";
 import { estimateBallWorldPosition, playersOnCourt } from "../utils/ballReconstruction";
 import type { ArmJoints, CourtPlayer } from "../utils/ballReconstruction";
 import type { BallTouch, TrajectoryMode } from "../utils/ballReconstruction";
-import type { CalibrationResult } from "../utils/cameraSolver";
+import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
+import { SIDE_COLORS } from "../utils/matchTimeline";
+import { touchColor } from "../utils/rallyEdits";
 
 // FIVB volleyball court dimensions (metres)
 const COURT_LENGTH = 18.0;
@@ -108,9 +110,12 @@ interface SkeletonViewerProps {
   touches?: BallTouch[];
 }
 
+/** Behind the 3D court: the stage colour of the app (--bg-stage in App.css). */
+const SCENE_BACKGROUND = 0x0d1014;
+
 /** Player figure tints by half of the court. */
-const PLAYER_COLOR_NEG_Z = 0x7fa7d9;
-const PLAYER_COLOR_POS_Z = 0xe39a9a;
+const PLAYER_COLOR_NEG_Z = SIDE_COLORS.far;
+const PLAYER_COLOR_POS_Z = SIDE_COLORS.near;
 
 // Player figure proportions, as fractions of standing height. The figure is
 // built in a local frame (feet at the origin, facing +z, player's left +x)
@@ -128,7 +133,7 @@ const STAND_MIN_H = 1.65, STAND_MAX_H = 2.05, NOMINAL_H = 1.85;
 let playerKit: ReturnType<typeof buildPlayerKit> | null = null;
 function buildPlayerKit() {
   const capsule = (r: number, len: number) => new THREE.CapsuleGeometry(r, Math.max(0.001, len - 2 * r), 4, 10);
-  const mat = (color: number, roughness = 0.75) => new THREE.MeshStandardMaterial({ color, roughness });
+  const mat = (color: THREE.ColorRepresentation, roughness = 0.75) => new THREE.MeshStandardMaterial({ color, roughness });
   return {
     geo: {
       thigh: capsule(0.048, BODY.thigh + 0.03),
@@ -247,19 +252,6 @@ function buildPlayerFigure(pl: CourtPlayer): THREE.Group {
   return g;
 }
 
-// Marker colour per touch type, so the rally reads serve -> reception -> set
-// -> attack at a glance.
-const TOUCH_COLORS: Record<string, number> = {
-  toss: 0x90caf9,
-  serve: 0x42a5f5,
-  reception: 0x66bb6a,
-  set: 0xffee58,
-  attack: 0xef5350,
-  block: 0xab47bc,
-  dig: 0x26c6da,
-  touch: 0xeeeeee,
-};
-
 /**
  * Clip-space matrix that takes the reference-frame camera's projection to
  * this video frame's, for a camera that pans and zooms from a fixed spot.
@@ -322,6 +314,7 @@ export default function SkeletonViewer({
     ballShadow: THREE.Mesh;
     ballStem: THREE.Line;
     ballTrail: THREE.LineSegments;
+    estimatedTrail: THREE.LineSegments;
     groundTrail: THREE.LineSegments;
     dropLines: THREE.LineSegments;
     touchMarkers: THREE.Group;
@@ -351,7 +344,7 @@ export default function SkeletonViewer({
 
     // Scene
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1a1a2e);
+    scene.background = new THREE.Color(SCENE_BACKGROUND);
 
     // Camera
     // far=200 clipped the court once the user orbited further out than 200 m.
@@ -427,6 +420,14 @@ export default function SkeletonViewer({
     );
     scene.add(ballTrail);
 
+    // Stretches of the trail the solver could not fit, estimated to keep the
+    // line going through the rally. Dashed: they are not measurements.
+    const estimatedTrail = new THREE.LineSegments(
+      new THREE.BufferGeometry().setFromPoints([]),
+      new THREE.LineDashedMaterial({ color: 0xffca28, transparent: true, opacity: 0.65, dashSize: 0.3, gapSize: 0.2 }),
+    );
+    scene.add(estimatedTrail);
+
     // The trail's footprint on the floor, plus faint verticals joining the
     // two. A lone line in 3D gives no depth cue on screen; tying it to the
     // court shows where over the court the ball actually travelled.
@@ -449,7 +450,7 @@ export default function SkeletonViewer({
 
     sceneRef.current = {
       scene, camera, renderer, controls, courtGroup,
-      ballMesh, ballShadow, ballStem, ballTrail, groundTrail, dropLines, touchMarkers, playerFigures,
+      ballMesh, ballShadow, ballStem, ballTrail, estimatedTrail, groundTrail, dropLines, touchMarkers, playerFigures,
     };
 
     // Animation loop
@@ -551,7 +552,7 @@ export default function SkeletonViewer({
       scene.background = null;
       controls.enabled = false;
     } else {
-      scene.background = new THREE.Color(0x1a1a2e);
+      scene.background = new THREE.Color(SCENE_BACKGROUND);
       controls.enabled = true;
     }
 
@@ -601,7 +602,7 @@ export default function SkeletonViewer({
       // In overlay mode the camera must match the video exactly.
       // Also sync controls.target so damping can't drift the camera back.
       controls.target.set(...calibration.lookAt);
-      camera.lookAt(new THREE.Vector3(...calibration.lookAt));
+      aimCamera(camera, calibration);
     } else if (container && container.clientWidth > 0 && container.clientHeight > 0) {
       // In side-by-side mode, orbit around the court centre from the
       // calibrated direction, pulled back so the whole court fits the window.
@@ -623,7 +624,7 @@ export default function SkeletonViewer({
       camera.fov = calibration.fov;
       camera.updateProjectionMatrix();
       controls.target.set(...calibration.lookAt);
-      camera.lookAt(new THREE.Vector3(...calibration.lookAt));
+      aimCamera(camera, calibration);
       return;
     }
 
@@ -694,13 +695,13 @@ export default function SkeletonViewer({
   useEffect(() => {
     const sceneState = sceneRef.current;
     if (!sceneState) return;
-    const { ballMesh, ballShadow, ballStem, ballTrail, groundTrail, dropLines } = sceneState;
+    const { ballMesh, ballShadow, ballStem, ballTrail, estimatedTrail, groundTrail, dropLines } = sceneState;
 
     if (ballTrajectory.length === 0) {
       ballMesh.visible = false;
       ballShadow.visible = false;
       ballStem.visible = false;
-      for (const line of [ballTrail, groundTrail, dropLines]) {
+      for (const line of [ballTrail, estimatedTrail, groundTrail, dropLines]) {
         line.geometry.dispose();
         line.geometry = new THREE.BufferGeometry();
       }
@@ -721,8 +722,10 @@ export default function SkeletonViewer({
       ]);
     }
 
-    // Build segment pairs — skip across frame gaps > 3, 3D jumps > 2 m, or method changes
+    // Build segment pairs — skip across frame gaps > 3, 3D jumps > 2 m, or method
+    // changes. Estimated stretches join whatever is either side of them.
     const segPoints: THREE.Vector3[] = [];
+    const estimatedPoints: THREE.Vector3[] = [];
     const groundPoints: THREE.Vector3[] = [];
     const dropPoints: THREE.Vector3[] = [];
     const FLOOR_Y = 0.01;
@@ -731,9 +734,11 @@ export default function SkeletonViewer({
       const curr = ballTrajectory[i];
       const frameDiff = curr.frame - prev.frame;
       const dist = Math.hypot(curr.x - prev.x, curr.y - prev.y, curr.z - prev.z);
-      if (frameDiff <= 3 && dist <= 2 && prev.method === curr.method) {
-        segPoints.push(new THREE.Vector3(prev.x, prev.y, prev.z));
-        segPoints.push(new THREE.Vector3(curr.x, curr.y, curr.z));
+      const estimated = prev.method === "estimated" || curr.method === "estimated";
+      if (frameDiff <= 3 && (estimated || (dist <= 2 && prev.method === curr.method))) {
+        const trail = estimated ? estimatedPoints : segPoints;
+        trail.push(new THREE.Vector3(prev.x, prev.y, prev.z));
+        trail.push(new THREE.Vector3(curr.x, curr.y, curr.z));
         groundPoints.push(new THREE.Vector3(prev.x, FLOOR_Y, prev.z));
         groundPoints.push(new THREE.Vector3(curr.x, FLOOR_Y, curr.z));
       }
@@ -742,10 +747,11 @@ export default function SkeletonViewer({
       if (p.frame % 4 !== 0) continue;
       dropPoints.push(new THREE.Vector3(p.x, FLOOR_Y, p.z), new THREE.Vector3(p.x, p.y, p.z));
     }
-    for (const [line, pts] of [[ballTrail, segPoints], [groundTrail, groundPoints], [dropLines, dropPoints]] as const) {
+    for (const [line, pts] of [[ballTrail, segPoints], [estimatedTrail, estimatedPoints], [groundTrail, groundPoints], [dropLines, dropPoints]] as const) {
       line.geometry.dispose();
       line.geometry = new THREE.BufferGeometry().setFromPoints(pts);
     }
+    estimatedTrail.computeLineDistances();
   }, [ballTrajectory, currentFrame]);
 
   // Players of the current frame as jointed figures standing on their feet
@@ -778,7 +784,7 @@ export default function SkeletonViewer({
       }
     }
     for (const t of touches ?? []) {
-      const color = TOUCH_COLORS[t.label] ?? TOUCH_COLORS.touch;
+      const color = touchColor(t.label);
       const [x, y, z] = t.position;
       const dot = new THREE.Mesh(
         new THREE.SphereGeometry(0.12, 16, 16),
@@ -802,9 +808,9 @@ export default function SkeletonViewer({
 // Court surface + surroundings. Colours follow the FIVB indoor convention:
 // a warm ochre playing court inside a blue free zone, which also makes the
 // court boundary readable from any camera angle.
-const COLOR_FREE_ZONE = 0x14395c;
-const COLOR_COURT     = 0xc07b3a;
-const COLOR_FRONT_ZONE= 0xcc8a45;
+const COLOR_FREE_ZONE = 0x151d27;
+const COLOR_COURT     = 0x22384d;
+const COLOR_FRONT_ZONE= 0x2b4560;
 const COLOR_LINE      = 0xf2f2f2;
 const FREE_ZONE       = 3.0;   // FIVB minimum free zone (m)
 const LINE_W          = 0.05;  // official line width (m)

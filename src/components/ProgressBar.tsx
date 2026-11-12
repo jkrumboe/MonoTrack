@@ -25,21 +25,21 @@ export default function ProgressBar({ percent, message, elapsedMs }: ProgressBar
 
   return (
     <div className="progress-container">
+      <div className="progress-info">
+        <span className="progress-message">{message}</span>
+        <span className="progress-percent">{percent}%</span>
+      </div>
       <div className="progress-bar">
         <div
           className="progress-fill"
           style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
         />
       </div>
-      <div className="progress-info">
-        <span className="progress-percent">{percent}%</span>
-        <span className="progress-message">{message}</span>
-      </div>
       {elapsedMs !== undefined && (
         <div className="progress-info progress-time">
           <span>Elapsed {formatDuration(elapsedMs)}</span>
           <span>
-            {remainingMs !== null ? `~${formatDuration(remainingMs)} remaining` : "Estimating time…"}
+            {remainingMs !== null ? `About ${formatDuration(remainingMs)} left` : "Estimating time…"}
           </span>
         </div>
       )}

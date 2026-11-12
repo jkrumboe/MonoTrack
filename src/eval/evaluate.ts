@@ -14,11 +14,39 @@ export interface CaseResult {
 
 export type RallyParamsOverride = BallReconstructionOptions["rallyParams"];
 
+/**
+ * Real clips are solved on their hand-placed court by default, which isolates
+ * ball tracking from court detection. EVAL_COURT=detected uses the court the
+ * analyzer found instead, as the app does, so court errors count.
+ */
 export function evaluateCase(c: EvalCase, params?: RallyParamsOverride): CaseResult {
-  const run = runFixture(c.fixture, params, false, c.truth?.court);
+  const detected = process.env.EVAL_COURT === "detected" && !c.synthetic;
+  const run = runFixture(c.fixture, params, false, detected ? undefined : c.truth?.court);
   if (!c.truth) return { case: c, run, metrics: null, matches: [] };
   const { metrics, matches } = scoreClip(c.fixture, c.truth, run);
   return { case: c, run, metrics, matches };
+}
+
+export function realSummary(results: CaseResult[], resamples = 4000) {
+  const real = results.filter((r) => r.metrics && !r.case.synthetic).map((r) => r.metrics!);
+  if (!real.length) return null;
+  const scores = real.map((m) => m.score);
+  const avg = (a: number[]) => a.reduce((s, v) => s + v, 0) / a.length;
+  // Fixed-seed bootstrap over clips: how far the mean moves with which clips happen to be labelled.
+  let seed = 12345;
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+  const means = Array.from({ length: resamples }, () => avg(scores.map(() => scores[Math.floor(rnd() * scores.length)]))).sort((a, b) => a - b);
+  const sum = (f: (m: (typeof real)[number]) => number) => real.reduce((s, m) => s + f(m), 0);
+  const courts = real.flatMap((m) => (m.courtErrPx != null ? [m.courtErrPx] : []));
+  return {
+    clips: real.length,
+    mean: avg(scores),
+    ci95: [means[Math.floor(resamples * 0.025)], means[Math.floor(resamples * 0.975)]] as [number, number],
+    // Pooled over touches: a clip with 16 touches counts for more than one with 2.
+    recall: sum((m) => m.touchesMatched) / Math.max(1, sum((m) => m.touchesTrue)),
+    precision: sum((m) => m.touchesMatched) / Math.max(1, sum((m) => m.touchesFound)),
+    courtErrPx: courts.length ? avg(courts) : null,
+  };
 }
 
 /**
