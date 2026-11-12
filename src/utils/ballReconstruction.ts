@@ -936,7 +936,7 @@ function splitArcsEx(obs: ArcObsEx[], videoWidth?: number, videoHeight?: number)
   }
   arcs.push(arc);
   if (videoWidth == null || videoHeight == null) return arcs;
-  return arcs.flatMap((a) => splitAtTouches(a, videoWidth, videoHeight));
+  return arcs.flatMap((a) => scanTouches(a, videoWidth / 2, videoHeight / 2));
 }
 
 /** Least-squares fit of y = c0 + c1·t + c2·t², returning [c0, c1, c2]. */
@@ -960,99 +960,293 @@ function _fitQuadratic(ts: number[], ys: number[]): [number, number, number] {
   ];
 }
 
+// ─── Flight model for touch detection ────────────────────────────────────────
+//
+// A ball in free flight moves on a parabola in space. Under a long broadcast
+// lens its picture is nearly a parabola in time too, but not under a wide
+// one: from a phone behind the end line the ball is 6 m away at one baseline
+// and 25 m at the other, and the picture of a serve slows to a crawl as it
+// flies away. Fitted with an image parabola, such a flight was cut every few
+// frames and its real touches were lost among the cuts.
+//
+// The picture of a parabola in space is a parabola divided by the distance
+// of the ball, which along a flight is itself a parabola in time:
+//   u(s) = (a0 + a1·s + a2·s²) / (1 + c1·s + c2·s²),  v(s) likewise with b.
+// That is linear in its eight numbers once multiplied out, so it is fitted
+// directly, without the camera. c1 and c2 are how fast the distance changes
+// (per second); a weak pull to zero leaves the image parabola wherever the
+// samples do not show the distance changing (a long lens, a short window).
 
-/**
- * Split a continuous ball track at player touches.
- *
- * Between touches the ball is in free flight, and under a broadcast lens its
- * image path is very nearly a parabola in time. A touch (dig, set, attack)
- * breaks that: the next positions leave the parabola fitted to the points so
- * far. Without this, a whole rally becomes one "arc" that no single ballistic
- * trajectory can explain, so the solver rejects it. Two consecutive points
- * must both deviate, so a single noisy detection does not cut an arc.
- */
-function splitAtTouches(obs: ArcObsEx[], videoWidth: number, videoHeight: number): ArcObsEx[][] {
-  if (obs.length < 2 * P.touchMinSeg) return [obs];
-  const hw = videoWidth / 2, hh = videoHeight / 2;
-  const out: ArcObsEx[][] = [];
-  let start = 0;
-  let i = start + P.touchMinSeg;
-  while (i < obs.length - 1) {
-    const seg = obs.slice(start, i);
-    const t0 = seg[0].t;
-    const ts = seg.map((o) => o.t - t0);
-    const cu = _fitQuadratic(ts, seg.map((o) => o.u));
-    const cv = _fitQuadratic(ts, seg.map((o) => o.v));
-    const devPx = (o: ArcObsEx) => {
-      const t = o.t - t0;
-      return Math.hypot(
-        (cu[0] + cu[1] * t + cu[2] * t * t - o.u) * hw,
-        (cv[0] + cv[1] * t + cv[2] * t * t - o.v) * hh,
-      );
+/** Camera of the clip being solved, for distances at touches. Set by the physics block. */
+let flightCam: {
+  cam: THREE.PerspectiveCamera;
+  /** Focal length (px) and distance to the middle of the court (m). */
+  fPx: number;
+  courtDist: number;
+} | null = null;
+
+/** Pull of the distance terms towards zero: px of residual per 1/s (c1) and 1/s² (c2). */
+const FLIGHT_DEPTH_RIDGE_PX = 3;
+const FLIGHT_DEPTH_RIDGE2_PX = 10;
+/** Never divide by less than this share of the mid-window distance. */
+const FLIGHT_MIN_REL_DEPTH = 0.25;
+
+/** Distance in pixels between each sample and the flight fitted to them, or null if it cannot be fitted. */
+function fitFlight(obs: ArcObs[], hw: number, hh: number): ((o: ArcObs) => number) | null {
+  if (obs.length < 3) return null;
+  const tm = 0.5 * (obs[0].t + obs[obs.length - 1].t);
+  const N = 8;
+  let x: number[] | null = null;
+  const den = (sol: number[] | null, s: number) => (sol ? Math.max(FLIGHT_MIN_REL_DEPTH, 1 + sol[6] * s + sol[7] * s * s) : 1);
+  // Reweighted least squares: dividing each row by its distance term turns
+  // the multiplied-out equations back into pixel errors.
+  for (let pass = 0; pass < 3; pass++) {
+    const A = Array.from({ length: N }, () => new Array<number>(N).fill(0));
+    const g = new Array<number>(N).fill(0);
+    const add = (row: number[], rhs: number) => {
+      for (let i = 0; i < N; i++) {
+        if (row[i] === 0) continue;
+        g[i] += row[i] * rhs;
+        for (let j = i; j < N; j++) A[i][j] += row[i] * row[j];
+      }
     };
-    const splitPx = Math.max(TOUCH_SPLIT_MIN_PX, P.touchSplitM / courtMetresPerPx);
-    if (devPx(obs[i]) > splitPx && devPx(obs[i + 1]) > splitPx) {
-      const at = refineSplit(obs, start, i, hw, hh);
-      out.push(obs.slice(start, at));
-      start = at;
-      i = start + P.touchMinSeg;
-    } else {
-      i++;
+    for (const o of obs) {
+      const s = o.t - tm, s2 = s * s;
+      const wu = hw / den(x, s), wv = hh / den(x, s);
+      add([wu, wu * s, wu * s2, 0, 0, 0, -wu * o.u * s, -wu * o.u * s2], wu * o.u);
+      add([0, 0, 0, wv, wv * s, wv * s2, -wv * o.v * s, -wv * o.v * s2], wv * o.v);
     }
+    add([0, 0, 0, 0, 0, 0, FLIGHT_DEPTH_RIDGE_PX, 0], 0);
+    add([0, 0, 0, 0, 0, 0, 0, FLIGHT_DEPTH_RIDGE2_PX], 0);
+    for (let i = 0; i < N; i++) { A[i][i] += 1e-12; for (let j = 0; j < i; j++) A[i][j] = A[j][i]; }
+    const sol = _solveLinear(A, g);
+    if (!sol) break;
+    x = sol;
   }
-  out.push(obs.slice(start));
-  return out;
+  const devOf = (sol: number[]) => (o: ArcObs) => {
+    const s = o.t - tm, s2 = s * s, d = den(sol, s);
+    return Math.hypot(((sol[0] + sol[1] * s + sol[2] * s2) / d - o.u) * hw, ((sol[3] + sol[4] * s + sol[5] * s2) / d - o.v) * hh);
+  };
+  // The image parabola is the same model with a constant distance. The
+  // reweighting above does not always settle (a window with a touch in it has
+  // no flight to find), so the parabola stands unless the fuller fit beats it.
+  const ts = obs.map((o) => o.t - tm);
+  const plain = [..._fitQuadratic(ts, obs.map((o) => o.u)), ..._fitQuadratic(ts, obs.map((o) => o.v)), 0, 0];
+  const sse = (sol: number[]) => {
+    const dev = devOf(sol);
+    return obs.reduce((sum, o) => sum + dev(o) ** 2, 0) + (FLIGHT_DEPTH_RIDGE_PX * sol[6]) ** 2 + (FLIGHT_DEPTH_RIDGE2_PX * sol[7]) ** 2;
+  };
+  return devOf(x && sse(x) < sse(plain) ? x : plain);
 }
 
-/** Frames either side of a detected split searched for the real touch. */
-const SPLIT_REFINE_FRAMES = 4;
-/** Samples beyond the search range on each side, so every candidate fits both flights. */
-const SPLIT_REFINE_WIN = 6;
-/** A moved cut must leave at most this fraction of the original cut's squared error. */
-const SPLIT_REFINE_GAIN = 0.3;
-/** Largest frame step inside the search window. */
-const SPLIT_REFINE_MAX_GAP = 2;
+/**
+ * Detection noise of a track (px, per axis), from third differences of
+ * consecutive samples: a flight contributes nothing to those, and the median
+ * ignores the few that straddle a touch.
+ */
+function _trackNoisePx(obs: ArcObs[], hw: number, hh: number): number {
+  const d3: number[] = [];
+  for (let i = 0; i + 3 < obs.length; i++) {
+    if (obs[i + 3].fi - obs[i].fi !== 3) continue;
+    d3.push(Math.abs(obs[i + 3].u - 3 * obs[i + 2].u + 3 * obs[i + 1].u - obs[i].u) * hw);
+    d3.push(Math.abs(obs[i + 3].v - 3 * obs[i + 2].v + 3 * obs[i + 1].v - obs[i].v) * hh);
+  }
+  // Var(d3) = 20 sigma²; median |x| = 0.6745 sigma for a normal x.
+  return d3.length >= 8 ? _median(d3) / 0.6745 / Math.sqrt(20) : SCAN_MIN_SIGMA_PX;
+}
+
+/** Track either side of a possible touch that is compared (s), and the fewest samples a side. */
+const SCAN_WINDOW_S = 0.5;
+const SCAN_MIN_SIDE = 4;
+/**
+ * One side may be this short when the other is a full one: a touch two
+ * samples before the track ends, or the two samples between an attack and
+ * its block. Too few to fit a flight to, so such a cut needs
+ * SCAN_SHORT_SIDE_FACTOR times the usual evidence.
+ */
+const SCAN_MIN_SHORT_SIDE = 2;
+const SCAN_SHORT_SIDE_FACTOR = 2;
+/**
+ * What a sample in a too-short piece is charged, in noise variances: twice
+ * what it would leave behind inside a fitted flight (2, one per axis), so
+ * between equal cuts the one that keeps the short piece shortest wins.
+ */
+const SCAN_FREE_SAMPLE_COST = 2;
+const _sidesOk = (nL: number, nR: number) => Math.min(nL, nR) >= SCAN_MIN_SHORT_SIDE && Math.max(nL, nR) >= SCAN_MIN_SIDE;
+/** Detection noise is at least this (px), however well a short window happens to fit. */
+const SCAN_MIN_SIGMA_PX = 1.5;
+
+/** Samples either side of a cut it may still move by, and the samples beyond them each parabola is fitted to. */
+const SCAN_FINE_FRAMES = 3;
+const SCAN_FINE_WINDOW = 6;
+
+/** As _flightSse, with a plain image parabola: for a few samples, where it is the same thing. */
+function _parabolaSse(o: ArcObsEx[], hw: number, hh: number, sigma: number): number {
+  if (o.length < SCAN_MIN_SIDE) return SCAN_FREE_SAMPLE_COST * sigma * sigma * o.length;
+  const ts = o.map((q) => q.t - o[0].t);
+  const cu = _fitQuadratic(ts, o.map((q) => q.u)), cv = _fitQuadratic(ts, o.map((q) => q.v));
+  return o.reduce((sum, q, i) => sum + ((cu[0] + cu[1] * ts[i] + cu[2] * ts[i] ** 2 - q.u) * hw) ** 2 + ((cv[0] + cv[1] * ts[i] + cv[2] * ts[i] ** 2 - q.v) * hh) ** 2, 0);
+}
+
+/** Sum of squared distances (px²) between samples and the flight fitted to them. */
+function _flightSse(obs: ArcObsEx[], hw: number, hh: number, sigma: number): number {
+  // Fewer than four samples lie on some flight whatever they are. They are
+  // charged their expected noise, or a cut would always gain by handing one
+  // more sample to the side that fits anything.
+  if (obs.length < SCAN_MIN_SIDE) return SCAN_FREE_SAMPLE_COST * sigma * sigma * obs.length;
+  const dev = fitFlight(obs, hw, hh);
+  if (!dev) return Infinity;
+  let sse = 0;
+  for (const o of obs) sse += dev(o) ** 2;
+  return sse;
+}
 
 /**
- * Move a split to where the track really breaks. splitAtTouches cuts at the
- * first sample off the parabola fitted so far, but that parabola spans the
- * whole flight and can drift off a few samples before the touch (pol_ita_r4:
- * cut at frame 60 while the serve contact was 62, so the serve arc started
- * with three samples of the toss coming down, fit 36 px off and was rejected).
- * Over a fixed window around the cut, the boundary where one parabola before
- * and one after leave the least squared error is the touch.
+ * How clearly the track breaks between samples b-1 and b, in units of the
+ * detection noise: how much worse one flight fits the samples around b than
+ * two flights meeting there. Windows stop at `lo` and `hi` (other splits).
  */
-function refineSplit(obs: ArcObsEx[], start: number, at: number, hw: number, hh: number): number {
-  // The window stops at detection gaps: a touch hidden in a gap is already cut
-  // there, and samples beyond it belong to another flight.
-  const reach = SPLIT_REFINE_FRAMES + SPLIT_REFINE_WIN;
-  let lo = at, hi = at + 1;
-  while (lo > Math.max(start, at - reach) && obs[lo].fi - obs[lo - 1].fi <= SPLIT_REFINE_MAX_GAP) lo--;
-  while (hi < Math.min(obs.length, at + reach) && obs[hi].fi - obs[hi - 1].fi <= SPLIT_REFINE_MAX_GAP) hi++;
-  const sse = (a: number, b: number) => {
-    const seg = obs.slice(a, b);
-    const ts = seg.map((o) => o.t - seg[0].t);
-    const cu = _fitQuadratic(ts, seg.map((o) => o.u));
-    const cv = _fitQuadratic(ts, seg.map((o) => o.v));
-    return seg.reduce((s, o, i) => {
-      const t = ts[i];
-      return s + ((cu[0] + cu[1] * t + cu[2] * t * t - o.u) * hw) ** 2 + ((cv[0] + cv[1] * t + cv[2] * t * t - o.v) * hh) ** 2;
-    }, 0);
-  };
-  // Four samples a side, so neither parabola fits its points exactly.
-  const ok = (b: number) => b - lo >= 4 && hi - b >= 4;
-  if (!ok(at)) return at;
-  // Only a clearly better boundary moves the cut: near a clean touch every
-  // candidate fits about as well, and the original cut is usually right.
-  let best = at, bestErr = SPLIT_REFINE_GAIN * (sse(lo, at) + sse(at, hi));
-  for (let b = at - SPLIT_REFINE_FRAMES; b <= at + SPLIT_REFINE_FRAMES; b++) {
-    if (b === at || b <= start || !ok(b)) continue;
-    const e = sse(lo, b) + sse(b, hi);
-    if (e < bestErr) { best = b; bestErr = e; }
+function _kinkScore(obs: ArcObsEx[], b: number, lo: number, hi: number, hw: number, hh: number, sigma: number): number {
+  let i0 = b, i1 = b;
+  while (i0 > lo && obs[b - 1].t - obs[i0 - 1].t <= SCAN_WINDOW_S) i0--;
+  while (i1 < hi && obs[i1].t - obs[b].t <= SCAN_WINDOW_S) i1++;
+  if (!_sidesOk(b - i0, i1 - b)) return 0;
+  const sL = _flightSse(obs.slice(i0, b), hw, hh, sigma), sR = _flightSse(obs.slice(b, i1), hw, hh, sigma), sJ = _flightSse(obs.slice(i0, i1), hw, hh, sigma);
+  if (!Number.isFinite(sL + sR + sJ)) return 0;
+  return (sJ - sL - sR) / (sigma * sigma) / (Math.min(b - i0, i1 - b) < SCAN_MIN_SIDE ? SCAN_SHORT_SIDE_FACTOR : 1);
+}
+
+/**
+ * The boundary where two flights leave the least error, over the window
+ * around `b`. The score is high all around a touch (any window holding the
+ * kink fits badly as one flight) and its peak can sit a few samples off, but
+ * within one window the best place to cut is the touch itself.
+ */
+function _refineCut(obs: ArcObsEx[], b: number, lo: number, hi: number, hw: number, hh: number, sigma: number): number {
+  let i0 = b, i1 = b;
+  while (i0 > lo && obs[b - 1].t - obs[i0 - 1].t <= SCAN_WINDOW_S) i0--;
+  while (i1 < hi && obs[i1].t - obs[b].t <= SCAN_WINDOW_S) i1++;
+  const twoFlights = (c: number, from: number, to: number, sse: (o: ArcObsEx[]) => number) => sse(obs.slice(from, c)) + sse(obs.slice(c, to));
+  let best = b, bestErr = Infinity;
+  for (let c = i0 + SCAN_MIN_SHORT_SIDE; c <= i1 - SCAN_MIN_SHORT_SIDE; c++) {
+    if (!_sidesOk(c - i0, i1 - c)) continue;
+    const e = twoFlights(c, i0, i1, (o) => _flightSse(o, hw, hh, sigma));
+    // The scanned position wins ties.
+    if (e < bestErr - 1e-9 || (c === b && e <= bestErr + 1e-9)) { best = c; bestErr = e; }
+  }
+  // To the sample: over a few samples either side a flight is a plain image
+  // parabola under any lens, and a parabola cannot bend round the touch the
+  // way the fuller model sometimes does with a sample or two of the other
+  // flight.
+  const parabolaSse = (o: ArcObsEx[]) => _parabolaSse(o, hw, hh, sigma);
+  const j0 = Math.max(i0, best - SCAN_FINE_FRAMES - SCAN_FINE_WINDOW), j1 = Math.min(i1, best + SCAN_FINE_FRAMES + SCAN_FINE_WINDOW);
+  let fine = best, fineErr = Infinity;
+  for (let c = best - SCAN_FINE_FRAMES; c <= best + SCAN_FINE_FRAMES; c++) {
+    if (!_sidesOk(c - j0, j1 - c) || c - i0 < SCAN_MIN_SHORT_SIDE || i1 - c < SCAN_MIN_SHORT_SIDE) continue;
+    const e = twoFlights(c, j0, j1, parabolaSse);
+    if (e < fineErr - 1e-9 || (c === best && e <= fineErr + 1e-9)) { fine = c; fineErr = e; }
+  }
+  return fine;
+}
+
+/** Cuts closer than this (s) are placed together (see _refinePair), each moved by up to SCAN_PAIR_FRAMES. */
+const SCAN_PAIR_MAX_S = 0.3;
+const SCAN_PAIR_FRAMES = 2;
+
+/**
+ * Place two close cuts together. An attack and its block are a few frames
+ * apart: each cut on its own is placed against a neighbouring "flight" that
+ * holds the other touch, and lands a sample or two off. Fitting the three
+ * flights at once (before, between, after) puts both where they are.
+ */
+function _refinePair(obs: ArcObsEx[], c1: number, c2: number, lo: number, hi: number, hw: number, hh: number, sigma: number): [number, number] {
+  // A fixed stretch of samples either side, so every candidate is judged on the same ones.
+  const i0 = Math.max(lo, c1 - SCAN_PAIR_FRAMES - SCAN_FINE_WINDOW), i1 = Math.min(hi, c2 + SCAN_PAIR_FRAMES + SCAN_FINE_WINDOW);
+  const sse = (a: number, b: number) => _parabolaSse(obs.slice(a, b), hw, hh, sigma);
+  let best: [number, number] = [c1, c2], bestErr = Infinity;
+  for (let a = c1 - SCAN_PAIR_FRAMES; a <= c1 + SCAN_PAIR_FRAMES; a++) {
+    for (let b = c2 - SCAN_PAIR_FRAMES; b <= c2 + SCAN_PAIR_FRAMES; b++) {
+      if (a - i0 < SCAN_MIN_SHORT_SIDE || i1 - b < SCAN_MIN_SHORT_SIDE || b - a < SCAN_MIN_SHORT_SIDE) continue;
+      const e = sse(i0, a) + sse(a, b) + sse(b, i1);
+      if (e < bestErr - 1e-9 || (a === c1 && b === c2 && e <= bestErr + 1e-9)) { best = [a, b]; bestErr = e; }
+    }
   }
   return best;
 }
 
+/**
+ * Split a continuous ball track at player touches (see the flight model).
+ *
+ * A touch is a kink: the samples before and after it each lie on a flight,
+ * but no single flight passes through both. Every position in the track is
+ * scored for that, using all samples within SCAN_WINDOW_S on both sides, and
+ * the clearest kinks are cut first; each cut then bounds its neighbours'
+ * windows, so a touch close to a stronger one is still judged on its own
+ * flights. Looking both ways with every sample is what finds a touch at the
+ * far baseline of a wide shot, where it moves the ball a few pixels.
+ */
+function scanTouches(obs: ArcObsEx[], hw: number, hh: number): ArcObsEx[][] {
+  const n = obs.length;
+  if (n < SCAN_MIN_SIDE + SCAN_MIN_SHORT_SIDE) return [obs];
+  const sigma = Math.max(SCAN_MIN_SIGMA_PX, _trackNoisePx(obs, hw, hh));
+  const cuts: number[] = [];
+  const score = new Array<number>(n).fill(0);
+  const bounds = (b: number): [number, number] => {
+    let lo = 0, hi = n;
+    for (const c of cuts) { if (c <= b && c > lo) lo = c; if (c > b && c < hi) hi = c; }
+    return [lo, hi];
+  };
+  const rescore = (from: number, to: number) => {
+    for (let b = Math.max(SCAN_MIN_SHORT_SIDE, from); b <= Math.min(n - SCAN_MIN_SHORT_SIDE, to); b++) {
+      score[b] = cuts.includes(b) ? 0 : _kinkScore(obs, b, ...bounds(b), hw, hh, sigma);
+    }
+  };
+  rescore(0, n);
+  for (;;) {
+    let best = -1;
+    for (let b = SCAN_MIN_SHORT_SIDE; b <= n - SCAN_MIN_SHORT_SIDE; b++) {
+      if (score[b] < P.touchKinkScore || (best >= 0 && score[b] <= score[best])) continue;
+      if (cuts.some((c) => Math.abs(c - b) < SCAN_MIN_SHORT_SIDE)) continue;
+      best = b;
+    }
+    if (best < 0) break;
+    const at = _refineCut(obs, best, ...bounds(best), hw, hh, sigma);
+    const cut = cuts.some((c) => Math.abs(c - at) < SCAN_MIN_SHORT_SIDE) ? best : at;
+    obs[cut].kink = score[best];
+    cuts.push(cut);
+    // Windows that reached across the new cut now stop at it.
+    let from = best, to = best;
+    while (from > 0 && obs[best].t - obs[from - 1].t <= 2 * SCAN_WINDOW_S) from--;
+    while (to < n - 1 && obs[to + 1].t - obs[best].t <= 2 * SCAN_WINDOW_S) to++;
+    rescore(from, to);
+  }
+  cuts.sort((x, y) => x - y);
+  for (let k = 0; k + 1 < cuts.length; k++) {
+    if (obs[cuts[k + 1]].t - obs[cuts[k]].t > SCAN_PAIR_MAX_S) continue;
+    const [a, b] = _refinePair(obs, cuts[k], cuts[k + 1], k > 0 ? cuts[k - 1] : 0, k + 2 < cuts.length ? cuts[k + 2] : n, hw, hh, sigma);
+    if ((k > 0 && a - cuts[k - 1] < SCAN_MIN_SHORT_SIDE) || (k + 2 < cuts.length && cuts[k + 2] - b < SCAN_MIN_SHORT_SIDE)) continue;
+    const [ka, kb] = [obs[cuts[k]].kink, obs[cuts[k + 1]].kink];
+    obs[cuts[k]].kink = undefined; obs[cuts[k + 1]].kink = undefined;
+    cuts[k] = a; cuts[k + 1] = b;
+    obs[a].kink = ka; obs[b].kink = kb;
+  }
+  const out: ArcObsEx[][] = [];
+  let start = 0;
+  for (const c of cuts) { out.push(obs.slice(start, c)); start = c; }
+  out.push(obs.slice(start));
+  return out;
+}
+
+/**
+ * Split a continuous ball track at player touches.
+ *
+ * Between touches the ball is in free flight (see the flight model above). A
+ * touch (dig, set, attack) breaks that: the next positions leave the flight
+ * fitted to the points so far. Without this, a whole rally becomes one "arc"
+ * that no single ballistic trajectory can explain, so the solver rejects it.
+ * Two consecutive points must both deviate, so a single noisy detection does
+ * not cut an arc.
+ */
 // ─── Rally solver: connected ballistic segments ──────────────────────────────
 //
 // Fitting each segment between touches on its own leaves its depth almost
@@ -1137,6 +1331,14 @@ export interface RallyParams {
    * ~70-420 px/s (0.5-3 m/s).
    */
   touchMinDvMps: number;
+  /** The same for a split found as a kink in the track rather than at a detection gap (see mergeUntouchedSplits). */
+  touchMinDvKinkMps: number;
+  /**
+   * How clearly the track must break for a touch split, in units of the
+   * detection noise squared (see scanTouches). By chance alone a flight
+   * scores above 28 once in 10 000 positions.
+   */
+  touchKinkScore: number;
   /**
    * Max seconds without the ball for two pieces of track to belong to the
    * same rally. Real side-view broadcasts lose a fast serve for 0.5-1 s; at
@@ -1219,6 +1421,8 @@ export const DEFAULT_RALLY_PARAMS: RallyParams = {
   touchSplitM: 0.071,
   touchMinSeg: 5,
   touchMinDvMps: 3.55,
+  touchMinDvKinkMps: 2.0,
+  touchKinkScore: 40,
   rallyMaxGapS: 1.0,
   knotMaxY: 4.5,
   softMaxSpeed: 30,
@@ -1277,8 +1481,6 @@ let P: RallyParams = DEFAULT_RALLY_PARAMS;
  * telephoto broadcast camera are judged alike. Set by the physics block.
  */
 let courtMetresPerPx = 0.00709;
-/** Never split on less than this, whatever the scale: detection noise is ~2 px. */
-const TOUCH_SPLIT_MIN_PX = 4;
 
 /** Combined projection, precomputed for speed: world (x,y,z) -> NDC (u,v). */
 function _makeProjector(cam: THREE.PerspectiveCamera) {
@@ -1700,10 +1902,15 @@ const TOSS_REACH_UP = 2.5;
 /** Image velocity jump (px/s) at the boundary between two pieces of track. */
 function _velocityJumpPx(before: ArcObsEx[], after: ArcObsEx[], hw: number, hh: number): number {
   const a = before.slice(-6), b = after.slice(0, 6);
-  if (a.length < 3 || b.length < 3) return Infinity; // too short to judge: keep
+  if (a.length < 2 || b.length < 2) return Infinity; // one sample has no velocity: keep
   const tb = 0.5 * (a[a.length - 1].t + b[0].t);
   // Local quadratic fits either side; perspective is smooth over ~0.2 s.
   const velAt = (obs: ArcObsEx[]) => {
+    // Two samples (between an attack and its block, say): their difference.
+    if (obs.length === 2) {
+      const dt = Math.max(1e-6, obs[1].t - obs[0].t);
+      return [((obs[1].u - obs[0].u) / dt) * hw, ((obs[1].v - obs[0].v) / dt) * hh];
+    }
     const ts = obs.map((o) => o.t - tb);
     const cu = _fitQuadratic(ts, obs.map((o) => o.u));
     const cv = _fitQuadratic(ts, obs.map((o) => o.v));
@@ -1712,6 +1919,37 @@ function _velocityJumpPx(before: ArcObsEx[], after: ArcObsEx[], hw: number, hh: 
   const [ua, va] = velAt(a);
   const [ub, vb] = velAt(b);
   return Math.hypot(ub - ua, vb - va);
+}
+
+/** Longest time (s) between the two touches of a double touch (attack and block). */
+const DOUBLE_TOUCH_MAX_S = 0.3;
+/** Samples either side of a split whose ball size says how far away it is, and the fewest needed. */
+const SPLIT_DEPTH_SAMPLES = 8;
+const SPLIT_DEPTH_MIN_SAMPLES = 4;
+/** Slack (m) around the possible touchers' distances. */
+const SPLIT_DEPTH_SLACK_M = 1.5;
+
+/**
+ * Metres per pixel at a split: the ball's distance there over the focal
+ * length. Under a long lens that is the same everywhere on the court; from a
+ * tripod behind the end line a pixel is 5 mm at the near baseline and 20 mm
+ * at the far one, and one scale for both lost real touches far away and
+ * kept jitter close by. The distance comes from the ball's apparent size
+ * around the split (rough, but this needs no better), held within the
+ * distances of the players who could have made the touch.
+ */
+function _metresPerPxAt(before: ArcObsEx[], after: ArcObsEx[], cands: TouchCandidate[]): number {
+  const ctx = flightCam;
+  if (!ctx) return courtMetresPerPx;
+  const sizes = [...before.slice(-SPLIT_DEPTH_SAMPLES), ...after.slice(0, SPLIT_DEPTH_SAMPLES)]
+    .flatMap((o) => (o.sizeDepth != null && o.sizeDepth > 0 ? [o.sizeDepth] : []));
+  let depth = sizes.length >= SPLIT_DEPTH_MIN_SAMPLES ? _median(sizes) : ctx.courtDist;
+  if (cands.length) {
+    const c = ctx.cam.position;
+    const ds = cands.map(([x, z]) => Math.hypot(x - c.x, 1.5 - c.y, z - c.z));
+    depth = Math.min(Math.max(...ds) + SPLIT_DEPTH_SLACK_M, Math.max(Math.min(...ds) - SPLIT_DEPTH_SLACK_M, depth));
+  }
+  return depth / ctx.fPx;
 }
 
 /**
@@ -1735,18 +1973,31 @@ function mergeUntouchedSplits(
    * back the one-arc flight that already failed to fit.
    */
   keepSplit: Set<number> = new Set(),
+  /** Kinks kept as the other half of a double touch (see below); set by the second pass. */
+  paired: Set<number> = new Set(),
 ): ArcObsEx[][] {
   const out: ArcObsEx[][] = [];
+  const decisions: (TouchSplitDecision & { t: number; fi: number })[] = [];
   for (const arc of arcs) {
     const prev = out[out.length - 1];
     if (prev && arc.length > 0 && !keepSplit.has(arc[0].fi)) {
       const last = prev[prev.length - 1];
       const sameRally = arc[0].t - last.t <= P.rallyMaxGapS;
       if (sameRally) {
-        const candidates = boundaryCandidates(last, arc[0], playersByFrame, cam).length;
-        const dvMps = _velocityJumpPx(prev, arc, hw, hh) * courtMetresPerPx;
-        const kept = candidates > 0 && dvMps >= P.touchMinDvMps;
-        log?.push({ frameBefore: last.fi, frameAfter: arc[0].fi, dvMps, candidates, kept });
+        const cands = boundaryCandidates(last, arc[0], playersByFrame, cam);
+        const candidates = cands.length;
+        const dvMps = _velocityJumpPx(prev, arc, hw, hh) * _metresPerPxAt(prev, arc, cands);
+        // A scanned kink is already a break no single flight explains, far
+        // above the noise, so it needs less of a velocity jump than a split
+        // at a detection gap, which has no such evidence. The jump is an
+        // estimate from a few samples and is small for a real touch that
+        // sends the ball along the line of sight (an attack seen from
+        // behind: 2-3 m/s). It is not waived: where the ball passes the net
+        // and the players the detector drifts by a few pixels, a real break
+        // in the track of 0.5-1.2 m/s (France vs Japan).
+        const kept = candidates > 0 &&
+          (paired.has(arc[0].fi) || dvMps >= (arc[0].kink != null ? P.touchMinDvKinkMps : P.touchMinDvMps));
+        decisions.push({ frameBefore: last.fi, frameAfter: arc[0].fi, dvMps, candidates, kept, kink: arc[0].kink, t: 0.5 * (last.t + arc[0].t), fi: arc[0].fi });
         if (!kept) {
           out[out.length - 1] = [...prev, ...arc];
           continue;
@@ -1755,6 +2006,18 @@ function mergeUntouchedSplits(
     }
     out.push(arc);
   }
+  // Double touches. An attack into the block is two touches a few frames
+  // apart, and from behind the court one of them sends the ball almost
+  // along the line of sight: a clear kink with next to no velocity change
+  // in the picture. A kink with a player in reach right next to a kept
+  // touch is taken as its other half. (Two weak kinks next to each other
+  // stay dropped: neither has a touch to pair with.)
+  const promote = decisions.filter((d) => !d.kept && d.kink != null && d.candidates > 0 &&
+    decisions.some((o) => o.kept && Math.abs(o.t - d.t) <= DOUBLE_TOUCH_MAX_S));
+  if (promote.length && paired.size === 0) {
+    return mergeUntouchedSplits(arcs, playersByFrame, cam, hw, hh, log, keepSplit, new Set(promote.map((d) => d.fi)));
+  }
+  for (const { t: _t, fi: _fi, ...d } of decisions) log?.push(d);
   return out;
 }
 
@@ -1821,6 +2084,8 @@ export interface TouchSplitDecision {
   /** Players who could have touched the ball there. */
   candidates: number;
   kept: boolean;
+  /** How clearly the track breaks there, in noise units; absent for a split at a detection gap. */
+  kink?: number;
 }
 
 /** A touch rule placed on one knot: its type, its side of the net, and its limits. */
@@ -1841,6 +2106,13 @@ interface KnotZone extends TouchRule {
  * an attack. Labelled clips: the shortest is serve to reception, 0.56 s.
  */
 const MIN_TOUCH_INTERVAL_S = 0.52;
+/**
+ * Longest time (s) the ball is carried up in the server's hand before the
+ * toss leaves it. The shortest toss flight, a float serve's, is ~0.5 s.
+ */
+const TOSS_CARRY_MAX_S = 0.3;
+/** A rally's first point this far (m) above the highest toss release is a ball already in the air. */
+const TOSS_SEEN_SLACK_M = 0.3;
 /** How far over the net (m) a blocker's hands reach into the attacker's side. */
 const BLOCK_REACH_OVER_M = 0.75;
 
@@ -1947,6 +2219,14 @@ function applyRallyRules(
     }
   } else {
     return zones;
+  }
+  // The ball is often seen in the server's hand before the toss: it rises
+  // with the hand, then leaves it, and that release is a break in the path
+  // like any touch (pol_ita_r4: first seen at frame 18, released at 21-22).
+  // The release is the toss; the first sight of the ball is not a touch.
+  if (startsWithToss && step === 0 && anchors.length > 2 && knotT.length > 1 && !skip.has(0) && !skip.has(1) &&
+      knotT[1] - knotT[0] <= TOSS_CARRY_MAX_S && (anchors[1] ?? []).some(isServer)) {
+    skip.add(0);
   }
   const plan = rallyPlan(S, startsWithToss, step + anchors.length);
   // The last knot is where the ball leaves view, not a touch.
@@ -2562,6 +2842,8 @@ interface ArcObsEx extends ArcObs {
    * noisy per frame for that.
    */
   sizeDepth?: number | null;
+  /** On the first sample after a scanned cut: how clearly the track breaks there (see scanTouches). */
+  kink?: number;
   /**
    * Vertical NDC position in the camera's own image (u/v are in the
    * reference image for a moving camera). Says whether the ball is at the
@@ -3352,6 +3634,7 @@ function _solveBallTrajectories(
         const centre = new THREE.Vector3(0, 1.5, 0);
         const fPx = vH / 2 / Math.tan((effectiveFovY * Math.PI) / 360);
         courtMetresPerPx = cam.position.distanceTo(centre) / fPx;
+        flightCam = { cam, fPx, courtDist: cam.position.distanceTo(centre) };
       }
       const touchPins = options?.touchEdits?.pins ?? [];
       const { arcs: rawArcs, starts: markedTouches } = splitAtMarkedTouches(
@@ -3541,10 +3824,18 @@ function _solveBallTrajectories(
           // A touch the rules placed at a player stands even when the flights
           // on both sides of it fit badly (a reception between a blurred serve
           // and a pass that left the picture).
-          const ruled = !!zones[k] && (anchors[k]?.length ?? 0) > 0;
+          // But not on a few stray detections: with no fitted flight on either
+          // side, fewer samples after it than a flight needs say nothing left
+          // it (usa_jap_r4: the tracker hopped to a player and then the floor
+          // for three frames after a serve, and that became a reception).
+          const ruled = !!zones[k] && (anchors[k]?.length ?? 0) > 0 && seg.obs.length >= MIN_ARC_FRAMES;
           if (!seg.accepted && !(k > 0 && results[k - 1].accepted) && !ruled) return;
           if (k === 0 && !zones[0]) return;
           if (k >= deadAfter) return;
+          // A toss is the ball leaving the server's hand. A ball first seen
+          // well above any reach is already in flight: the clip (or the
+          // detector) picked it up after the toss, which nobody can date.
+          if (zones[k]?.label === "toss" && seg.posAt(seg.tStart)[1] > zones[k]!.maxY + TOSS_SEEN_SLACK_M) return;
           // Short gap (an arm hides the ball at contact): the knot is the
           // contact. Long gap (a high toss leaves the frame and only comes
           // back at the serve): the ball reappears right after the contact,
@@ -3880,4 +4171,10 @@ function _solveBallTrajectories(
 }
 
 /** Internal helpers exposed for unit tests (src/eval). Not part of the app API. */
-export const __test__ = { fitQuadratic: _fitQuadratic, applyRallyRules, velocityJumpPx: _velocityJumpPx };
+/** Kink score at every position of a track (tests and diagnostics). */
+function kinkScoresFor(obs: ArcObsEx[], vW: number, vH: number): number[] {
+  const sigma = Math.max(SCAN_MIN_SIGMA_PX, _trackNoisePx(obs, vW / 2, vH / 2));
+  return obs.map((_, b) => _kinkScore(obs, b, 0, obs.length, vW / 2, vH / 2, sigma));
+}
+
+export const __test__ = { kinkScoresFor, fitFlight, fitQuadratic: _fitQuadratic, applyRallyRules, velocityJumpPx: _velocityJumpPx };
