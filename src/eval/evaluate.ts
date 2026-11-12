@@ -59,3 +59,51 @@ export function aggregateScore(results: CaseResult[], includeKnownLimits = false
     .map((r) => r.metrics!.score);
   return s.length ? s.reduce((a, b) => a + b, 0) / s.length : 0;
 }
+
+const med = (a: number[]) => {
+  if (!a.length) return null;
+  const s = [...a].sort((x, y) => x - y), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+const nums = (a: (number | null | undefined)[]) => a.filter((v): v is number => v != null && Number.isFinite(v));
+
+/**
+ * The numbers the acceptance criteria in EVAL.md are written in, over a group
+ * of clips (gated synthetic scenarios, the tuning clips, the holdout clips).
+ */
+export function groupSummary(ms: ClipMetrics[]) {
+  const sum = (f: (m: ClipMetrics) => number) => ms.reduce((s, m) => s + f(m), 0);
+  const avg = (a: number[]) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
+  const max = (a: number[]) => (a.length ? Math.max(...a) : null);
+  const min = (a: number[]) => (a.length ? Math.min(...a) : null);
+  const T = sum((m) => m.touchesTrue), F = sum((m) => m.touchesFound), M = sum((m) => m.touchesMatched);
+  return {
+    clips: ms.length,
+    score: avg(ms.map((m) => m.score)),
+    touchesTrue: T, touchesFound: F, touchesMatched: M,
+    recall: T ? M / T : null,
+    precision: F ? M / F : null,
+    /** Touches found at the right time with the right type, out of all true touches. */
+    typeCorrect: T ? sum((m) => m.typeCorrect ?? 0) / T : null,
+    touchPosMedianM: med(nums(ms.map((m) => m.touchPosErrM))),
+    touchFrameErrMean: avg(nums(ms.map((m) => m.touchFrameErr))),
+    touchFrameErrWorst: max(nums(ms.map((m) => m.touchFrameErr))),
+    reprojMedianPx: med(nums(ms.map((m) => m.reprojMedianPx))),
+    reprojWorstPx: max(nums(ms.map((m) => m.reprojMedianPx))),
+    reprojCoverage: avg(nums(ms.map((m) => m.reprojCoverage))),
+    trajCoverageMin: min(nums(ms.map((m) => m.trajCoverage))),
+    pathRmsMedianM: med(nums(ms.map((m) => m.pathRmsM))),
+    pathRmsWorstM: max(nums(ms.map((m) => m.pathRmsM))),
+    path3dMedianM: med(nums(ms.map((m) => m.path3dMedianM))),
+  };
+}
+export type GroupSummary = ReturnType<typeof groupSummary>;
+
+export function groupSummaries(results: CaseResult[], holdout: string[]) {
+  const pick = (f: (r: CaseResult) => boolean) => results.filter((r) => r.metrics && f(r)).map((r) => r.metrics!);
+  return {
+    synthetic: groupSummary(pick((r) => r.case.synthetic && !r.case.knownLimit)),
+    tuning: groupSummary(pick((r) => !r.case.synthetic && !holdout.includes(r.case.name))),
+    holdout: groupSummary(pick((r) => !r.case.synthetic && holdout.includes(r.case.name))),
+  };
+}

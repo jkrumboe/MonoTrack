@@ -15,6 +15,12 @@ export interface EvalCase {
   note?: string;
 }
 
+/**
+ * Real clips never used to choose parameters or rules (see EVAL.md). They are
+ * reported separately and must not get worse than their baseline.
+ */
+export const HOLDOUT = ["pol_ita_r3", "pol_ita_r6", "usa_jap_r2"];
+
 /** Repo-root eval/ directory (fixtures, labels, reports). */
 export const EVAL_DIR = path.resolve(__dirname, "../../eval");
 

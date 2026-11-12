@@ -7,8 +7,8 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { allCases, EVAL_DIR } from "./dataset";
-import { aggregateScore, evaluateCase, realSummary, type CaseResult, type RallyParamsOverride } from "./evaluate";
+import { allCases, EVAL_DIR, HOLDOUT } from "./dataset";
+import { aggregateScore, evaluateCase, groupSummaries, realSummary, type CaseResult, type GroupSummary, type RallyParamsOverride } from "./evaluate";
 import { writeReport } from "./report";
 
 function arg(name: string): string | undefined {
@@ -29,13 +29,13 @@ for (const c of cases) {
   results.push(r);
   const m = r.metrics;
   const fmt = (v: number | null | undefined, d = 2) => (v == null || !Number.isFinite(v) ? "  -  " : v.toFixed(d).padStart(5));
-  const tag = c.synthetic ? (c.knownLimit ? "limit" : "synth") : (c.truth ? "real " : "real*");
+  const tag = c.synthetic ? (c.knownLimit ? "limit" : "synth") : (!c.truth ? "real*" : HOLDOUT.includes(c.name) ? "hold " : "real ");
   console.log(
     `${tag} ${c.name.padEnd(18)} ` +
     (m
       ? `score ${m.score.toFixed(1).padStart(5)}  touches ${m.touchesMatched}/${m.touchesTrue} (found ${m.touchesFound})` +
         `  type ${fmt(m.typeAccuracy)}  pos ${fmt(m.touchPosErrM)} m  h ${fmt(m.touchHeightErrM)} m  dt ${fmt(m.touchFrameErr)} f` +
-        `  path ${fmt(m.pathRmsM)} m  cov ${fmt(m.pathCoverage)}  reproj ${fmt(m.reprojMedianPx, 1)} px  court ${fmt(m.courtErrPx, 1)} px`
+        `  path ${fmt(m.pathRmsM)} m  med3d ${fmt(m.path3dMedianM)} m  line ${fmt(m.trajCoverage)}  reproj ${fmt(m.reprojMedianPx, 1)} px on ${fmt(m.reprojCoverage)}  court ${fmt(m.courtErrPx, 1)} px`
       : `unlabelled: ${r.run?.result.touches?.length ?? 0} touches found`) +
     `  (${r.run?.millis ?? 0} ms)`,
   );
@@ -52,12 +52,30 @@ if (real) {
   );
 }
 
+const groups = groupSummaries(results, HOLDOUT);
+const pct = (v: number | null) => (v == null ? "-" : `${(100 * v).toFixed(0)}%`);
+const n2 = (v: number | null, d = 2) => (v == null ? "-" : v.toFixed(d));
+const line = (name: string, g: GroupSummary) => {
+  if (!g.clips) return;
+  console.log(
+    `${name.padEnd(18)} ${g.clips} clips  score ${n2(g.score, 1)}  type ${pct(g.typeCorrect)}  recall ${pct(g.recall)}  precision ${pct(g.precision)}` +
+    `  touch pos ${n2(g.touchPosMedianM)} m  dt ${n2(g.touchFrameErrMean)} (worst ${n2(g.touchFrameErrWorst)}) f` +
+    `  reproj ${n2(g.reprojMedianPx, 1)} (worst ${n2(g.reprojWorstPx, 1)}) px on ${pct(g.reprojCoverage)}  line min ${pct(g.trajCoverageMin)}` +
+    (g.pathRmsMedianM != null ? `  path RMS ${n2(g.pathRmsMedianM)} (worst ${n2(g.pathRmsWorstM)}) m  median 3D ${n2(g.path3dMedianM)} m` : ""),
+  );
+};
+console.log("");
+line("Synthetic (gated)", groups.synthetic);
+line("Real, tuning set", groups.tuning);
+line("Real, holdout", groups.holdout);
+
 fs.mkdirSync(EVAL_DIR, { recursive: true });
 const summary = {
   when: new Date().toISOString(),
   params: params ?? "defaults",
   overall: total,
   real,
+  groups,
   cases: results.map((r) => ({ name: r.case.name, synthetic: r.case.synthetic, knownLimit: r.case.knownLimit, metrics: r.metrics })),
 };
 fs.writeFileSync(path.join(EVAL_DIR, "last.json"), JSON.stringify(summary, null, 2));

@@ -8,6 +8,12 @@ export const BROADCAST_CAM: CalibrationResult = {
   fov: 9.295,
 };
 
+/**
+ * Phone on a tripod 7 m behind the end line, 3.5 m up, main lens (46° vertical
+ * in landscape): both baselines and balls up to ~8 m over the net are in view.
+ */
+export const TRIPOD_CAM: CalibrationResult = { position: [0, 3.5, 16], lookAt: [0, 1.5, 0], fov: 46 };
+
 const cam = (position: [number, number, number], fov: number): CalibrationResult => ({
   position, lookAt: [0, 0.5, -6], fov,
 });
@@ -67,6 +73,15 @@ export const SCENARIOS: Scenario[] = [
   // Pan/zoom from a fixed spot, with the motion estimate's output (stabilised).
   { name: "side-pan", note: "Sideline camera that follows the ball (0.35 s lag) and zooms ×0.85–1.15; 1.5 px motion-estimate error.", camera: { position: [20, 8, 0], lookAt: [0, 0.5, 0], fov: 22 }, touches: sideOut(1), motion: { followLagS: 0.35, zoom: [0.85, 1.15], zoomPeriodS: 3, hNoisePx: 1.5 }, seed: 17 },
   { name: "behind-pan", note: "Broadcast camera behind the baseline that follows the ball and zooms ×0.9–1.2; 1 px motion error.", camera: BROADCAST_CAM, touches: sideOut(-1), motion: { followLagS: 0.4, zoom: [0.9, 1.2], zoomPeriodS: 4, hNoisePx: 1 }, seed: 18 },
+  // The product target: a phone on a tripod behind the end line. Static, wide
+  // lens (the whole court in view), 1080p. The ball is ~10 px at the far
+  // baseline and ~17 px at the net, so its size says little about depth
+  // (20 % size noise); perspective is strong instead.
+  { name: "tripod-30", note: "Phone on a tripod 7 m behind the end line, 3.5 m up, 46° lens, 30 fps; near side serves.", camera: TRIPOD_CAM, touches: sideOut(1), sizeNoise: 0.2, sizeCrowdBiasPx: 0, seed: 21 },
+  { name: "tripod-60", note: "Same tripod at 60 fps; far side serves.", camera: TRIPOD_CAM, video: { width: 1920, height: 1080, fps: 60 }, touches: sideOut(-1), sizeNoise: 0.2, sizeCrowdBiasPx: 0, seed: 22 },
+  { name: "tripod-close-30", note: "Tripod 5 m behind the end line, 3 m up, 56° lens, 30 fps; far side serves.", camera: { position: [0, 3, 14], lookAt: [0, 1.5, 0], fov: 56 }, touches: sideOut(-1), sizeNoise: 0.2, sizeCrowdBiasPx: 0, seed: 23 },
+  { name: "tripod-far-60", note: "Tripod 8 m behind the end line, 4 m up, 1.5 m off-centre, 42° lens, 60 fps; near side serves.", camera: { position: [1.5, 4, 17], lookAt: [0, 1.5, 0], fov: 42 }, video: { width: 1920, height: 1080, fps: 60 }, touches: sideOut(1), sizeNoise: 0.2, sizeCrowdBiasPx: 0, seed: 24 },
+  { name: "tripod-long-30", note: "Tripod, 30 fps: the attack is dug, set and attacked back, and the ball lands in.", camera: TRIPOD_CAM, touches: longRally(-1), sizeNoise: 0.2, sizeCrowdBiasPx: 0, seed: 25 },
   { name: "side-pan-raw", note: "Known limit: the panning side camera without motion compensation (what the old pipeline saw).", camera: { position: [20, 8, 0], lookAt: [0, 0.5, 0], fov: 22 }, touches: sideOut(1), motion: { followLagS: 0.35, zoom: [0.85, 1.15], zoomPeriodS: 3, stabilize: false }, seed: 17, knownLimit: true },
   { name: "back-row-attack", note: "Known limit: back-row attack contacted 3 m from the net.", camera: BROADCAST_CAM, touches: sideOut(1, { attackZ: 3.0 }), seed: 13, knownLimit: true },
   { name: "long-rally", note: "Known limit: dig, set and second attack after the block (no rules yet).", camera: BROADCAST_CAM, touches: longRally(1), seed: 14, knownLimit: true },

@@ -111,6 +111,7 @@ export function scoreClip(fx: Fixture, truth: Truth, run: PipelineRun | null): {
         clip: fx.clip, synthetic, touchesTrue: truth.touches.length, touchesFound: 0, touchesMatched: 0,
         recall: 0, precision: 0, typeAccuracy: 0, touchPosErrM: null, touchHeightErrM: null, touchFrameErr: null,
         pathRmsM: null, pathCoverage: synthetic ? 0 : null, reprojMedianPx: null, courtErrPx: null, score: 0,
+        path3dMedianM: null, typeCorrect: 0, trajCoverage: 0, reprojCoverage: 0,
       },
     };
   }
@@ -131,20 +132,37 @@ export function scoreClip(fx: Fixture, truth: Truth, run: PipelineRun | null): {
   const posErrs = matched.flatMap((m) => (m.posErrM != null ? [m.posErrM] : []));
   const hErrs = matched.flatMap((m) => (m.heightErrM != null ? [m.heightErrM] : []));
 
-  let pathRmsM: number | null = null, pathCoverage: number | null = null;
+  let pathRmsM: number | null = null, pathCoverage: number | null = null, path3dMedianM: number | null = null;
   if (truth.path) {
     const frames = Object.keys(truth.path).map(Number);
     let ss = 0, n = 0;
+    const errs: number[] = [];
     for (const f of frames) {
       const p = run.result.positions.get(f);
       if (!p) continue;
       const q = truth.path[f];
-      ss += (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2;
+      const e2 = (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2;
+      ss += e2;
+      errs.push(Math.sqrt(e2));
       n++;
     }
     pathRmsM = n ? Math.sqrt(ss / n) : null;
+    path3dMedianM = n ? median(errs) : null;
     pathCoverage = frames.length ? n / frames.length : 0;
   }
+  // Every frame from the first to the last contact should have a path.
+  let trajCoverage: number | null = null;
+  if (truth.touches.length) {
+    const tf = truth.touches.map((t) => t.frame);
+    const a = Math.min(...tf), b = Math.max(...tf);
+    let have = 0;
+    for (let f = a; f <= b; f++) if (run.result.positions.has(f)) have++;
+    trajCoverage = have / (b - a + 1);
+  }
+  // A low reprojection error is easy to get by fitting fewer detections.
+  const detected = fx.frames.filter((f) => f.ball_img_pos && !f.ball_interpolated).length;
+  const fittedFrames = new Set((run.result.physicsDebug ?? []).filter((d) => d.usedInFit).map((d) => d.frame)).size;
+  const reprojCoverage = detected ? fittedFrames / detected : null;
   const reproj = (run.result.physicsDebug ?? [])
     .filter((d) => d.usedInFit && d.reprojectionErrorPx != null)
     .map((d) => d.reprojectionErrorPx as number);
@@ -170,6 +188,7 @@ export function scoreClip(fx: Fixture, truth: Truth, run: PipelineRun | null): {
       touchFrameErr: matched.length ? mean(matched.map((m) => Math.abs(m.found!.frame - m.trueFrame))) : null,
       pathRmsM, pathCoverage, reprojMedianPx: reproj.length ? median(reproj) : null, courtErrPx: court.px,
       score,
+      path3dMedianM, typeCorrect: matched.filter((m) => m.found!.label === m.trueType).length, trajCoverage, reprojCoverage,
     },
   };
 }

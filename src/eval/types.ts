@@ -90,6 +90,14 @@ export interface ClipMetrics {
   pathRmsM: number | null;
   /** Share of true-path frames that got a 3D position. */
   pathCoverage: number | null;
+  /** Median 3D error over frames that have both truth and a solved position (m), synthetic only. */
+  path3dMedianM?: number | null;
+  /** Matched touches whose label is right (count). Type correct = this / touchesTrue. */
+  typeCorrect?: number;
+  /** Share of frames from the first to the last labelled contact that have a 3D position. */
+  trajCoverage?: number | null;
+  /** Share of frames with a ball detection that the solver fitted (not estimated, not an outlier). */
+  reprojCoverage?: number | null;
   /** Median reprojection error of solved positions onto detections (px). */
   reprojMedianPx: number | null;
   /** Scored court vs the labelled court, px at 1920x1080. Null when unlabelled. */
