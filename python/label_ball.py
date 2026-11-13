@@ -103,6 +103,13 @@ def main():
     cap = cv2.VideoCapture(video)
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # The frame-count settings are meant at 25-30 fps: at 60 fps the ball moves
+    # half as far between frames and a gap of the same length is twice as many.
+    rate = fps / 30.0 if fps >= 45 else 1.0
+    motion_step = max(1, int(round(MOTION_STEP * rate)))
+    gap_max = int(round(GAP_MAX * rate))
+    print(f"{n} frames, {W}x{H}, {fps:.2f} fps" + (f" (motion step {motion_step} frames)" if rate != 1 else ""))
     scale = VIEW_W / W
     state = {"frame": 0, "playing": False, "zoom": False, "view": None}
     decoded = {}
@@ -126,10 +133,10 @@ def main():
         return None if moving else np.eye(3)
 
     def candidates(i):
-        if i - MOTION_STEP < 0 or i + MOTION_STEP >= n:
+        if i - motion_step < 0 or i + motion_step >= n:
             return []
-        imgs = [frame(i - MOTION_STEP), frame(i), frame(i + MOTION_STEP)]
-        hs = [ref_from(i - MOTION_STEP), ref_from(i), ref_from(i + MOTION_STEP)]
+        imgs = [frame(i - motion_step), frame(i), frame(i + motion_step)]
+        hs = [ref_from(i - motion_step), ref_from(i), ref_from(i + motion_step)]
         if any(im is None for im in imgs) or any(h is None for h in hs):
             return []
         N = np.diag([W * MOTION_SCALE, H * MOTION_SCALE, 1.0])
@@ -141,7 +148,7 @@ def main():
     def next_hard(after):
         """Next unlabelled frame inside a short detector gap (the ball lost during play)."""
         for a, b in zip(detected, detected[1:]):
-            if 1 < b - a <= GAP_MAX:
+            if 1 < b - a <= gap_max:
                 for f in range(max(a + 1, after + 1), b):
                     if f not in labels:
                         return f
@@ -165,7 +172,7 @@ def main():
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump({"clip": clip, "video": os.path.relpath(video, os.path.join(EVAL_DIR, os.pardir)),
-                       "width": W, "height": H,
+                       "width": W, "height": H, "fps": fps,
                        "frames": {str(k): labels[k] for k in sorted(labels)}}, fh, indent=1)
         seen = sum(1 for v in labels.values() if v)
         print(f"Saved {len(labels)} frames ({seen} with the ball, {len(labels) - seen} without) to {out_path}")

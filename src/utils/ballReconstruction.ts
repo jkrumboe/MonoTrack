@@ -654,6 +654,8 @@ const MAX_ARC_DURATION_S = 2.5;
 const MAX_FRAME_GAP = 3;
 /** Split when the NDC 2D jump between consecutive observations exceeds this. */
 const MAX_2D_JUMP_NDC = 0.3;
+/** The frame gap as time (s), which is what counts at 60 fps: 3 frames at 30 fps. */
+const MAX_FRAME_GAP_S = 0.1;
 /** Split when bbox camera-ray depth changes by more than this fraction. */
 const MAX_DEPTH_CHANGE_FRAC = 0.3;
 /**
@@ -926,7 +928,7 @@ function splitArcsEx(obs: ArcObsEx[], videoWidth?: number, videoHeight?: number)
     const shouldSplit =
       gapS     > MAX_ARC_GAP_S          ||
       spanS    > MAX_ARC_DURATION_S     ||
-      frameGap > MAX_FRAME_GAP          ||
+      frameGap > Math.max(MAX_FRAME_GAP, Math.round(MAX_FRAME_GAP_S * clipFps)) ||
       jump2d   > MAX_2D_JUMP_NDC        ||
       depthChangeFrac > MAX_DEPTH_CHANGE_FRAC;
     if (shouldSplit) {

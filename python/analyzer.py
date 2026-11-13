@@ -345,7 +345,20 @@ _BALL_CONF_TRUST = 0.35     # above this a detection may start/restart a track
 # spike at 30 fps across a ~20 m field of view is roughly 0.04, so 0.18 leaves
 # generous headroom for fast serves and camera pans.
 _BALL_MAX_STEP = 0.18
-_BALL_COAST_FRAMES = 12     # how long to keep predicting through a dropout
+_BALL_COAST_FRAMES_30 = 12  # how long to keep predicting through a dropout, in frames at 30 fps
+_BALL_COAST_FRAMES = _BALL_COAST_FRAMES_30
+# Limits counted in frames were set on 25-30 fps footage. At a high frame rate
+# (a phone at 60 fps) the same number of frames is half the time, so they are
+# scaled by this; it stays 1 up to 45 fps, which leaves 25/30 fps results as
+# they were.
+_FRAME_SCALE = 1.0
+
+
+def _set_frame_rate(fps):
+    """Scale the frame-count limits for this clip's frame rate (see _FRAME_SCALE)."""
+    global _FRAME_SCALE, _BALL_COAST_FRAMES
+    _FRAME_SCALE = fps / 30.0 if fps and fps >= 45 else 1.0
+    _BALL_COAST_FRAMES = int(round(_BALL_COAST_FRAMES_30 * _FRAME_SCALE))
 
 
 def _detect_ball_candidates(frame, model, conf_thresh=_BALL_CONF_FLOOR):
@@ -749,16 +762,16 @@ def _interpolate_ball_path(raw_detections):
     Returns dict {frame_idx: {'pos': [cx, cy], 'conf': float,
                               'bbox': list|None, 'interpolated': bool}}
     """
-    MAX_GAP = 18  # ~0.6 s at 30 fps - beyond this a guess is worse than a hole
+    MAX_GAP = int(round(18 * _FRAME_SCALE))  # ~0.6 s - beyond this a guess is worse than a hole
     # Discard fragments shorter than this; isolated specks are almost always
     # false positives and, being too short to fit an arc, only add noise
     # downstream. Mirrors split_track(min_track=5) in yastrebksv/TrackNet.
-    MIN_TRACK = 5
+    MIN_TRACK = int(round(5 * _FRAME_SCALE))
     # Gap that ends a subtrack. Deliberately much smaller than MAX_GAP: this
     # decides what counts as one continuous sighting of the ball, whereas
     # MAX_GAP decides how far interpolation may reach. Using MAX_GAP here would
     # glue a stray 2-frame island onto a genuine run and keep it.
-    SPLIT_GAP = 6
+    SPLIT_GAP = int(round(6 * _FRAME_SCALE))
 
     if not raw_detections:
         return {}
@@ -2169,6 +2182,7 @@ def analyze_video_cv(video_path: str):
     img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     send_progress(0, f"Analyzing {total_frames} frames at {fps:.1f} FPS...")
+    _set_frame_rate(fps)
 
     court_interval = max(int(fps), 1)
     global _prev_corners, _last_court_keypoints
