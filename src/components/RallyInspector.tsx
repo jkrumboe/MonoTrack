@@ -11,6 +11,7 @@ import type { FrameData } from "../hooks/useAnalysis";
 import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
 import type { PhysicsReprojectionDebug, TouchSplitDecision } from "../utils/ballReconstruction";
 import { TOUCH_KINDS, touchColor, touchMatchFrames, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
+import { resetSegmentEdits, type RefitSegment } from "../utils/rallyRefit";
 import { inspectRally, type Fix, type Problem } from "../utils/rallyInspection";
 import CourtEditor3D from "./CourtEditor3D";
 
@@ -36,6 +37,12 @@ interface Props {
   courtErrPx: number | null;
   edits: RallyEdits;
   onEdit: (change: (e: RallyEdits) => RallyEdits) => void;
+  /** The flights between touches as shown, with their arc handles (see utils/rallyRefit). */
+  segments: RefitSegment[];
+  onUndo: () => void;
+  onRedo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
   currentFrame: number;
   onSeek: (frame: number) => void;
   /** The video player, drawn under the overlay. */
@@ -161,6 +168,14 @@ export default function RallyInspector(p: Readonly<Props>) {
   const clearTouch = useCallback((frame: number) => onEdit((e) => {
     const t = { ...e.touches }; delete t[frame]; return { ...e, touches: t };
   }), [onEdit]);
+  /** Height of the ball midway through the flight that starts at this touch, or null: the automatic arc. */
+  const setArc = useCallback((frame: number, midY: number | null) => onEdit((e) => {
+    const arcs = { ...(e.arcs ?? {}) };
+    if (midY == null) delete arcs[frame]; else arcs[frame] = Math.round(midY * 100) / 100;
+    return { ...e, arcs };
+  }), [onEdit]);
+  /** A flight back to the automatic result: its arc and the 3D placements of its two touches. */
+  const resetSegment = useCallback((from: number, to: number) => onEdit((e) => resetSegmentEdits(e, from, to, 2)), [onEdit]);
   const setDismissed = useCallback((key: string, on: boolean) => onEdit((e) => ({
     ...e, dismissed: on ? [...new Set([...e.dismissed, key])] : e.dismissed.filter((k) => k !== key),
   })), [onEdit]);
@@ -192,6 +207,12 @@ export default function RallyInspector(p: Readonly<Props>) {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && (t.isContentEditable || ["TEXTAREA", "SELECT"].includes(t.tagName) || (t.tagName === "INPUT" && (t as HTMLInputElement).type !== "range"))) return;
+      // Ctrl/Cmd+Z undo, Ctrl/Cmd+Shift+Z or Ctrl+Y redo.
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "z" || e.key === "Z" || e.key === "y" || e.key === "Y")) {
+        if (e.key === "y" || e.key === "Y" || e.shiftKey) p.onRedo(); else p.onUndo();
+        e.preventDefault();
+        return;
+      }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === "b" || e.key === "B") setTool((x) => (x === "ball" ? "none" : "ball"));
       else if (e.key === "x" || e.key === "X") setBall(cur, null);
@@ -204,7 +225,7 @@ export default function RallyInspector(p: Readonly<Props>) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [cur, touchHere, addType, setBall, setTouch, stepProblem]);
+  }, [cur, touchHere, addType, setBall, setTouch, stepProblem, p.onUndo, p.onRedo]);
 
   // ── Video stage: zoom, pan, click to place the ball ──────────────────────
   useEffect(() => {
@@ -382,8 +403,11 @@ export default function RallyInspector(p: Readonly<Props>) {
     for (const [f, q] of Object.entries(edits.pins)) {
       rows.push({ from: Number(f), to: Number(f), text: `Touch placed in 3D (h ${q[1].toFixed(1)} m)`, undo: () => setPin(Number(f), null) });
     }
+    for (const [f, y] of Object.entries(edits.arcs ?? {})) {
+      rows.push({ from: Number(f), to: Number(f), text: `Arc reshaped (${y.toFixed(1)} m high midway)`, undo: () => setArc(Number(f), null) });
+    }
     return rows.sort((a, b) => a.from - b.from);
-  }, [edits.ball, edits.touches, edits.pins, onEdit, clearTouch, setPin]);
+  }, [edits.ball, edits.touches, edits.pins, edits.arcs, onEdit, clearTouch, setPin, setArc]);
 
   const scoreColor = insp.score >= 80 ? "var(--ok)" : insp.score >= 55 ? "var(--warn)" : "var(--bad)";
   const shown = showHidden ? insp.problems : insp.open;
@@ -429,6 +453,8 @@ export default function RallyInspector(p: Readonly<Props>) {
           flash={flash === "3d"}
           frames={frames} positions={p.positions} touches={touches} calibration={p.calibration} aspect={aspect}
           cur={cur} selected={touchHere?.frame ?? null} onSelect={onSeek} onPin={(f, q) => setPin(f, q)}
+          fps={fps} segments={p.segments} onArc={setArc} onResetSegment={resetSegment}
+          onUndo={p.onUndo} onRedo={p.onRedo} canUndo={p.canUndo} canRedo={p.canRedo}
         />
         <Timeline
           frames={frames} fps={fps} positions={p.positions} touches={touches} edits={edits}

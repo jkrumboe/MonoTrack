@@ -8,11 +8,17 @@
  * cannot see, so the selected touch shows its line of sight (the ball is
  * somewhere on it) and a drag snaps onto it. Hold Shift to place it freely,
  * e.g. when the ball was hidden at the touch.
+ *
+ * Each flight has a handle midway (a diamond, in the side view): drag it up
+ * or down to make the arc higher or flatter. Flights rebuilt from an edit
+ * are drawn dashed: they are placed, not measured. Undo, redo and "reset
+ * flight" sit under the views.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FrameData } from "../hooks/useAnalysis";
 import type { CalibrationResult } from "../utils/cameraSolver";
 import { ballRay, touchColor, type EditedTouch } from "../utils/rallyEdits";
+import { ARC_MAX_G, ARC_MIN_G, arcAt, gravityForMidHeight, type RefitSegment } from "../utils/rallyRefit";
 
 type V3 = [number, number, number];
 
@@ -35,6 +41,17 @@ interface Props {
   selected: number | null;
   onSelect: (frame: number) => void;
   onPin: (frame: number, pos: V3) => void;
+  fps: number;
+  /** The flights between touches, with where their arc handles sit. */
+  segments: RefitSegment[];
+  /** Set the height of the ball midway through the flight starting at a touch's frame. */
+  onArc: (fromFrame: number, midY: number) => void;
+  /** Put a flight back to the automatic result. */
+  onResetSegment: (fromFrame: number, toFrame: number) => void;
+  onUndo: () => void;
+  onRedo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
   /** Draw attention to the editor (a problem's fix points here). */
   flash?: boolean;
 }
@@ -48,6 +65,8 @@ export default function CourtEditor3D(p: Readonly<Props>) {
   const [w, setW] = useState(0);
   /** Touch being dragged and where it is now (not yet committed). */
   const [drag, setDrag] = useState<{ frame: number; pos: V3; snapped: boolean } | null>(null);
+  /** Arc handle being dragged: the flight's first touch frame and the height it is at now. */
+  const [arcDrag, setArcDrag] = useState<{ from: number; midY: number } | null>(null);
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -70,6 +89,8 @@ export default function CourtEditor3D(p: Readonly<Props>) {
     [p.calibration, p.selected, p.aspect, p.frames],
   );
   const shown = (t: EditedTouch): V3 => (drag && drag.frame === t.frame ? drag.pos : t.position);
+  /** The flight that starts at the selected touch, or the one that ends at it for the last touch. */
+  const selSegment = p.segments.find((x) => x.from === p.selected) ?? p.segments.find((x) => x.to === p.selected) ?? null;
 
   useEffect(() => {
     if (!w) return;
@@ -131,6 +152,33 @@ export default function CourtEditor3D(p: Readonly<Props>) {
       };
       for (const r of runsOf(0, p.frames.length - 1)) line(r, "rgba(242,194,48,.28)", 1.5);
       for (const r of runsOf(p.cur - 30, p.cur)) line(r, "#f2c230", 2);
+      // Flights rebuilt from an edit: dashed over the solid line, as estimates.
+      for (const sg of p.segments) {
+        if (!sg.rebuilt) continue;
+        const pts: V3[] = [];
+        for (let f = sg.from; f <= sg.to; f++) { const q = p.positions.get(f); if (q) pts.push(q); }
+        line(pts, css("--bg-stage", "#0d1014"), 3);
+        line(pts, sg.warning ? "#ff7043" : "#f2c230", 1.5, [5, 4]);
+      }
+      // The arc being reshaped, as it will be.
+      if (arcDrag) {
+        const sg = p.segments.find((x) => x.from === arcDrag.from);
+        const a = p.touches.find((t) => t.frame === sg?.from), b = p.touches.find((t) => t.frame === sg?.to);
+        if (sg && a && b) {
+          const g = Math.min(ARC_MAX_G * 9.81, Math.max(ARC_MIN_G * 9.81, gravityForMidHeight(a.position, b.position, sg.from, sg.to, p.fps, arcDrag.midY)));
+          const pts: V3[] = [];
+          for (let f = sg.from; f <= sg.to; f++) pts.push(arcAt(a.position, b.position, sg.from, sg.to, g, p.fps, f));
+          line(pts, "#00e5ff", 2);
+        }
+      }
+      // Arc handles: a diamond midway through each flight.
+      for (const sg of p.segments) {
+        const q: V3 = arcDrag && arcDrag.from === sg.from ? [sg.mid[0], arcDrag.midY, sg.mid[2]] : sg.mid;
+        const [x, y] = px(q), r = view === "side" ? 5 : 3.5;
+        ctx.beginPath(); ctx.moveTo(x, y - r); ctx.lineTo(x + r, y); ctx.lineTo(x, y + r); ctx.lineTo(x - r, y); ctx.closePath();
+        ctx.fillStyle = sg.manual ? "#00e5ff" : css("--bg-stage", "#0d1014"); ctx.fill();
+        ctx.strokeStyle = sg.warning ? "#ff7043" : sg.manual ? "#00e5ff" : "rgba(242,194,48,.9)"; ctx.lineWidth = 1.5; ctx.stroke();
+      }
       const now = p.positions.get(p.cur);
       if (now) {
         ctx.beginPath(); ctx.arc(...px(now), 4, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
@@ -154,8 +202,12 @@ export default function CourtEditor3D(p: Readonly<Props>) {
         ctx.fillStyle = "#00e5ff"; ctx.font = "11px ui-monospace, Consolas, monospace";
         ctx.fillText(`x ${q[0].toFixed(1)}  h ${q[1].toFixed(1)}  z ${q[2].toFixed(1)} m${drag.snapped ? "  on line of sight" : ""}`, 6, 13);
       }
+      if (arcDrag && view === "side") {
+        ctx.fillStyle = "#00e5ff"; ctx.font = "11px ui-monospace, Consolas, monospace";
+        ctx.fillText(`arc ${arcDrag.midY.toFixed(1)} m high midway`, 6, 13);
+      }
     }
-  }, [w, s, topH, sideH, p.positions, p.touches, p.frames.length, p.cur, p.selected, p.calibration, ray, drag]);
+  }, [w, s, topH, sideH, p.positions, p.touches, p.frames.length, p.cur, p.selected, p.calibration, ray, drag, arcDrag, p.segments, p.fps]);
 
   /** Mouse position -> court point in a view, keeping the coordinate the view does not show. */
   const toWorld = (view: View, mx: number, my: number, keep: V3, free: boolean): { pos: V3; snapped: boolean } => {
@@ -190,11 +242,31 @@ export default function CourtEditor3D(p: Readonly<Props>) {
     return best;
   };
 
+  /** The arc handle under the mouse (side view only: height is what it changes). */
+  const hitArc = (view: View, mx: number, my: number): RefitSegment | null => {
+    if (view !== "side") return null;
+    const { px } = mapper(view);
+    let best: RefitSegment | null = null, bestD = HIT_PX;
+    for (const sg of p.segments) {
+      const [x, y] = px(sg.mid);
+      const d = Math.hypot(x - mx, y - my);
+      if (d < bestD) { bestD = d; best = sg; }
+    }
+    return best;
+  };
+
   const handlers = (view: View) => ({
     onPointerDown: (e: React.PointerEvent<HTMLCanvasElement>) => {
       const r = e.currentTarget.getBoundingClientRect();
       const t = hit(view, e.clientX - r.left, e.clientY - r.top);
-      if (!t) return;
+      if (!t) {
+        const sg = hitArc(view, e.clientX - r.left, e.clientY - r.top);
+        if (sg) {
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setArcDrag({ from: sg.from, midY: sg.mid[1] });
+        }
+        return;
+      }
       p.onSelect(t.frame);
       e.currentTarget.setPointerCapture(e.pointerId);
       setDrag({ frame: t.frame, pos: t.position, snapped: false });
@@ -202,14 +274,24 @@ export default function CourtEditor3D(p: Readonly<Props>) {
     onPointerMove: (e: React.PointerEvent<HTMLCanvasElement>) => {
       const r = e.currentTarget.getBoundingClientRect();
       const mx = e.clientX - r.left, my = e.clientY - r.top;
+      if (arcDrag) {
+        setArcDrag({ from: arcDrag.from, midY: Math.max(0.2, Math.min(Y_MAX + 4, (sideH - my) / s)) });
+        return;
+      }
       if (!drag) {
-        e.currentTarget.style.cursor = hit(view, mx, my) ? "grab" : "default";
+        e.currentTarget.style.cursor = hit(view, mx, my) ? "grab" : hitArc(view, mx, my) ? "ns-resize" : "default";
         return;
       }
       // The line of sight is the selected touch's, and the dragged touch is selected.
       setDrag({ frame: drag.frame, ...toWorld(view, mx, my, drag.pos, e.shiftKey) });
     },
     onPointerUp: () => {
+      if (arcDrag) {
+        const sg = p.segments.find((x) => x.from === arcDrag.from);
+        if (sg && Math.abs(sg.mid[1] - arcDrag.midY) > 0.03) p.onArc(arcDrag.from, arcDrag.midY);
+        setArcDrag(null);
+        return;
+      }
       if (!drag) return;
       const t = p.touches.find((x) => x.frame === drag.frame);
       const moved = t && Math.hypot(t.position[0] - drag.pos[0], t.position[1] - drag.pos[1], t.position[2] - drag.pos[2]) > 0.05;
@@ -228,11 +310,27 @@ export default function CourtEditor3D(p: Readonly<Props>) {
         <div className="court3d-title">From the side · height</div>
         <canvas ref={sideRef} {...handlers("side")} />
       </div>
+      <div className="court3d-tools">
+        <button className="inspect-btn" onClick={p.onUndo} disabled={!p.canUndo} title="Ctrl+Z">Undo</button>
+        <button className="inspect-btn" onClick={p.onRedo} disabled={!p.canRedo} title="Ctrl+Shift+Z">Redo</button>
+        {selSegment && (
+          <button
+            className="inspect-btn"
+            onClick={() => p.onResetSegment(selSegment.from, selSegment.to)}
+            disabled={!selSegment.rebuilt}
+            title="Clear the arc and the 3D placements of this flight's two touches"
+          >
+            Reset flight to automatic
+          </button>
+        )}
+        {selSegment?.warning && <span className="court3d-warn">This flight {selSegment.warning}.</span>}
+      </div>
       <div className="court3d-help">
         {selTouch
           ? <>Drag the <b style={{ color: touchColor(selTouch.label) }}>{selTouch.label}</b> to where the ball was played.
               {ray ? " It snaps to the camera's line of sight (cyan): the ball is somewhere on it. Shift: place freely." : " The ball is hidden at this touch: place it freely."}</>
           : "Click a touch to select it, then drag it to where the ball was played. The flights either side follow."}
+        {" "}Drag a diamond in the side view to make that flight higher or flatter.
       </div>
     </div>
   );

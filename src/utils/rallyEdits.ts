@@ -14,13 +14,17 @@ import type { Side } from "./matchTimeline";
 import type { FrameData } from "../hooks/useAnalysis";
 import type { BallReconstructionOptions, BallTouch } from "./ballReconstruction";
 
-export const TOUCH_KINDS = ["toss", "serve", "reception", "set", "attack", "block", "dig"] as const;
+/**
+ * Touch types that can be set by hand. The solver finds the first seven; a
+ * free ball, a touch of the net and the ball landing are marked in the editor.
+ */
+export const TOUCH_KINDS = ["toss", "serve", "reception", "set", "attack", "block", "dig", "free ball", "net", "floor"] as const;
 export type TouchKind = (typeof TOUCH_KINDS)[number];
 
 /** Marker colour per touch type (a solver "block/dig" takes its first kind's). */
 export const TOUCH_COLORS: Record<string, string> = {
   toss: "#7fb3e6", serve: "#3a88d8", reception: "#17a085", set: "#b38d0c", attack: "#e0443f",
-  block: "#a860d2", dig: "#d67a14", touch: "#9a9a9a",
+  block: "#a860d2", dig: "#d67a14", "free ball": "#5fb0a6", net: "#e6d25a", floor: "#8a6b4f", touch: "#9a9a9a",
 };
 export const touchColor = (label: string) => TOUCH_COLORS[label] ?? TOUCH_COLORS[label.split("/")[0]] ?? TOUCH_COLORS.touch;
 
@@ -32,6 +36,11 @@ export interface RallyEdits {
   touches: Record<number, TouchKind | "none">;
   /** Frame of a touch -> where the ball was at it (m, court coords: x across, y up, z along). */
   pins: Record<number, [number, number, number]>;
+  /**
+   * Frame of the touch a flight starts at -> height (m) of the ball midway
+   * through that flight, set with the arc handle (see rallyRefit.ts).
+   */
+  arcs?: Record<number, number>;
   /** Keys of problems marked "not a problem". */
   dismissed: string[];
   /** Points set by hand: rally start frame -> the side that won it (see matchTimeline). */
@@ -195,7 +204,7 @@ export async function loadEdits(videoPath: string): Promise<RallyEdits> {
   const saved = JSON.parse(text);
   const e = saved.edits ?? saved;
   return {
-    version: 1, ball: e.ball ?? {}, touches: e.touches ?? {}, pins: e.pins ?? {}, dismissed: e.dismissed ?? [],
+    version: 1, ball: e.ball ?? {}, touches: e.touches ?? {}, pins: e.pins ?? {}, arcs: e.arcs ?? {}, dismissed: e.dismissed ?? [],
     points: e.points ?? {}, teams: e.teams ?? {},
   };
 }

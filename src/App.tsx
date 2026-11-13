@@ -28,6 +28,7 @@ import {
 } from "./utils/rallyEdits";
 import type { FrameData, BallReconstructionMethod } from "./hooks/useAnalysis";
 import type { SolverRequest, SolverResponse } from "./utils/solverWorker";
+import { historyOf, historyPush, historyRedo, historyUndo, refitEditedPath, type History } from "./utils/rallyRefit";
 import "./App.css";
 
 type ViewMode = "side-by-side" | "overlay" | "inspect";
@@ -269,7 +270,8 @@ function App() {
    * Hand corrections for this video (ball positions, touches, dismissed
    * problems), saved per video and applied on every analysis of it.
    */
-  const [edits, setEdits] = useState<RallyEdits>(EMPTY_EDITS);
+  const [editHistory, setEditHistory] = useState<History<RallyEdits>>(() => historyOf(EMPTY_EDITS));
+  const edits = editHistory.present;
   /** Edits for the current video were loaded, so changes from here on are the user's and get saved. */
   const editsReadyRef = useRef(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -387,10 +389,41 @@ function App() {
     [ballTouches, edits, ball3dMap, result?.fps],
   );
 
+  /**
+   * The path as edited: flights at a moved, added or removed touch, or with
+   * a reshaped arc, are rebuilt here at once (see utils/rallyRefit); the rest
+   * is the solver's. The background solve then catches up with the same edits.
+   */
+  const refit = useMemo(() => {
+    const moving = framesForSolver.some((f) => f.ref_from_frame);
+    const observations = new Map<number, [number, number]>();
+    for (const f of framesForSolver) {
+      const q = moving ? f.ball_ref_pos : f.ball_img_pos;
+      if (q && !f.ball_interpolated) observations.set(f.frame, [q[0] * 2 - 1, 1 - q[1] * 2]);
+    }
+    let project: ((q: [number, number, number]) => [number, number]) | undefined;
+    if (calibration && videoAspect && videoAspect > 0) {
+      const cam = new THREE.PerspectiveCamera(calibration.fov, videoAspect, 0.1, 500);
+      aimCamera(cam, calibration);
+      cam.updateMatrixWorld();
+      cam.updateProjectionMatrix();
+      const v = new THREE.Vector3();
+      project = (q) => { v.set(q[0], q[1], q[2]).project(cam); return [v.x, v.y]; };
+    }
+    return refitEditedPath({
+      touches: displayTouches, positions: ball3dMap, methods: ball3dMethods, fps: result?.fps ?? 30,
+      arcs: edits.arcs,
+      removedAt: Object.entries(edits.touches).flatMap(([f, k]) => (k === "none" ? [Number(f)] : [])),
+      observations, project,
+    });
+  }, [displayTouches, ball3dMap, ball3dMethods, result?.fps, edits.arcs, edits.touches, framesForSolver, calibration, videoAspect]);
+  const shownBall3dMap = refit.positions;
+  const shownBall3dMethods = refit.methods;
+
   /** Positions the solver fitted, without the estimates that keep the line going. */
   const fittedBall3dMap = useMemo(
-    () => new Map([...ball3dMap].filter(([f]) => ball3dMethods.get(f) !== "estimated")),
-    [ball3dMap, ball3dMethods],
+    () => new Map([...shownBall3dMap].filter(([f]) => shownBall3dMethods.get(f) !== "estimated")),
+    [shownBall3dMap, shownBall3dMethods],
   );
 
   /** Rallies, points and score, from the touches (see utils/matchTimeline). */
@@ -410,26 +443,26 @@ function App() {
     // In physics-reprojection / short-arc-debug mode, ONLY arc-fitted positions are valid.
     // Rejected or unfitted arcs must not bleed stale bbox-depth positions into the output.
     if (trajectoryMode === "physics-reprojection" || trajectoryMode === "short-arc-debug") {
-      if (ball3dMap.size === 0) {
+      if (shownBall3dMap.size === 0) {
         // Solver ran but found nothing — return frames with all 3D positions cleared.
         return frames.map((f) => ({ ...f, ball_3d_pos: undefined, ball_3d_method: undefined }));
       }
       return frames.map((f) => {
-        const pos = ball3dMap.get(f.frame);
-        const method = ball3dMethods.get(f.frame);
+        const pos = shownBall3dMap.get(f.frame);
+        const method = shownBall3dMethods.get(f.frame);
         if (pos) return { ...f, ball_3d_pos: pos, ball_3d_method: method };
         // Frame not covered by accepted arc — clear any stale position.
         return { ...f, ball_3d_pos: undefined, ball_3d_method: undefined };
       });
     }
     // Other modes: keep raw frames when solver has no results.
-    if (ball3dMap.size === 0) return frames;
+    if (shownBall3dMap.size === 0) return frames;
     return frames.map((f) => {
-      const pos = ball3dMap.get(f.frame);
-      const method = ball3dMethods.get(f.frame);
+      const pos = shownBall3dMap.get(f.frame);
+      const method = shownBall3dMethods.get(f.frame);
       return pos ? { ...f, ball_3d_pos: pos, ball_3d_method: method } : f;
     });
-  }, [frames, ball3dMap, ball3dMethods, trajectoryMode]);
+  }, [frames, shownBall3dMap, shownBall3dMethods, trajectoryMode]);
 
 
   useEffect(() => {
@@ -615,12 +648,12 @@ function App() {
   // so an empty start cannot overwrite them.
   useEffect(() => {
     editsReadyRef.current = false;
-    setEdits(EMPTY_EDITS);
+    setEditHistory(historyOf(EMPTY_EDITS));
     setSaveState("idle");
     if (!isRealVideo) return;
     let cancelled = false;
     loadEdits(videoPath)
-      .then((e) => { if (!cancelled) setEdits(e); })
+      .then((e) => { if (!cancelled) setEditHistory(historyOf(e)); })
       .catch((err) => console.warn("[edits] could not load:", err))
       .finally(() => { if (!cancelled) editsReadyRef.current = true; });
     return () => { cancelled = true; };
@@ -629,7 +662,12 @@ function App() {
   /** Change the edits; they are saved shortly after. */
   const updateEdits = useCallback((change: (e: RallyEdits) => RallyEdits) => {
     if (!editsReadyRef.current && isRealVideo) return;
-    setEdits((e) => change(e));
+    setEditHistory((h) => historyPush(h, change(h.present)));
+    if (isRealVideo) setSaveState("saving");
+  }, [isRealVideo]);
+  /** Step back or forward through the edits made in this session. */
+  const stepEdits = useCallback((dir: -1 | 1) => {
+    setEditHistory((h) => (dir < 0 ? historyUndo(h) : historyRedo(h)));
     if (isRealVideo) setSaveState("saving");
   }, [isRealVideo]);
 
@@ -1253,8 +1291,13 @@ function App() {
                   fps={result.fps}
                   videoSize={videoSize}
                   calibration={calibration}
-                  positions={ball3dMap}
+                  positions={shownBall3dMap}
                   fittedPositions={fittedBall3dMap}
+                  segments={refit.segments}
+                  onUndo={() => stepEdits(-1)}
+                  onRedo={() => stepEdits(1)}
+                  canUndo={editHistory.past.length > 0}
+                  canRedo={editHistory.future.length > 0}
                   physicsDebug={physicsDebug}
                   touchSplits={touchSplits}
                   touches={displayTouches}

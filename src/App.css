@@ -2043,6 +2043,9 @@ button, input, select {
   color: var(--text-tertiary);
 }
 
+.court3d-tools { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.court3d-tools .inspect-btn:disabled { opacity: 0.45; cursor: default; }
+.court3d-warn { font-size: 12px; color: #ff7043; }
 .court3d-help { flex-basis: 100%; font-size: 12px; color: var(--text-secondary); }
 
 /* === Record screen === */
