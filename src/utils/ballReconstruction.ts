@@ -1341,6 +1341,8 @@ export interface RallyParams {
    * scores above 28 once in 10 000 positions.
    */
   touchKinkScore: number;
+  /** A kink this clear (with twice touchMinDvMps) is a touch even with no player detected in reach. */
+  touchKinkCertain: number;
   /**
    * Max seconds without the ball for two pieces of track to belong to the
    * same rally. Real side-view broadcasts lose a fast serve for 0.5-1 s; at
@@ -1425,6 +1427,7 @@ export const DEFAULT_RALLY_PARAMS: RallyParams = {
   touchMinDvMps: 3.55,
   touchMinDvKinkMps: 2.0,
   touchKinkScore: 40,
+  touchKinkCertain: 1000,
   rallyMaxGapS: 1.0,
   knotMaxY: 4.5,
   softMaxSpeed: 30,
@@ -2038,8 +2041,12 @@ function mergeUntouchedSplits(
         // behind: 2-3 m/s). It is not waived: where the ball passes the net
         // and the players the detector drifts by a few pixels, a real break
         // in the track of 0.5-1.2 m/s (France vs Japan).
-        const kept = candidates > 0 &&
-          (paired.has(arc[0].fi) || dvMps >= (arc[0].kink != null ? P.touchMinDvKinkMps : P.touchMinDvMps));
+        // Nobody in reach is normally the end of it, but a break this sharp
+        // and this large is a touch by someone the detector missed (a
+        // receiver hidden behind a team-mate).
+        const certain = (arc[0].kink ?? 0) >= P.touchKinkCertain && dvMps >= 2 * P.touchMinDvMps;
+        const kept = certain || (candidates > 0 &&
+          (paired.has(arc[0].fi) || dvMps >= (arc[0].kink != null ? P.touchMinDvKinkMps : P.touchMinDvMps)));
         decisions.push({ frameBefore: last.fi, frameAfter: arc[0].fi, dvMps, candidates, kept, kink: arc[0].kink, t: 0.5 * (last.t + arc[0].t), fi: arc[0].fi });
         if (!kept) {
           out[out.length - 1] = [...prev, ...arc];
@@ -2158,6 +2165,8 @@ const TOSS_CARRY_MAX_S = 0.3;
 const TOSS_SEEN_SLACK_M = 0.3;
 /** Distance from the net (m) beyond which a player on the serving side at the serve contact is the server, feet in the air. */
 const SERVER_AIRBORNE_MIN_ABS_Z = 5;
+/** Longest time (s) from an attack to its block. */
+const BLOCK_MAX_AFTER_ATTACK_S = 0.4;
 /** How far over the net (m) a blocker's hands reach into the attacker's side. */
 const BLOCK_REACH_OVER_M = 0.75;
 
@@ -2173,8 +2182,15 @@ function _inZoneZ(zone: TouchRule, side: number, z: number, slack: number, extra
  * (a block is at the net, a dig never is), while the solved height of a
  * touch is the least reliable coordinate.
  */
-function zoneLabel(zone: KnotZone, [, , z]: [number, number, number]): string {
+function zoneLabel(zone: KnotZone, [, , z]: [number, number, number], sincePrevS = 0): string {
   if (!zone.alternatives) return zone.label;
+  // A block is the attack coming straight back off the hands: the ball is
+  // there within a few frames. A touch at the net longer after the last one
+  // is a dig of a tip or of a ball off the tape (usa_jap_r3: 0.6 s).
+  if (sincePrevS > BLOCK_MAX_AFTER_ATTACK_S) {
+    const late = zone.alternatives.find((a) => a.label !== "block");
+    if (late) return late.label;
+  }
   // Blockers reach over the net: a block can be solved just past it.
   const hit = zone.alternatives.find((a) => _inZoneZ(a, zone.side, z, BLOCK_REACH_OVER_M));
   return (hit ?? zone.alternatives[zone.alternatives.length - 1]).label;
@@ -3898,7 +3914,8 @@ function _solveBallTrajectories(
           const gap = prevObs ? seg.obs[0].t - prevObs[prevObs.length - 1].t : 0;
           const frame = contacts[k]?.frame ?? (gap <= TOUCH_FRAME_MAX_GAP_S ? nearestFrame(seg.tStart) : seg.obs[0].fi);
           const position = seg.posAt(seg.tStart);
-          touches.push({ frame, position, label: zones[k] ? zoneLabel(zones[k]!, position) : "touch", candidates: anchors[k] ?? [] });
+          const sincePrev = k > 0 ? seg.tStart - results[k - 1].tStart : 0;
+          touches.push({ frame, position, label: zones[k] ? zoneLabel(zones[k]!, position, sincePrev) : "touch", candidates: anchors[k] ?? [] });
         });
         console.log(
           "[rally] " + results.map((seg, k) => {
