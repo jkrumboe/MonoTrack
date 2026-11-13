@@ -238,6 +238,8 @@ export interface BallTouch {
   position: [number, number, number];
   /** "toss" | "serve" | "reception" | "set" | "attack" | "block" | "dig" | "touch". */
   label: string;
+  /** Court (x, z) of the players who could have made the touch, after the rules. */
+  candidates?: [number, number][];
 }
 
 export interface BallWorldEstimate {
@@ -1481,6 +1483,10 @@ let P: RallyParams = DEFAULT_RALLY_PARAMS;
  * telephoto broadcast camera are judged alike. Set by the physics block.
  */
 let courtMetresPerPx = 0.00709;
+/** Frame rate of the clip being solved; windows given in frames are meant at 30 fps. */
+let clipFps = 30;
+/** Every player on every frame, when the analyzer gives them: what a player is followed through. */
+let trackBoxes: Map<number, PlayerBox[]> | null = null;
 
 /** Combined projection, precomputed for speed: world (x,y,z) -> NDC (u,v). */
 function _makeProjector(cam: THREE.PerspectiveCamera) {
@@ -1738,21 +1744,51 @@ function takeOffSpot(
   cam: THREE.PerspectiveCamera,
 ): TouchCandidate | null {
   const [x1, y1, x2, y2] = box;
-  let feetY = y2;
-  for (const step of [-1, 1]) {
+  const h = y2 - y1;
+  // How much lower the same player's feet were d frames before and after.
+  const window = Math.max(1, Math.round(P.playerTrackFrames * clipFps / 30));
+  const drop: number[][] = [[], []];
+  [-1, 1].forEach((step, side) => {
     let cur: PlayerBox = [x1, y1, x2, y2];
-    for (let d = step; Math.abs(d) <= P.playerTrackFrames; d += step) {
+    let lowest = 0;
+    for (let d = 1; d <= window; d++) {
       let next: PlayerBox | null = null;
       let bestIou = 0.5;
-      for (const c of playersByFrame.get(fi + d) ?? []) {
+      for (const c of (trackBoxes ?? playersByFrame).get(fi + step * d) ?? []) {
         const iou = _boxIou(cur, c);
         if (iou > bestIou) { bestIou = iou; next = c; }
       }
       if (!next) break;
       cur = next;
-      feetY = Math.max(feetY, cur[3]);
+      // Only while the box keeps its size. A jump lifts the whole box; a box
+      // that grows as its feet come down is the player coming closer, or the
+      // track slipping onto someone nearer the camera (pol_ita_r2: an
+      // attacker 7 m out was placed at 3.6 m by a neighbour's feet).
+      const hc = cur[3] - cur[1];
+      if (Math.abs(hc / h - 1) <= TAKEOFF_SAME_SIZE) lowest = Math.max(lowest, cur[3] - y2);
+      drop[side][d] = lowest;
     }
+  });
+  // A jump goes up and comes down: the feet were lower both before and
+  // after. Lower on one side only is a player moving through (an attacker's
+  // run-up comes from deeper in the court; taken as a jump, it put the
+  // take-off spot where the player had been 0.4 s earlier, metres away).
+  // Fixtures that only list the players near the ball lose a server or
+  // attacker as the ball leaves; there a side whose track has ended cannot
+  // say, and the other is taken alone. With every player listed, a track
+  // that ends is a player lost in a crowd, and nothing beyond it is used.
+  let lift = 0;
+  for (let d = 1; d <= window; d++) {
+    const before = drop[0][d], after = drop[1][d];
+    if (before == null || after == null) {
+      if (trackBoxes || (before == null && after == null)) break;
+      lift = Math.max(lift, (before ?? after)!);
+    } else lift = Math.max(lift, Math.min(before, after));
   }
+  // Nobody jumps half their own height, and the lowest of many box edges is
+  // always a little lower: below a hop's worth it is only that jitter, which
+  // from a low camera is a metre or two on the floor.
+  const feetY = lift > TAKEOFF_MAX_LIFT * h || lift < TAKEOFF_MIN_LIFT * h ? y2 : y2 + lift;
   const g = _groundPointOf(cam, (x1 + x2) / 2, feetY);
   if (!g || Math.abs(g[0]) > RALLY_MAX_ABS_X_M || Math.abs(g[1]) > RALLY_MAX_ABS_Z_M) return null;
   // The referees stand at the net posts, beyond the sidelines (the first on
@@ -1761,6 +1797,13 @@ function takeOffSpot(
   if (Math.abs(g[1]) < OFFICIALS_NET_Z_M && Math.abs(g[0]) > COURT_HALF_W + OFFICIALS_OUT_M) return null;
   return g;
 }
+
+/** How much a tracked box may differ in height (fraction) and still show the same player at the same distance. */
+const TAKEOFF_SAME_SIZE = 0.15;
+/** Highest jump, as a share of the box height. */
+const TAKEOFF_MAX_LIFT = 0.45;
+/** Smallest lift taken as a jump, as a share of the box height (~0.15 m). */
+const TAKEOFF_MIN_LIFT = 0.08;
 
 /** Arm keypoints of one player: [x, y, conf] for shoulders, elbows, wrists (left, right). */
 type PlayerArms = number[][];
@@ -2113,6 +2156,8 @@ const MIN_TOUCH_INTERVAL_S = 0.52;
 const TOSS_CARRY_MAX_S = 0.3;
 /** A rally's first point this far (m) above the highest toss release is a ball already in the air. */
 const TOSS_SEEN_SLACK_M = 0.3;
+/** Distance from the net (m) beyond which a player on the serving side at the serve contact is the server, feet in the air. */
+const SERVER_AIRBORNE_MIN_ABS_Z = 5;
 /** How far over the net (m) a blocker's hands reach into the attacker's side. */
 const BLOCK_REACH_OVER_M = 0.75;
 
@@ -2194,7 +2239,14 @@ function applyRallyRules(
   // Does the rally start with the toss, or does the clip begin at the serve
   // contact? A toss goes up and comes down over the same server, so the
   // same player stands at the first and the second point.
-  const sameServer = servers0.some(([x0, z0]) => servers1.some(([x1, z1]) => Math.hypot(x0 - x1, z0 - z1) < 2.5));
+  // A jump server is in the air at the contact, and feet off the floor look
+  // further away than they are: from behind the court, metres inside the
+  // baseline (France vs Japan: 3 m). Nobody else on the serving side plays
+  // the ball between toss and serve, so a player in that back court counts.
+  const airborne1 = anchors.length > 2
+    ? (anchors[1] ?? []).filter(([, z]) => Math.abs(z) >= SERVER_AIRBORNE_MIN_ABS_Z && servers0.some(([, z0]) => Math.sign(z0) === Math.sign(z)))
+    : [];
+  const sameServer = servers0.some(([x0, z0]) => servers1.some(([x1, z1]) => Math.hypot(x0 - x1, z0 - z1) < 2.5)) || airborne1.length > 0;
   let startsWithToss: boolean;
   let S: number;
   let step = 0;
@@ -3635,6 +3687,8 @@ function _solveBallTrajectories(
         const fPx = vH / 2 / Math.tan((effectiveFovY * Math.PI) / 360);
         courtMetresPerPx = cam.position.distanceTo(centre) / fPx;
         flightCam = { cam, fPx, courtDist: cam.position.distanceTo(centre) };
+        clipFps = 1 / frameDt;
+        trackBoxes = allPlayersByFrame.size ? allPlayersByFrame : null;
       }
       const touchPins = options?.touchEdits?.pins ?? [];
       const { arcs: rawArcs, starts: markedTouches } = splitAtMarkedTouches(
@@ -3844,7 +3898,7 @@ function _solveBallTrajectories(
           const gap = prevObs ? seg.obs[0].t - prevObs[prevObs.length - 1].t : 0;
           const frame = contacts[k]?.frame ?? (gap <= TOUCH_FRAME_MAX_GAP_S ? nearestFrame(seg.tStart) : seg.obs[0].fi);
           const position = seg.posAt(seg.tStart);
-          touches.push({ frame, position, label: zones[k] ? zoneLabel(zones[k]!, position) : "touch" });
+          touches.push({ frame, position, label: zones[k] ? zoneLabel(zones[k]!, position) : "touch", candidates: anchors[k] ?? [] });
         });
         console.log(
           "[rally] " + results.map((seg, k) => {
