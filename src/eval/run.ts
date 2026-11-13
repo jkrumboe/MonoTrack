@@ -64,6 +64,19 @@ const line = (name: string, g: GroupSummary) => {
     (g.pathRmsMedianM != null ? `  path RMS ${n2(g.pathRmsMedianM)} (worst ${n2(g.pathRmsWorstM)}) m  median 3D ${n2(g.path3dMedianM)} m` : ""),
   );
 };
+// Reprojection only counts while as many detections are fitted as at the baseline.
+const covFile = path.join(EVAL_DIR, "baseline-coverage.json");
+if (fs.existsSync(covFile) && !only) {
+  const floors: Record<string, { baseline: number }> = JSON.parse(fs.readFileSync(covFile, "utf8"));
+  for (const [name, holdout] of [["tuning set", false], ["holdout", true]] as const) {
+    const rs = results.filter((r) => r.metrics && !r.case.synthetic && HOLDOUT.includes(r.case.name) === holdout && floors[r.case.name]);
+    if (!rs.length) continue;
+    const now = rs.reduce((sum, r) => sum + (r.metrics!.reprojCoverage ?? 0), 0) / rs.length;
+    const base = rs.reduce((sum, r) => sum + floors[r.case.name].baseline, 0) / rs.length;
+    console.log(`Reprojection coverage, ${name}: ${(100 * now).toFixed(0)}% (baseline ${(100 * base).toFixed(0)}%)` +
+      (now + 1e-9 >= base ? "" : "  -> below baseline: the reprojection error does not count"));
+  }
+}
 console.log("");
 line("Synthetic (gated)", groups.synthetic);
 line("Real, tuning set", groups.tuning);

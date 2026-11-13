@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { __test__ } from "../utils/ballReconstruction";
-import { EVAL_DIR, realCases, syntheticCases } from "./dataset";
-import { aggregateScore, evaluateCase } from "./evaluate";
+import { EVAL_DIR, HOLDOUT, realCases, syntheticCases, type EvalCase } from "./dataset";
+import { aggregateScore, evaluateCase, groupSummaries, type CaseResult } from "./evaluate";
 import { calibrate, cameraFor, projectNorm, runFixture } from "./pipeline";
 import type { CourtLabel, Fixture } from "./types";
 
@@ -125,6 +125,13 @@ describe("ball line", () => {
   });
 });
 
+/** Each case is solved once and shared by the gates below. */
+const solvedCases = new Map<string, CaseResult>();
+const resultOf = (c: EvalCase): CaseResult => {
+  if (!solvedCases.has(c.name)) solvedCases.set(c.name, evaluateCase(c));
+  return solvedCases.get(c.name)!;
+};
+
 describe("regression gate", () => {
   const baselineFile = path.join(EVAL_DIR, "baseline.json");
   const baseline: Record<string, number> = fs.existsSync(baselineFile)
@@ -137,7 +144,7 @@ describe("regression gate", () => {
       // Real clips take up to ~15 s of synchronous solving; let the test
       // worker answer its runner first, or vitest reports an RPC timeout.
       await new Promise((r) => setImmediate(r));
-      const score = evaluateCase(c).metrics!.score;
+      const score = resultOf(c).metrics!.score;
       // A few points of slack: solver seeds and float order can move a score slightly.
       expect(score).toBeGreaterThanOrEqual(baseline[c.name] - 3);
     });
@@ -157,5 +164,52 @@ describe("regression gate", () => {
       await new Promise((r) => setImmediate(r));
     }
     expect(aggregateScore(bad)).toBeLessThan(aggregateScore(good) - 5);
+  });
+});
+
+describe("acceptance", () => {
+  // The criteria of EVAL.md that are met, held there. Those not yet met
+  // (worst synthetic path, synthetic touch position, coverage back at its
+  // baseline) are listed in EVAL.md and not asserted.
+  const cases = [...syntheticCases(), ...realCases()].filter((c) => c.truth && !c.knownLimit);
+  const groups = async () => {
+    const results: CaseResult[] = [];
+    for (const c of cases) {
+      results.push(resultOf(c));
+      await new Promise((r) => setImmediate(r));
+    }
+    return { results, ...groupSummaries(results, HOLDOUT) };
+  };
+
+  it("synthetic scenarios, tripod included", async () => {
+    const { results, synthetic } = await groups();
+    expect(synthetic.pathRmsMedianM!).toBeLessThanOrEqual(1.0);
+    expect(synthetic.typeCorrect!).toBeGreaterThanOrEqual(0.9);
+    // A trajectory on every frame between the first and the last contact.
+    for (const r of results) if (r.case.synthetic) expect(r.metrics!.trajCoverage, r.case.name).toBe(1);
+  });
+
+  it("real clips, tuning set", async () => {
+    const { tuning } = await groups();
+    expect(tuning.touchFrameErrMean!).toBeLessThanOrEqual(1.0);
+    expect(tuning.touchFrameErrWorst!).toBeLessThanOrEqual(2.0);
+    expect(tuning.reprojMedianPx!).toBeLessThanOrEqual(3.0);
+    expect(tuning.reprojWorstPx!).toBeLessThanOrEqual(6.0);
+    expect(tuning.typeCorrect!).toBeGreaterThanOrEqual(0.85);
+    expect(tuning.precision!).toBeGreaterThanOrEqual(0.85);
+    expect(tuning.touchPosMedianM!).toBeLessThanOrEqual(1.2);
+  });
+
+  it("reprojection coverage stays above its floor", async () => {
+    // A low reprojection error is easy to get by fitting fewer detections.
+    // The floor is the lower of the 2026-11-12 baseline and the value when
+    // the gate was added (eval/baseline-coverage.json); it only goes up.
+    const file = path.join(EVAL_DIR, "baseline-coverage.json");
+    const floors: Record<string, { baseline: number; floor: number }> = JSON.parse(fs.readFileSync(file, "utf8"));
+    const { results } = await groups();
+    for (const r of results) {
+      const f = floors[r.case.name];
+      if (f) expect(r.metrics!.reprojCoverage!, r.case.name).toBeGreaterThanOrEqual(f.floor - 0.01);
+    }
   });
 });

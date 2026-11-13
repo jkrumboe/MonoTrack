@@ -1,13 +1,46 @@
 {
-  "pol_ita_r1": 0.7157,
-  "pol_ita_r2": 0.898,
-  "pol_ita_r3": 0.95,
-  "pol_ita_r4": 0.8372,
-  "pol_ita_r5": 0.9,
-  "pol_ita_r6": 0.6489,
-  "pol_ita_r7": 0.4157,
-  "usa_jap_r1": 1,
-  "usa_jap_r2": 0.8226,
-  "usa_jap_r3": 0.9098,
-  "usa_jap_r4": 0.6964
+  "pol_ita_r1": {
+    "baseline": 0.7157,
+    "floor": 0.6373
+  },
+  "pol_ita_r2": {
+    "baseline": 0.898,
+    "floor": 0.8912
+  },
+  "pol_ita_r3": {
+    "baseline": 0.95,
+    "floor": 0.825
+  },
+  "pol_ita_r4": {
+    "baseline": 0.8372,
+    "floor": 0.8372
+  },
+  "pol_ita_r5": {
+    "baseline": 0.9,
+    "floor": 0.9
+  },
+  "pol_ita_r6": {
+    "baseline": 0.6489,
+    "floor": 0.6489
+  },
+  "pol_ita_r7": {
+    "baseline": 0.4157,
+    "floor": 0.3034
+  },
+  "usa_jap_r1": {
+    "baseline": 1,
+    "floor": 1
+  },
+  "usa_jap_r2": {
+    "baseline": 0.8226,
+    "floor": 0.8226
+  },
+  "usa_jap_r3": {
+    "baseline": 0.9098,
+    "floor": 0.8169
+  },
+  "usa_jap_r4": {
+    "baseline": 0.6964,
+    "floor": 0.6964
+  }
 }

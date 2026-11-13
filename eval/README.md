@@ -8,8 +8,13 @@ Scores the 3D rally solver against ground truth, so changes are measured instead
 | `npm run eval -- --only near-serve,France_vs_Japan` | Just those cases |
 | `npm run eval -- --params eval/tuned-params.json` | With parameter overrides |
 | `npm run eval -- --save-baseline` | Stores current scores as the regression baseline (`eval/baseline.json`) |
-| `npm test` | Unit tests, a reviewed check on France vs Japan, and the regression gate (no case may drop >3 points below baseline) |
+| `npm run eval:diag -- clip[,clip]` | Where one clip goes wrong, as text: each true touch against the found one, path error per flight, the solver's verdict on every segment |
+| `npm run eval:splits` | Every candidate touch split on the synthetic and tuning clips with its evidence (kink score, velocity jump, players in reach) and whether a true touch is there |
+| `npm test` | Unit tests, a reviewed check on France vs Japan, the regression gate (no case may drop >3 points below baseline), the acceptance criteria that are met (see `EVAL.md`), a per-clip floor on reprojection coverage, and the editor re-fit tests |
 | `npm run tune -- --iters 40 --sensitivity` | Searches solver parameters; writes `eval/tuned-params.json` and `eval/tune-report.json` |
+
+## Groups
+The report ends with one line each for the gated synthetic scenarios (tripod ones included), the 8 real tuning clips and the 3 holdout clips (`HOLDOUT` in `src/eval/dataset.ts`: never used to choose parameters or rules). `EVAL.md` at the repo root has the baseline, the result and what is still weak. Reprojection error only counts while reprojection coverage (detections the solver fitted) is at its baseline; the run says when it is not.
 
 ## Adding a real clip
 Easiest: `python python/clip_picker.py` opens a page at http://127.0.0.1:8765. Search YouTube or pick a suggested match, mark the rally (I = start, O = end, P = preview) and press Download clip. Only that section is downloaded (1080p, video only, to `eval/videos/`), the analyzer writes the fixture, and the Label button opens the labeller. Downloads are recorded in `eval/clip_sources.json`, so `python python/fetch_clip.py --list eval/clip_sources.json` rebuilds the set elsewhere.
