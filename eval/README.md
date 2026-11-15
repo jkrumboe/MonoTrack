@@ -20,7 +20,7 @@ The report ends with one line each for the gated synthetic scenarios (tripod one
 Easiest: `python python/clip_picker.py` opens a page at http://127.0.0.1:8765. Search YouTube or pick a suggested match, mark the rally (I = start, O = end, P = preview) and press Download clip. Only that section is downloaded (1080p, video only, to `eval/videos/`), the analyzer writes the fixture, and the Label button opens the labeller. Downloads are recorded in `eval/clip_sources.json`, so `python python/fetch_clip.py --list eval/clip_sources.json` rebuilds the set elsewhere.
 
 By hand:
-1. `python python/fetch_clip.py URL 1:02:10-1:02:45 --name usa_bra_r1 --fixture`, or for a local file `python python/export_fixture.py clip.mp4` → `eval/fixtures/clip.json` (runs the analyzer once, ~40 s on GPU).
+1. `python python/fetch_clip.py URL 1:02:10-1:02:45 --name usa_bra_r1 --fixture`, or for a local file `python python/export_fixture.py clip.mp4` → `eval/fixtures/clip.json` (runs the analyzer once, ~40 s on GPU). With `VB_ANALYSIS_SERVER=http://host:8765` it runs on that analysis server instead, e.g. the Docker container (`docker compose up -d`, see the main README).
 2. `python python/label_touches.py clip.mp4` → `eval/labels/clip.json`. Mark each touch at its contact frame and click the toucher's feet (take-off spot for jumps). About 1–2 minutes per rally.
 3. Note the clip's source in `clips.md`. Videos are not committed; fixtures and labels are.
 4. `npm run eval`, then `npm run eval -- --save-baseline` once the scores are reviewed.

@@ -1,0 +1,39 @@
+# Analysis server on the GPU.
+#
+#   docker compose up -d --build     # build and start; http://<host>:8765
+#   docker compose logs -f           # analyzer output
+#   docker compose down              # stop (matches and weights are kept in volumes)
+#
+# With VB_TOKEN set in the environment (or a .env file next to this one),
+# every /api call needs it.
+#
+# Developing the analyzer: `docker compose -f compose.yaml -f compose.dev.yaml up -d`
+# runs ./python from this checkout instead of the copy in the image.
+services:
+  analysis:
+    build: .
+    image: tennis-3d-analysis
+    ports:
+      - "${VB_PORT:-8765}:8765"
+    environment:
+      VB_TOKEN: ${VB_TOKEN:-}
+      BALL_DETECTOR: ${BALL_DETECTOR:-tracknetv2}
+    volumes:
+      - data:/data                      # matches (VB_DATA) and saved courts
+      - weights:/app/python/models      # ball-detector weights; filled from the image, keeps later downloads
+      - cache:/cache                    # Hugging Face / Ultralytics caches
+    # PyTorch DataLoader workers and OpenCV share memory; Docker's default 64 MB is too small.
+    shm_size: 2gb
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  data:
+  weights:
+  cache:

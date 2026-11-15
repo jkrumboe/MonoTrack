@@ -1,0 +1,25 @@
+# Only what the image needs: python/, the web app sources, package files.
+**/__pycache__
+**/*.pyc
+.git
+.venv
+node_modules
+dist
+dist-ssr
+src-tauri
+notebooks
+runs
+eval
+note
+*.mp4
+*.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+!src/**/*.json
+!public/**/*.json
+*.pt
+*.pth
+*.pth.tar
+*.onnx
+python/models

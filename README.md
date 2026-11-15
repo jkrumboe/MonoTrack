@@ -64,6 +64,36 @@ which proxies `/api` to the server). Settings:
 - ffmpeg on PATH: phone recordings (variable frame rate, often WebM) are
   re-encoded to constant-rate MP4.
 
+**Analysis server in Docker (GPU):** on a machine with an NVIDIA GPU, the
+driver and the NVIDIA Container Toolkit (Docker Desktop on Windows: WSL 2
+backend):
+
+```sh
+docker compose up -d --build        # http://<host>:8765, app and API
+docker compose logs -f              # analyzer output
+```
+
+Matches, saved courts and downloaded weights live in Docker volumes and
+survive `docker compose down`. Set `VB_TOKEN` (environment or `.env`) to
+require a token. To run the analyzer code from your checkout instead of the
+copy in the image (edit, then `restart`, no rebuild):
+
+```sh
+docker compose -f compose.yaml -f compose.dev.yaml up -d
+```
+
+Using it from a development machine, set `VB_ANALYSIS_SERVER`:
+
+```sh
+VB_ANALYSIS_SERVER=http://gpu-box:8765 npm run web             # Vite proxies /api there
+VB_ANALYSIS_SERVER=http://gpu-box:8765 python python/export_fixture.py clip.mp4
+```
+
+`export_fixture.py` (and `fetch_clip.py --fixture` and `clip_picker.py`,
+which run it) then uploads the clip, analyses it on the server's GPU and
+writes the eval fixture locally; this machine needs no torch or CUDA.
+`npm test` and `npm run eval` read those fixtures and need no GPU.
+
 **Phone:** browsers only allow the camera over **https** (or on localhost).
 Start the server with a certificate, open its address on the phone, then use
 *Add to Home Screen*:

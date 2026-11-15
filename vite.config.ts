@@ -29,9 +29,11 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
     // The web app in development: API calls go to the analysis server
-    // (npm run server), so the page and the API share an origin as in production.
+    // (npm run server, or the Docker container on another machine:
+    // VB_ANALYSIS_SERVER=http://gpu-box:8765 npm run web), so the page and the
+    // API share an origin as in production.
     proxy: {
-      "/api": "http://127.0.0.1:8765",
+      "/api": { target: process.env.VB_ANALYSIS_SERVER || "http://127.0.0.1:8765", changeOrigin: true },
     },
   },
 }));

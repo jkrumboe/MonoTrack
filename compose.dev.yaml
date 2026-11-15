@@ -1,0 +1,8 @@
+# Runs the analyzer code from this checkout: edit python/, then
+#   docker compose -f compose.yaml -f compose.dev.yaml restart
+# (no rebuild). Rebuild only when python/requirements.txt changes.
+services:
+  analysis:
+    volumes:
+      - ./python:/app/python
+      - weights:/app/python/models      # mounted over the checkout's models folder
