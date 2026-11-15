@@ -24,23 +24,41 @@ interface JobMeta extends Omit<MatchSummary, "video"> {
   id: string;
 }
 
+/**
+ * The server address as typed in the settings, made usable: "192.168.2.101"
+ * without a scheme would otherwise be a path on the current page. Bare addresses
+ * get http:// and, without a port, :8765. Empty means the server that serves this page.
+ */
+export function normalizeServerUrl(raw: string): string {
+  let s = raw.trim().replace(/\/+$/, "").replace(/\/api$/, "");
+  if (s && !/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
+    // Typed bare ("192.168.2.101"): the server's own default port, unless one is given.
+    const host = s.split("/")[0];
+    s = `http://${s}`;
+    if (!/:\d+$/.test(host)) s = s.replace(host, `${host}:8765`);
+  }
+  return s;
+}
+
 export class ServerBackend implements Backend {
   readonly kind = "server" as const;
   private readonly base: string;
 
   constructor(baseUrl: string, private readonly token: string) {
-    this.base = baseUrl.replace(/\/+$/, "");
+    this.base = normalizeServerUrl(baseUrl);
   }
 
-  private url(path: string, query: Record<string, string | number> = {}) {
+  /** `withToken`: only for URLs the browser loads itself (<video src>), which cannot send a header. */
+  private url(path: string, query: Record<string, string | number> = {}, withToken = false) {
     const q = new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)]));
-    if (this.token) q.set("token", this.token);
+    if (withToken && this.token) q.set("token", this.token);
     const qs = q.toString();
     return `${this.base}/api${path}${qs ? `?${qs}` : ""}`;
   }
 
   private async request<T>(method: string, path: string, opts: { query?: Record<string, string | number>; body?: BodyInit; json?: unknown } = {}): Promise<T> {
-    const headers: Record<string, string> = {};
+    // A header, not ?token=: query strings end up in server and proxy logs.
+    const headers: Record<string, string> = this.token ? { Authorization: `Bearer ${this.token}` } : {};
     let body = opts.body;
     if (opts.json !== undefined) {
       headers["Content-Type"] = "application/json";
@@ -161,7 +179,7 @@ export class ServerBackend implements Backend {
   }
 
   async videoSource(video: string) {
-    return { url: this.url(`/jobs/${jobId(video)}/video`) };
+    return { url: this.url(`/jobs/${jobId(video)}/video`, {}, true) };
   }
 
   detectCourt(video: string, frameTime: number) {

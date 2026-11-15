@@ -389,7 +389,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         if "/events" not in self.path:  # polled every second; too chatty
-            log(self.address_string(), fmt % args)
+            # <video src> carries the token in the query; keep it out of the log.
+            log(self.address_string(), re.sub(r"(token=)[^&\s\"]+", r"\1***", fmt % args))
 
     # helpers
     def _cors(self):
@@ -461,6 +462,10 @@ class Handler(BaseHTTPRequestHandler):
         parts = [unquote(p) for p in url.path.split("/") if p]
         try:
             if not parts or parts[0] != "api":
+                # e.g. /192.168.2.101/api/jobs from a server address set without http://:
+                # an error, not the app's index.html with 200.
+                if "api" in parts:
+                    return self._error(404, "not found: the API is at /api/ (check the server address)")
                 if method in ("GET", "HEAD"):
                     return self._static(url.path)
                 return self._error(404, "not found")
