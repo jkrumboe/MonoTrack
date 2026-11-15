@@ -13,6 +13,10 @@ services:
   analysis:
     build: .
     image: tennis-3d-analysis
+    # Build on every `up`, not only when the image is missing: Portainer (and a
+    # plain `docker compose up -d`) would otherwise keep running old code after
+    # a pull. Unchanged layers come from the build cache, so this is quick.
+    pull_policy: build
     ports:
       - "${VB_PORT:-8765}:8765"
     environment:

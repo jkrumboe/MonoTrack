@@ -82,6 +82,12 @@ copy in the image (edit, then `restart`, no rebuild):
 docker compose -f compose.yaml -f compose.dev.yaml up -d
 ```
 
+With Portainer (a standalone Docker environment, not Swarm; the host needs
+the NVIDIA Container Toolkit): *Stacks → Add stack → Repository*, this
+repository's URL, the branch as reference (`refs/heads/<branch>`), compose
+path `compose.yaml`, and `VB_TOKEN` under *Environment variables*. Each
+*Pull and redeploy* (or GitOps update) rebuilds from the pulled code.
+
 Using it from a development machine, set `VB_ANALYSIS_SERVER`:
 
 ```sh
