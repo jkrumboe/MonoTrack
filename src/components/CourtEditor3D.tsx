@@ -19,6 +19,8 @@ import type { FrameData } from "../hooks/useAnalysis";
 import type { CalibrationResult } from "../utils/cameraSolver";
 import { ballRay, touchColor, type EditedTouch } from "../utils/rallyEdits";
 import { ARC_MAX_G, ARC_MIN_G, arcAt, gravityForMidHeight, type RefitSegment } from "../utils/rallyRefit";
+import type { SolverTrace } from "../utils/ballReconstruction";
+import { SPAN_COLORS, spanAt, type PathSpan } from "../utils/pathExplain";
 
 type V3 = [number, number, number];
 
@@ -52,6 +54,13 @@ interface Props {
   onRedo: () => void;
   canUndo: boolean;
   canRedo: boolean;
+  /**
+   * Developer view (see PathExplain): the path coloured by how each stretch
+   * was made, the arcs the solver fitted where it refused them, every knot,
+   * and the candidate players at the knot nearest the current frame.
+   */
+  spans?: PathSpan[];
+  trace?: SolverTrace;
   /** Draw attention to the editor (a problem's fix points here). */
   flash?: boolean;
 }
@@ -150,8 +159,45 @@ export default function CourtEditor3D(p: Readonly<Props>) {
         if (run.length) out.push(run);
         return out;
       };
-      for (const r of runsOf(0, p.frames.length - 1)) line(r, "rgba(242,194,48,.28)", 1.5);
-      for (const r of runsOf(p.cur - 30, p.cur)) line(r, "#f2c230", 2);
+      if (p.spans && p.trace) {
+        // The path by how it was made. Each frame takes its stretch's colour.
+        let run: V3[] = [], color = "";
+        const flush = () => { if (run.length > 1) line(run, color, 2); run = []; };
+        for (let f = 0; f < p.frames.length; f++) {
+          const q = p.positions.get(f);
+          const c = q ? SPAN_COLORS[spanAt(p.spans, f)?.status ?? "bridge"] : "";
+          if (!q || c !== color) { const last = run[run.length - 1]; flush(); if (q && last && c) run.push(last); color = c; }
+          if (q) run.push(q);
+        }
+        flush();
+        // What the solver fitted where it refused the flight: the gap between
+        // this and the drawn line is what the detections pulled it by.
+        for (const rally of p.trace.rallies) {
+          for (const fl of rally.flights) {
+            if (!fl.accepted) line(fl.arc.map(([, x, y, z]): V3 => [x, y, z]), "rgba(255,82,82,.85)", 1, [2, 3]);
+          }
+          // Every knot; the ones not reported as touches are hollow.
+          for (const k of rally.knots) {
+            if (k.reported) continue;
+            const [x, y] = px(k.position);
+            ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.strokeStyle = "rgba(255,255,255,.7)"; ctx.lineWidth = 1.2; ctx.stroke();
+          }
+        }
+        // Candidate players at the knot nearest the current frame.
+        const knots = p.trace.rallies.flatMap((r) => r.knots);
+        const near = knots.reduce<typeof knots[number] | null>((b, k) => (!b || Math.abs(k.frame - p.cur) < Math.abs(b.frame - p.cur) ? k : b), null);
+        if (near && Math.abs(near.frame - p.cur) <= 15) {
+          for (const [cx, cz] of near.candidates) {
+            const [x, y] = px([cx, 0, cz]);
+            ctx.strokeStyle = "#ff80ab"; ctx.lineWidth = 1.5; ctx.strokeRect(x - 4, y - 4, 8, 8);
+            line([[cx, 0, cz], near.position], "rgba(255,128,171,.45)", 1, [2, 3]);
+          }
+        }
+      } else {
+        for (const r of runsOf(0, p.frames.length - 1)) line(r, "rgba(242,194,48,.28)", 1.5);
+        for (const r of runsOf(p.cur - 30, p.cur)) line(r, "#f2c230", 2);
+      }
       // Flights rebuilt from an edit: dashed over the solid line, as estimates.
       for (const sg of p.segments) {
         if (!sg.rebuilt) continue;
@@ -207,7 +253,7 @@ export default function CourtEditor3D(p: Readonly<Props>) {
         ctx.fillText(`arc ${arcDrag.midY.toFixed(1)} m high midway`, 6, 13);
       }
     }
-  }, [w, s, topH, sideH, p.positions, p.touches, p.frames.length, p.cur, p.selected, p.calibration, ray, drag, arcDrag, p.segments, p.fps]);
+  }, [w, s, topH, sideH, p.positions, p.touches, p.frames.length, p.cur, p.selected, p.calibration, ray, drag, arcDrag, p.segments, p.fps, p.spans, p.trace]);
 
   /** Mouse position -> court point in a view, keeping the coordinate the view does not show. */
   const toWorld = (view: View, mx: number, my: number, keep: V3, free: boolean): { pos: V3; snapped: boolean } => {
@@ -325,6 +371,16 @@ export default function CourtEditor3D(p: Readonly<Props>) {
         )}
         {selSegment?.warning && <span className="court3d-warn">This flight {selSegment.warning}.</span>}
       </div>
+      {p.spans && (
+        <div className="court3d-help">
+          <b style={{ color: SPAN_COLORS.fitted }}>green</b> fitted to the detections ·{" "}
+          <b style={{ color: SPAN_COLORS.refused }}>orange</b> refused flight, drawn along the detections ·{" "}
+          <b style={{ color: "#ff5252" }}>red dots</b> the arc the solver fitted there ·{" "}
+          <b style={{ color: SPAN_COLORS.bridge }}>grey</b> hole bridged or followed on ·{" "}
+          <b style={{ color: SPAN_COLORS.rebuilt }}>cyan</b> rebuilt from an edit · hollow rings: knots that are not touches ·{" "}
+          <b style={{ color: "#ff80ab" }}>pink squares</b> candidate players at the nearest knot
+        </div>
+      )}
       <div className="court3d-help">
         {selTouch
           ? <>Drag the <b style={{ color: touchColor(selTouch.label) }}>{selTouch.label}</b> to where the ball was played.

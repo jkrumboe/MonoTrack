@@ -230,6 +230,64 @@ export interface BallTrajectoryResult {
   touches?: BallTouch[];
   /** Every candidate touch split and the decision on it (diagnostics). */
   touchSplits?: TouchSplitDecision[];
+  /** How the path was put together, flight by flight (see SolverTrace). */
+  trace?: SolverTrace;
+}
+
+/** A point where the solver joined two flights, and whether it was reported as a touch. */
+export interface SolverTraceKnot {
+  frame: number;
+  position: [number, number, number];
+  /** What the rally rules took it for ("serve", "block/dig", ...), or "touch" when they had no rule for it. */
+  label: string;
+  /** Court (x, z) of the players it could be pulled to. */
+  candidates: [number, number][];
+  reported: boolean;
+  /** Why it is, or is not, a touch. */
+  why: string;
+}
+
+/** One flight between two knots as the solver fitted it. */
+export interface SolverTraceFlight {
+  fromFrame: number;
+  toFrame: number;
+  /** Detections in it, and how many the fit kept. */
+  detections: number;
+  inliers: number;
+  accepted: boolean;
+  /** The solver's reason for refusing it, or null. */
+  rejectReason: string | null;
+  /** Median distance (px) between the fitted arc and its detections. */
+  medianErrPx: number | null;
+  /** Launch speed (m/s) and downward acceleration (multiples of g) of the fitted arc. */
+  speedMps: number;
+  gOverG: number;
+  /** The fitted arc, frame by frame: [frame, x, y, z]. For a refused flight this is not what is drawn. */
+  arc: [number, number, number, number][];
+}
+
+/** A stretch of frames the solver could not fit and filled so the line runs on. */
+export interface SolverTraceFill {
+  fromFrame: number;
+  toFrame: number;
+  /**
+   * "refused": a refused flight, its arc moved onto the detections' lines of
+   * sight. "bridge": a hole between two solved stretches, joined by an arc.
+   * "follow": the last flight carried on under gravity after the ball was lost.
+   */
+  kind: "refused" | "bridge" | "follow";
+  /** Frames in it that had a detection to move the arc onto. */
+  detections: number;
+}
+
+/** What the solver did, for the developer view: every rally's knots and flights, and the fills. */
+export interface SolverTrace {
+  rallies: { knots: SolverTraceKnot[]; flights: SolverTraceFlight[] }[];
+  fills: SolverTraceFill[];
+  /** Pieces of track too short to solve: [first frame, last frame, detections]. */
+  skipped: [number, number, number][];
+  /** Limits the verdicts were judged against. */
+  limits: { segMaxMedianErrPx: number; segMinInlierFrac: number; rallyOutlierPx: number; touchMinDvMps: number; touchMinDvKinkMps: number; touchKinkScore: number };
 }
 
 /** One touch of the ball in a rally, as placed by the rally solver. */
@@ -1614,6 +1672,9 @@ interface RallySegmentResult {
   rejectReason: string | null;
   errPx: number[];
   outlier: boolean[];
+  /** Downward acceleration of the arc (m/s²) and the median error of its kept detections (px). */
+  gMps2: number;
+  medErrPx: number;
 }
 
 /** Ball this close to the top of the picture (NDC v) is leaving or entering it there. */
@@ -2760,6 +2821,7 @@ function solveRally(
       obs: seg, tStart: tau[k], tEnd: tau[k + 1],
       posAt: (t: number) => segPos(sol, k, Math.min(tau[k + 1], Math.max(tau[k], t))),
       speedMps, accepted: rejectReason === null, rejectReason, errPx, outlier,
+      gMps2: sol[GK + k], medErrPx: medErr,
     };
   });
 }
@@ -2799,7 +2861,12 @@ function fillLineGaps(
   touches: BallTouch[],
   positions: Map<number, V3>,
   methods: Map<number, BallReconstructionMethod>,
+  /** Receives each stretch filled, for the developer view. */
+  log?: SolverTraceFill[],
 ): void {
+  const note = (kind: SolverTraceFill["kind"], run: SolverFrame[]) => {
+    if (run.length) log?.push({ kind, fromFrame: run[0].frame, toFrame: run[run.length - 1].frame, detections: run.filter((fr) => fr.ball_img_pos && !fr.ball_interpolated).length });
+  };
   const set = (fr: SolverFrame, p: V3) => {
     positions.set(fr.frame, [
       Math.max(-RALLY_MAX_ABS_X_M - 1, Math.min(RALLY_MAX_ABS_X_M + 1, p[0])),
@@ -2854,6 +2921,7 @@ function fillLineGaps(
       const run = frames.filter((fr) =>
         fr.timestamp >= seg.tStart - 1e-6 && fr.timestamp <= seg.tEnd + 1e-6 && !positions.has(fr.frame));
       follow(run, seg.posAt, k > 0, k < rally.length - 1);
+      note("refused", run);
     });
   }
 
@@ -2874,6 +2942,7 @@ function fillLineGaps(
       const pb = solved(b)!;
       const t0 = frames[a].timestamp;
       const g = Math.min(GRAVITY, (8 * Math.max(0, FILL_BRIDGE_MAX_Y_M - Math.max(pa[1], pb[1]))) / (T * T));
+      note("bridge", frames.slice(a + 1, b));
       follow(frames.slice(a + 1, b), (t) => {
         const s = t - t0, w = s / T;
         return [pa[0] + (pb[0] - pa[0]) * w, pa[1] + (pb[1] - pa[1]) * w + 0.5 * g * s * (T - s), pa[2] + (pb[2] - pa[2]) * w];
@@ -2881,6 +2950,7 @@ function fillLineGaps(
       continue;
     }
     // Follow the last flight on under gravity until it reaches the floor.
+    const followed: SolverFrame[] = [];
     const back = Math.max(0, a - FILL_FOLLOW_VEL_FRAMES);
     const p0 = solved(back);
     const span = frames[a].timestamp - frames[back].timestamp;
@@ -2895,7 +2965,9 @@ function fillLineGaps(
       const x = pa[0] + v[0] * s, z = pa[2] + v[2] * s;
       if (y < HALF_BALL || Math.abs(x) > RALLY_MAX_ABS_X_M + 1 || Math.abs(z) > RALLY_MAX_ABS_Z_M + 1) break;
       set(frames[i], [x, y, z]);
+      followed.push(frames[i]);
     }
+    note("follow", followed);
     a = b - 1;
   }
 }
@@ -3641,6 +3713,13 @@ function _solveBallTrajectories(
     const physicsDebug: PhysicsReprojectionDebug[] = [];
     const touches: BallTouch[] = [];
     const touchSplits: TouchSplitDecision[] = [];
+    const trace: SolverTrace = {
+      rallies: [], fills: [], skipped: [],
+      limits: {
+        segMaxMedianErrPx: P.segMaxMedianErrPx, segMinInlierFrac: P.segMinInlierFrac, rallyOutlierPx: P.rallyOutlierPx,
+        touchMinDvMps: P.touchMinDvMps, touchMinDvKinkMps: P.touchMinDvKinkMps, touchKinkScore: P.touchKinkScore,
+      },
+    };
 
     if (trajectoryMode === "physics-reprojection") {
       // Detections reaching here have already passed the analyzer's motion
@@ -3772,6 +3851,8 @@ function _solveBallTrajectories(
         const knotT = rally.map((seg, k) => k === 0 ? seg[0].t
           : contacts[k]?.t ?? 0.5 * (rally[k - 1][rally[k - 1].length - 1].t + seg[0].t));
         const rules: { state?: RulesState } = {};
+        // The rules add the knots they drop to `free`; these are the ones above the picture.
+        const above = new Set(free);
         const zones = hasPlayers ? applyRallyRules(anchors, free, knotT, resume, rules) : [];
         // Hand-placed touches: knot k sits between the last sample before it
         // and the first after (the first sample itself for the rally start).
@@ -3782,7 +3863,7 @@ function _solveBallTrajectories(
         });
         pins.forEach((pin, k) => { if (pin && anchors.length > k) anchors[k] = [[pin[0], pin[2]]]; });
         return {
-          anchors, zones, free, contacts, rules: rules.state ?? null,
+          anchors, zones, free, above, contacts, rules: rules.state ?? null,
           results: solveRally(rally, cam, vW, vH, anchors, zones, imageAt, free, contacts, pins),
         };
       };
@@ -3838,6 +3919,8 @@ function _solveBallTrajectories(
       for (const rally of rallies) {
         const nObs = rally.reduce((s, a) => s + a.length, 0);
         if (nObs < MIN_ARC_FRAMES) {
+          const flat = rally.flat();
+          if (flat.length) trace.skipped.push([flat[0].fi, flat[flat.length - 1].fi, nObs]);
           for (const arc of rally) {
             for (const o of arc) {
               const origIdx = detectedList.findIndex((df) => df.frame === o.fi);
@@ -3858,7 +3941,7 @@ function _solveBallTrajectories(
           continue;
         }
 
-        const { anchors, zones, free, contacts, rules, results } = solveRuled(rally, carry);
+        const { anchors, zones, free, above, contacts, rules, results } = solveRuled(rally, carry);
         carry = rules;
         solvedRallies.push(results);
         // Which knots are touches. Measured on 11 labelled broadcast clips,
@@ -3891,8 +3974,22 @@ function _solveBallTrajectories(
           for (let i = 1; i < 10; i++) minY = Math.min(minY, seg.posAt(seg.tStart + ((seg.tEnd - seg.tStart) * i) / 10)[1]);
           if (minY > -0.5 && minY <= FLOOR_ARC_Y_M) deadAfter = k + 1;
         });
+        const knots: SolverTraceKnot[] = [];
         results.forEach((seg, k) => {
-          if (free.has(k)) return;
+          const knotPos = seg.posAt(seg.tStart);
+          const knot: SolverTraceKnot = {
+            frame: nearestFrame(seg.tStart), position: knotPos, label: zones[k]?.label ?? "touch",
+            candidates: anchors[k] ?? [], reported: false, why: "",
+          };
+          knots.push(knot);
+          if (free.has(k)) {
+            knot.why = above.has(k)
+              ? "the ball was above the picture here: two halves of one flight, not a touch"
+              : k === 0
+                ? "the ball in the server's hand before the toss leaves it"
+                : `a break in the track too soon after the previous touch to be another one (under ${MIN_TOUCH_INTERVAL_S} s)`;
+            return;
+          }
           // A touch the rules placed at a player stands even when the flights
           // on both sides of it fit badly (a reception between a blurred serve
           // and a pass that left the picture).
@@ -3901,13 +3998,19 @@ function _solveBallTrajectories(
           // it (usa_jap_r4: the tracker hopped to a player and then the floor
           // for three frames after a serve, and that became a reception).
           const ruled = !!zones[k] && (anchors[k]?.length ?? 0) > 0 && seg.obs.length >= MIN_ARC_FRAMES;
-          if (!seg.accepted && !(k > 0 && results[k - 1].accepted) && !ruled) return;
-          if (k === 0 && !zones[0]) return;
-          if (k >= deadAfter) return;
+          if (!seg.accepted && !(k > 0 && results[k - 1].accepted) && !ruled) {
+            knot.why = "the flights on both sides were refused, and the rules did not place it at a player";
+            return;
+          }
+          if (k === 0 && !zones[0]) { knot.why = "where the ball is first seen; not recognised as a toss or serve"; return; }
+          if (k >= deadAfter) { knot.why = "after the ball reached the floor: the rally is over"; return; }
           // A toss is the ball leaving the server's hand. A ball first seen
           // well above any reach is already in flight: the clip (or the
           // detector) picked it up after the toss, which nobody can date.
-          if (zones[k]?.label === "toss" && seg.posAt(seg.tStart)[1] > zones[k]!.maxY + TOSS_SEEN_SLACK_M) return;
+          if (zones[k]?.label === "toss" && knotPos[1] > zones[k]!.maxY + TOSS_SEEN_SLACK_M) {
+            knot.why = `first seen ${knotPos[1].toFixed(1)} m up, already in the air: the toss happened before this`;
+            return;
+          }
           // Short gap (an arm hides the ball at contact): the knot is the
           // contact. Long gap (a high toss leaves the frame and only comes
           // back at the serve): the ball reappears right after the contact,
@@ -3915,9 +4018,34 @@ function _solveBallTrajectories(
           const prevObs = k > 0 ? results[k - 1].obs : null;
           const gap = prevObs ? seg.obs[0].t - prevObs[prevObs.length - 1].t : 0;
           const frame = contacts[k]?.frame ?? (gap <= TOUCH_FRAME_MAX_GAP_S ? nearestFrame(seg.tStart) : seg.obs[0].fi);
-          const position = seg.posAt(seg.tStart);
+          const position = knotPos;
           const sincePrev = k > 0 ? seg.tStart - results[k - 1].tStart : 0;
-          touches.push({ frame, position, label: zones[k] ? zoneLabel(zones[k]!, position, sincePrev) : "touch", candidates: anchors[k] ?? [] });
+          const label = zones[k] ? zoneLabel(zones[k]!, position, sincePrev) : "touch";
+          touches.push({ frame, position, label, candidates: anchors[k] ?? [] });
+          knot.frame = frame; knot.reported = true; knot.label = label;
+          knot.why = (zones[k] ? `touch ${k + 1} of the rally by the rules` : "a break in the path with a player in reach; the rules had no type for it") +
+            (contacts[k] ? ", timed at a player's wrists while the ball was hidden" : "") +
+            ((anchors[k]?.length ?? 0) > 0 ? `, pulled towards ${anchors[k].length > 1 ? `the nearest of ${anchors[k].length} candidate players` : "one candidate player"}` : ", no player to anchor it: placed by its zone and the flights");
+        });
+        // The rally's last point is where the ball was last seen.
+        {
+          const lastSeg = results[results.length - 1];
+          knots.push({
+            frame: nearestFrame(lastSeg.tEnd), position: lastSeg.posAt(lastSeg.tEnd), label: "end", candidates: [],
+            reported: false, why: "where this piece of track ends (ball lost or clip over), not a touch",
+          });
+        }
+        trace.rallies.push({
+          knots,
+          flights: results.map((seg) => ({
+            fromFrame: nearestFrame(seg.tStart), toFrame: nearestFrame(seg.tEnd),
+            detections: seg.obs.length, inliers: seg.outlier.filter((o) => !o).length,
+            accepted: seg.accepted, rejectReason: seg.rejectReason,
+            medianErrPx: Number.isFinite(seg.medErrPx) ? seg.medErrPx : null,
+            speedMps: seg.speedMps, gOverG: seg.gMps2 / GRAVITY,
+            arc: frames.filter((fr) => fr.timestamp >= seg.tStart - 1e-6 && fr.timestamp <= seg.tEnd + 1e-6)
+              .map((fr) => [fr.frame, ...seg.posAt(fr.timestamp)] as [number, number, number, number]),
+          })),
         });
         console.log(
           "[rally] " + results.map((seg, k) => {
@@ -4013,7 +4141,7 @@ function _solveBallTrajectories(
         }
       }
       const fitted = positions.size;
-      fillLineGaps(solvedRallies, frames, cam, touches, positions, methods);
+      fillLineGaps(solvedRallies, frames, cam, touches, positions, methods, trace.fills);
       console.log(`[physicsReproj] line fill: ${positions.size - fitted} estimated frames on ${fitted} fitted`);
 
       // Emit physicsDebug records for detected frames NOT covered by any arc
@@ -4218,6 +4346,7 @@ function _solveBallTrajectories(
       physicsDebug: physicsDebug.length > 0 ? physicsDebug : undefined,
       touches: touches.length > 0 ? touches : undefined,
       touchSplits: touchSplits.length > 0 ? touchSplits : undefined,
+      trace: trajectoryMode === "physics-reprojection" ? trace : undefined,
       stats: { detectedFrames, solved3dFrames, rejectedFrames, methodCounts, avgConf },
     };
   }

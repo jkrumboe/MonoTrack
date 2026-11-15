@@ -22,7 +22,7 @@ import {
   backendKind, canRecord, getBackend, loadSettings, type Backend,
 } from "./platform/backend";
 import { buildMatchTimeline, nextRallyAfter, rallyAt, type Side } from "./utils/matchTimeline";
-import { type BallFrameDebug, type BallTouch, type PhysicsReprojectionDebug, type TouchSplitDecision, type TrajectoryMode } from "./utils/ballReconstruction";
+import { type BallFrameDebug, type BallTouch, type PhysicsReprojectionDebug, type SolverTrace, type TouchSplitDecision, type TrajectoryMode } from "./utils/ballReconstruction";
 import {
   applyBallEdits, applyTouchEdits, EMPTY_EDITS, loadEdits, saveEdits, touchEditsForSolver, type RallyEdits,
 } from "./utils/rallyEdits";
@@ -251,6 +251,8 @@ function App() {
   const [ballTouches, setBallTouches] = useState<BallTouch[]>([]);
   /** The solver's touch split decisions (for the problems list). */
   const [touchSplits, setTouchSplits] = useState<TouchSplitDecision[] | undefined>(undefined);
+  /** How the solver put the path together, for the developer view in Inspect & Edit. */
+  const [solverTrace, setSolverTrace] = useState<SolverTrace | undefined>(undefined);
   /** A solve is running in the worker. */
   const [solving, setSolving] = useState(false);
   /** True when physics-reprojection mode ran but produced zero fitted arcs. */
@@ -336,7 +338,8 @@ function App() {
         console.error("[ballSolver] failed:", e.data.error);
         return;
       }
-      const { positions, methods, stats, debugRecords, physicsDebug: pd, touches, touchSplits: splits } = e.data.result;
+      const { positions, methods, stats, debugRecords, physicsDebug: pd, touches, touchSplits: splits, trace } = e.data.result;
+      setSolverTrace(trace);
       setBall3dMap(positions);
       setBall3dMethods(methods);
       setBall3dDebug(debugRecords);
@@ -1299,6 +1302,7 @@ function App() {
                   canUndo={editHistory.past.length > 0}
                   canRedo={editHistory.future.length > 0}
                   physicsDebug={physicsDebug}
+                  trace={solverTrace}
                   touchSplits={touchSplits}
                   touches={displayTouches}
                   // A hand-aligned court is checked by eye; its error against

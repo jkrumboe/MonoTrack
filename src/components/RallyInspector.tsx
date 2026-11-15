@@ -9,9 +9,11 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import * as THREE from "three";
 import type { FrameData } from "../hooks/useAnalysis";
 import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
-import type { PhysicsReprojectionDebug, TouchSplitDecision } from "../utils/ballReconstruction";
+import type { PhysicsReprojectionDebug, SolverTrace, TouchSplitDecision } from "../utils/ballReconstruction";
 import { TOUCH_KINDS, touchColor, touchMatchFrames, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
 import { resetSegmentEdits, type RefitSegment } from "../utils/rallyRefit";
+import { traceSpans } from "../utils/pathExplain";
+import PathExplain from "./PathExplain";
 import { inspectRally, type Fix, type Problem } from "../utils/rallyInspection";
 import CourtEditor3D from "./CourtEditor3D";
 
@@ -32,6 +34,8 @@ interface Props {
   fittedPositions: Map<number, V3>;
   physicsDebug?: PhysicsReprojectionDebug[];
   touchSplits?: TouchSplitDecision[];
+  /** The solver's account of the path (developer view). */
+  trace?: SolverTrace;
   /** Touches with the touch edits applied. */
   touches: EditedTouch[];
   courtErrPx: number | null;
@@ -120,6 +124,18 @@ export default function RallyInspector(p: Readonly<Props>) {
   const [addType, setAddType] = useState<TouchKind>("set");
   const [showHidden, setShowHidden] = useState(false);
   const [flash, setFlash] = useState<"ball" | "touch" | "3d" | null>(null);
+  /** Developer view: colour the path by how each stretch was made, and say why. Remembered. */
+  const [explain, setExplain] = useState(() => {
+    try { return localStorage.getItem("inspect.explain") === "1"; } catch { return false; }
+  });
+  const toggleExplain = () => setExplain((v) => {
+    try { localStorage.setItem("inspect.explain", v ? "0" : "1"); } catch { /* private window */ }
+    return !v;
+  });
+  const spans = useMemo(
+    () => (p.trace ? traceSpans(p.trace, p.segments.filter((s) => s.rebuilt)) : []),
+    [p.trace, p.segments],
+  );
   const [zoom, setZoom] = useState({ k: 1, x: 0, y: 0 });
   const stageRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
@@ -454,6 +470,7 @@ export default function RallyInspector(p: Readonly<Props>) {
           frames={frames} positions={p.positions} touches={touches} calibration={p.calibration} aspect={aspect}
           cur={cur} selected={touchHere?.frame ?? null} onSelect={onSeek} onPin={(f, q) => setPin(f, q)}
           fps={fps} segments={p.segments} onArc={setArc} onResetSegment={resetSegment}
+          spans={explain ? spans : undefined} trace={explain ? p.trace : undefined}
           onUndo={p.onUndo} onRedo={p.onRedo} canUndo={p.canUndo} canRedo={p.canRedo}
         />
         <Timeline
@@ -483,6 +500,16 @@ export default function RallyInspector(p: Readonly<Props>) {
               </div>
             ))}
           </div>
+        </section>
+
+        <section className="inspect-card">
+          <div className="inspect-h">
+            How this path was made
+            <button className="inspect-link" onClick={toggleExplain}>{explain ? "hide" : "show"}</button>
+          </div>
+          {explain && (p.trace
+            ? <PathExplain trace={p.trace} spans={spans} touchSplits={p.touchSplits} cur={cur} onSeek={onSeek} />
+            : <p className="muted">Nothing solved yet.</p>)}
         </section>
 
         <section className="inspect-card inspect-problems">

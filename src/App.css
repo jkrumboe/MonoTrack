@@ -2043,6 +2043,24 @@ button, input, select {
   color: var(--text-tertiary);
 }
 
+/* Developer view: how the path was made (PathExplain) */
+.explain { display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.explain p { margin: 4px 0 0; line-height: 1.45; color: var(--text-secondary); }
+.explain-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: rgba(255,255,255,.06); }
+.explain-bar i { display: block; height: 100%; }
+.explain-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--text-secondary); }
+.explain-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; }
+.explain-h { display: flex; justify-content: space-between; font-weight: 600; margin-top: 4px; }
+.explain-here { padding: 8px; border-radius: 6px; background: rgba(255,255,255,.04); }
+.explain-list { display: flex; flex-direction: column; max-height: 260px; overflow-y: auto; }
+.explain-row { display: grid; grid-template-columns: 10px 74px 1fr auto; align-items: baseline; gap: 6px; padding: 3px 4px; border: 0; border-radius: 4px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.explain-row.split { grid-template-columns: 10px 74px 1fr; }
+.explain-row:hover, .explain-row.current { background: rgba(255,255,255,.07); }
+.explain-row i { width: 8px; height: 8px; border-radius: 2px; align-self: center; }
+.explain-frames { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.explain-title { overflow-wrap: anywhere; }
+.explain-verdict { color: var(--text-secondary); white-space: nowrap; }
+
 .court3d-tools { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .court3d-tools .inspect-btn:disabled { opacity: 0.45; cursor: default; }
 .court3d-warn { font-size: 12px; color: #ff7043; }
