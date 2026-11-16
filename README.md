@@ -100,6 +100,19 @@ which run it) then uploads the clip, analyses it on the server's GPU and
 writes the eval fixture locally; this machine needs no torch or CUDA.
 `npm test` and `npm run eval` read those fixtures and need no GPU.
 
+**Checking a GPU server** in about two minutes (a 20 s stretch of a video,
+not the whole match):
+
+```sh
+python python/server_check.py --server http://gpu-box:8765 --gpu-only      # 5 s: GPU visible to torch?
+python python/server_check.py --server http://gpu-box:8765 --expect-gpu 3060
+python python/server_check.py eval/videos/vb14/*.avi --seconds 10          # several videos
+```
+
+It reports PASS/WARN/FAIL (torch sees CUDA, GPU busy during the analysis,
+frames, ball, court), the speed in seconds per second of video, and what the
+whole video would take. Results go to `runs/server_check.jsonl`.
+
 **Phone:** browsers only allow the camera over **https** (or on localhost).
 Start the server with a certificate, open its address on the phone, then use
 *Add to Home Screen*:

@@ -1739,10 +1739,30 @@ button, input, select {
   background: var(--bg-stage);
 }
 
+/* The video and the court view, side by side at the same height. */
+.inspect-pair {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  flex-shrink: 0;
+}
+
+.inspect-pair > * { flex: 1 1 0; min-width: 0; }
+
+/* Aligning the court: the video takes the row, kept within the window. */
+.inspect-pair.aligning > .court3d { display: none; }
+.inspect-pair.aligning .inspect-stage { max-height: calc(100vh - 170px); }
+
+.inspect-video {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .inspect-stage {
   position: relative;
-  flex: 1;
-  min-height: 260px;
+  flex: none;
+  aspect-ratio: 16 / 9;
   background: #000;
   border-radius: var(--radius);
   overflow: hidden;
@@ -2031,7 +2051,13 @@ button, input, select {
 }
 
 .court3d.flash { background: rgba(0, 229, 255, 0.14); }
-.court3d-view { min-width: 0; }
+.court3d-view { min-width: 0; flex-basis: 100%; }
+.court3d-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; margin-bottom: 4px; }
+.court3d-snap { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); cursor: pointer; }
+.court3d-orbit { position: relative; }
+.court3d-orbit canvas { display: block; border-radius: var(--radius); touch-action: none; }
+.court3d-orbit .court3d-labels { position: absolute; inset: 0; pointer-events: none; }
+.court3d-reset { position: absolute; right: 8px; bottom: 8px; }
 .court3d-view canvas { display: block; border-radius: var(--radius); touch-action: none; }
 
 .court3d-title {
@@ -2063,6 +2089,8 @@ button, input, select {
 
 .court3d-tools { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .court3d-tools .inspect-btn:disabled { opacity: 0.45; cursor: default; }
+.court3d-height { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+.court3d-height input { width: 64px; height: 26px; padding: 0 6px; border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--bg-secondary); color: inherit; font: inherit; }
 .court3d-warn { font-size: 12px; color: #ff7043; }
 .court3d-help { flex-basis: 100%; font-size: 12px; color: var(--text-secondary); }
 
@@ -2318,6 +2346,7 @@ button, input, select {
   .inspect-layout { flex-direction: column; }
   .inspect-main { overflow: visible; }
   .inspect-stage { flex: none; aspect-ratio: 16 / 9; min-height: 0; }
+  .inspect-pair { flex-direction: column; align-items: stretch; }
   .inspect-side { width: 100%; border-left: none; border-top: 1px solid var(--border); overflow: visible; }
 }
 

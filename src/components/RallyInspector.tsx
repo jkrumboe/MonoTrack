@@ -55,6 +55,12 @@ interface Props {
   saveState: SaveState;
   saveError: string | null;
   onAlignCourt: () => void;
+  /**
+   * The court alignment, while it is open here: the editor to lay over the
+   * video at the stage's size, and the zoom it asks the video to follow.
+   * The video takes the whole width meanwhile.
+   */
+  align?: { render: (width: number, height: number) => ReactNode; view: { zoom: number; panX: number; panY: number } } | null;
 }
 
 /** Camera-motion homography nearest a frame (moving camera), or undefined. */
@@ -141,6 +147,9 @@ export default function RallyInspector(p: Readonly<Props>) {
   const innerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [innerSize, setInnerSize] = useState({ w: 0, h: 0 });
+  /** The court alignment owns the stage's mouse and wheel while it is open. */
+  const aligning = useRef(false);
+  aligning.current = !!p.align;
 
   const insp = useMemo(() => inspectRally({
     frames, fps, positions: p.fittedPositions, physicsDebug: p.physicsDebug, touches, touchSplits: p.touchSplits,
@@ -255,6 +264,7 @@ export default function RallyInspector(p: Readonly<Props>) {
     const el = stageRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
+      if (aligning.current) return;
       e.preventDefault();
       const r = el.getBoundingClientRect();
       const mx = e.clientX - r.left, my = e.clientY - r.top;
@@ -274,7 +284,7 @@ export default function RallyInspector(p: Readonly<Props>) {
   }, []);
   const drag = useRef<{ x: number; y: number; zx: number; zy: number; moved: boolean } | null>(null);
   const onMouseDown = (e: React.MouseEvent) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || aligning.current) return;
     drag.current = { x: e.clientX, y: e.clientY, zx: zoom.x, zy: zoom.y, moved: false };
   };
   const onMouseMove = (e: React.MouseEvent) => {
@@ -438,6 +448,8 @@ export default function RallyInspector(p: Readonly<Props>) {
   return (
     <div className="inspect-layout">
       <div className="inspect-main">
+        <div className={`inspect-pair ${p.align ? "aligning" : ""}`}>
+        <div className="inspect-video">
         <div
           className={`inspect-stage ${tool === "ball" ? "tool-ball" : zoom.k > 1 ? "zoomed" : ""}`}
           ref={stageRef}
@@ -447,9 +459,18 @@ export default function RallyInspector(p: Readonly<Props>) {
           onMouseLeave={() => { drag.current = null; }}
           onDoubleClick={() => tool === "none" && setZoom({ k: 1, x: 0, y: 0 })}
         >
-          <div ref={innerRef} className="inspect-stage-inner" style={{ transform: `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.k})` }}>
+          <div
+            ref={innerRef}
+            className="inspect-stage-inner"
+            style={{
+              transform: p.align
+                ? `translate(${p.align.view.panX}px, ${p.align.view.panY}px) scale(${p.align.view.zoom})`
+                : `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.k})`,
+            }}
+          >
             {p.video}
-            <canvas ref={canvasRef} className="inspect-overlay" />
+            <canvas ref={canvasRef} className="inspect-overlay" style={p.align ? { display: "none" } : undefined} />
+            {p.align && innerSize.w > 0 && innerSize.h > 0 && p.align.render(innerSize.w, innerSize.h)}
           </div>
           {tool === "ball" && (
             <div className="inspect-tool-hint">
@@ -465,14 +486,15 @@ export default function RallyInspector(p: Readonly<Props>) {
           <span><i style={{ background: "#f2c230" }} />3D path</span>
           <span className="muted">wheel: zoom · drag: pan · <kbd>[</kbd> <kbd>]</kbd> problems</span>
         </div>
+        </div>
         <CourtEditor3D
           flash={flash === "3d"}
           frames={frames} positions={p.positions} touches={touches} calibration={p.calibration} aspect={aspect}
           cur={cur} selected={touchHere?.frame ?? null} onSelect={onSeek} onPin={(f, q) => setPin(f, q)}
           fps={fps} segments={p.segments} onArc={setArc} onResetSegment={resetSegment}
-          spans={explain ? spans : undefined} trace={explain ? p.trace : undefined}
           onUndo={p.onUndo} onRedo={p.onRedo} canUndo={p.canUndo} canRedo={p.canRedo}
         />
+        </div>
         <Timeline
           frames={frames} fps={fps} positions={p.positions} touches={touches} edits={edits}
           problems={insp.open} rally={insp.rally} cur={cur} onSeek={onSeek}

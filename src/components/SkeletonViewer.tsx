@@ -94,6 +94,11 @@ function fitCameraToCourt(
   controls.enableDamping = true;
 }
 
+/** Over the video, the ball trail covers this many frames back from now. */
+const OVERLAY_TRAIL_FRAMES = 30;
+/** Over the video, touches this many frames either side of now are marked. */
+const OVERLAY_TOUCH_FRAMES = 30;
+
 interface SkeletonViewerProps {
   overlay?: boolean;
   calibration?: CalibrationResult | null;
@@ -556,14 +561,14 @@ export default function SkeletonViewer({
       controls.enabled = true;
     }
 
-    // Fade the painted floor for video overlays, and hide the free zone
-    // entirely — it is scenery, and opaque it would cover the footage.
+    // Over the video only the court lines are drawn: the painted floor and
+    // the free zone are scenery, and would tint the footage.
     courtGroup.traverse((obj) => {
       if (!(obj instanceof THREE.Mesh)) return;
-      if (obj.name === "court-free-zone") {
+      if (obj.name === "court-free-zone" || obj.name === "court-surface" || obj.name === "court-front-zone") {
         obj.visible = !overlay;
-        return;
       }
+      if (obj.name === "court-free-zone") return;
       if (obj.name !== "court-surface" && obj.name !== "court-front-zone") return;
       const mat = obj.material;
       if (mat instanceof THREE.MeshStandardMaterial) {
@@ -711,7 +716,8 @@ export default function SkeletonViewer({
     const cur = ballTrajectory.find((p) => p.frame === currentFrame);
     ballMesh.visible = !!cur;
     ballShadow.visible = !!cur;
-    ballStem.visible = !!cur;
+    // Over the video the picture already gives depth: no stem, no floor footprint.
+    ballStem.visible = !!cur && !overlay;
     if (cur) {
       ballMesh.position.set(cur.x, cur.y, cur.z);
       ballShadow.position.set(cur.gx, 0.005, cur.gz);
@@ -732,6 +738,8 @@ export default function SkeletonViewer({
     for (let i = 1; i < ballTrajectory.length; i++) {
       const prev = ballTrajectory[i - 1];
       const curr = ballTrajectory[i];
+      // Over the video only the ball's recent past is drawn.
+      if (overlay && (curr.frame > currentFrame || prev.frame < currentFrame - OVERLAY_TRAIL_FRAMES)) continue;
       const frameDiff = curr.frame - prev.frame;
       const dist = Math.hypot(curr.x - prev.x, curr.y - prev.y, curr.z - prev.z);
       const estimated = prev.method === "estimated" || curr.method === "estimated";
@@ -739,12 +747,13 @@ export default function SkeletonViewer({
         const trail = estimated ? estimatedPoints : segPoints;
         trail.push(new THREE.Vector3(prev.x, prev.y, prev.z));
         trail.push(new THREE.Vector3(curr.x, curr.y, curr.z));
+        if (overlay) continue;
         groundPoints.push(new THREE.Vector3(prev.x, FLOOR_Y, prev.z));
         groundPoints.push(new THREE.Vector3(curr.x, FLOOR_Y, curr.z));
       }
     }
     for (const p of ballTrajectory) {
-      if (p.frame % 4 !== 0) continue;
+      if (overlay || p.frame % 4 !== 0) continue;
       dropPoints.push(new THREE.Vector3(p.x, FLOOR_Y, p.z), new THREE.Vector3(p.x, p.y, p.z));
     }
     for (const [line, pts] of [[ballTrail, segPoints], [estimatedTrail, estimatedPoints], [groundTrail, groundPoints], [dropLines, dropPoints]] as const) {
@@ -752,7 +761,7 @@ export default function SkeletonViewer({
       line.geometry = new THREE.BufferGeometry().setFromPoints(pts);
     }
     estimatedTrail.computeLineDistances();
-  }, [ballTrajectory, currentFrame]);
+  }, [ballTrajectory, currentFrame, overlay]);
 
   // Players of the current frame as jointed figures standing on their feet
   // position, jersey tinted by side of the net, arms posed from the pose
@@ -784,6 +793,8 @@ export default function SkeletonViewer({
       }
     }
     for (const t of touches ?? []) {
+      // Over the video: only the touches around now, and no floor ring.
+      if (overlay && Math.abs(t.frame - (currentFrame ?? 0)) > OVERLAY_TOUCH_FRAMES) continue;
       const color = touchColor(t.label);
       const [x, y, z] = t.position;
       const dot = new THREE.Mesh(
@@ -792,6 +803,7 @@ export default function SkeletonViewer({
       );
       dot.position.set(x, y, z);
       touchMarkers.add(dot);
+      if (overlay) continue;
       const ring = new THREE.Mesh(
         new THREE.RingGeometry(0.22, 0.32, 24),
         new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false }),
@@ -800,7 +812,7 @@ export default function SkeletonViewer({
       ring.position.set(x, 0.015, z);
       touchMarkers.add(ring);
     }
-  }, [touches]);
+  }, [touches, overlay, overlay ? currentFrame : 0]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return <div ref={containerRef} style={{ width: "100%", height: "100%", minHeight: 400 }} />;
 }
@@ -815,7 +827,7 @@ const COLOR_LINE      = 0xf2f2f2;
 const FREE_ZONE       = 3.0;   // FIVB minimum free zone (m)
 const LINE_W          = 0.05;  // official line width (m)
 
-function createCourt(): THREE.Group {
+export function createCourt(): THREE.Group {
   const group = new THREE.Group();
 
   const halfL = COURT_HALF_L;  // 9 m

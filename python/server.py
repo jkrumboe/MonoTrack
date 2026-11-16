@@ -376,6 +376,46 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+_torch_cuda = None
+
+
+def gpu_status():
+    """What the analyzer will run on: torch's CUDA view (checked once) and a live nvidia-smi reading.
+
+    nvidia-smi alone is not enough: inside a container it can see the card while
+    the installed torch is a CPU build, and the analysis then silently runs on the CPU.
+    """
+    global _torch_cuda
+    if _torch_cuda is None:
+        code = ("import json, torch; ok = torch.cuda.is_available(); print(json.dumps({"
+                "'cuda': ok, 'device': torch.cuda.get_device_name(0) if ok else None, "
+                "'torch': torch.__version__, 'cuda_version': torch.version.cuda}))")
+        try:
+            out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+            _torch_cuda = json.loads(out.stdout.strip().splitlines()[-1])
+        except Exception as e:
+            _torch_cuda = {"cuda": False, "error": f"torch check failed: {e}"}
+    status = dict(_torch_cuda)
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu,power.draw,driver_version",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        name, total, used, util, power, driver = [v.strip() for v in out.split(",")]
+
+        def num(v):
+            try:
+                return float(v)
+            except ValueError:
+                return None
+        status.update(smi_name=name, vram_total_mib=num(total), vram_used_mib=num(used),
+                      util_pct=num(util), power_w=num(power), driver=driver)
+    except Exception:
+        status["smi"] = "nvidia-smi not available"
+    return status
+
+
 def _public(meta):
     keys = ("id", "name", "created", "size", "uploaded", "status", "progress", "message", "source", "frames", "fps")
     return {k: meta.get(k) for k in keys}
@@ -483,7 +523,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api(self, method, p, query):
         if p == ["health"]:
-            return self._json({"ok": True, "ffmpeg": bool(shutil.which("ffmpeg")), "auth": bool(TOKEN)})
+            health = {"ok": True, "ffmpeg": bool(shutil.which("ffmpeg")), "auth": bool(TOKEN)}
+            if query.get("gpu", ["0"])[0] == "1":  # not on the Docker healthcheck: nvidia-smi costs ~0.1 s
+                health["gpu"] = gpu_status()
+            return self._json(health)
         if p == ["jobs"] and method == "GET":
             return self._json([_public(m) for m in list_jobs()])
         if p == ["jobs"] and method == "POST":

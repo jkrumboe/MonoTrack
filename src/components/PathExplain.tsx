@@ -4,7 +4,7 @@
  * Lists the path as stretches (each flight between two knots, each bridged or
  * followed hole) with the solver's verdict and its reason, says what the
  * current frame is drawn by, and lists every candidate touch it considered.
- * The same stretches colour the two court views (see CourtEditor3D).
+ * The same stretches colour the timeline.
  */
 import { useMemo, useState } from "react";
 import type { SolverTrace, TouchSplitDecision } from "../utils/ballReconstruction";

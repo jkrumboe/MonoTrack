@@ -1019,6 +1019,27 @@ function App() {
     return undefined;
   }, [showCalibration, calibrationViewTransform, videoZoomTransform]);
 
+  /** The court alignment editor, laid over a video pane of this size (side by side, or Inspect & edit). */
+  const renderCalibration = (width: number, height: number) => (
+    <CourtCalibration
+      width={width}
+      height={height}
+      videoPath={videoPath}
+      adjustMode={!!calibration}
+      initialCalibration={calibration ?? undefined}
+      onViewTransformChange={setCalibrationViewTransform}
+      onCalibrated={(cal) => {
+        setCalibration(cal);
+        setManualCalibrationLocked(true);
+        setShowCalibration(false);
+        if (isRealVideo && videoAspect) saveCourtForMatch(videoPath, cal, videoAspect, courtData[0]?.frame ?? 0);
+      }}
+      onCancel={() => setShowCalibration(false)}
+      toReference={frameMapping?.toReference}
+      fromReference={frameMapping?.fromReference}
+    />
+  );
+
   const matchTitle = matchName
     || (videoPath === "demo.mp4" ? "Demo data" : videoPath && !videoPath.startsWith("job:") ? videoPath.split(/[\\/]/).pop() ?? "" : videoPath ? "Match" : "");
   const inMatch = screen === "analysis" && status === "complete" && !!result;
@@ -1150,11 +1171,12 @@ function App() {
                   {solving && (
                     <span className="status-chip"><span className="spinner" />Solving ball path</span>
                   )}
-                  {isRealVideo && viewMode !== "inspect" && (
+                  {isRealVideo && (
                     <button
                       className={`court-status ${showCalibration ? "open" : calibration ? "ok" : "warn"}`}
                       onClick={() => {
-                        setViewMode("side-by-side");
+                        // Inspect & edit aligns the court over its own video; the other views in the side-by-side one.
+                        if (viewMode !== "inspect") setViewMode("side-by-side");
                         setShowCalibration((v) => !v);
                       }}
                       title={showCalibration ? "Close the court alignment" : calibration ? "Check or adjust the court alignment" : "The court is needed to find rallies and points"}
@@ -1226,25 +1248,8 @@ function App() {
                           currentFrame={currentFrame}
                         />
                       )}
-                      {showCalibration && splitVideoSize.width > 0 && splitVideoSize.height > 0 && (
-                        <CourtCalibration
-                          width={splitVideoSize.width}
-                          height={splitVideoSize.height}
-                          videoPath={videoPath}
-                          adjustMode={!!calibration}
-                          initialCalibration={calibration ?? undefined}
-                          onViewTransformChange={setCalibrationViewTransform}
-                          onCalibrated={(cal) => {
-                            setCalibration(cal);
-                            setManualCalibrationLocked(true);
-                            setShowCalibration(false);
-                            if (isRealVideo && videoAspect) saveCourtForMatch(videoPath, cal, videoAspect, courtData[0]?.frame ?? 0);
-                          }}
-                          onCancel={() => setShowCalibration(false)}
-                          toReference={frameMapping?.toReference}
-                          fromReference={frameMapping?.fromReference}
-                        />
-                      )}
+                      {showCalibration && splitVideoSize.width > 0 && splitVideoSize.height > 0 &&
+                        renderCalibration(splitVideoSize.width, splitVideoSize.height)}
                     </div>
                     {!showCalibration && <span className="pane-label">Video</span>}
                   </div>
@@ -1315,7 +1320,8 @@ function App() {
                   solving={solving}
                   saveState={saveState}
                   saveError={saveError}
-                  onAlignCourt={() => { setViewMode("side-by-side"); setShowCalibration(true); }}
+                  onAlignCourt={() => setShowCalibration(true)}
+                  align={showCalibration ? { render: renderCalibration, view: calibrationViewTransform } : null}
                   video={
                     <VideoPlayer
                       videoPath={videoPath}

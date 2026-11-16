@@ -1,36 +1,29 @@
 /**
- * Edit the rally in 3D: the court from above and from the side, on one
- * shared along-the-court axis, with the solved path and its touches. Drag a
- * touch to where it really was; the solver holds it there and refits the
- * flights either side (see the pins in rallyEdits.ts).
+ * Edit the rally in 3D: the court in perspective, with the solved path and
+ * its touches, to orbit and drag in (see RallyEditor3DView). Drag a touch to
+ * where it really was; the solver holds it there and refits the flights
+ * either side (see the pins in rallyEdits.ts).
  *
  * From one camera the depth along each line of sight is what the solver
  * cannot see, so the selected touch shows its line of sight (the ball is
- * somewhere on it) and a drag snaps onto it. Hold Shift to place it freely,
- * e.g. when the ball was hidden at the touch.
+ * somewhere on it); "snap to line of sight" makes a drag hold to it, and
+ * Shift flips that for one drag. Grabbing the path anywhere else puts a new
+ * touch there (the solver splits the flight at it).
  *
- * Each flight has a handle midway (a diamond, in the side view): drag it up
- * or down to make the arc higher or flatter. Flights rebuilt from an edit
- * are drawn dashed: they are placed, not measured. Undo, redo and "reset
- * flight" sit under the views.
+ * Each flight has a handle midway (a diamond): drag it up or down to make
+ * the arc higher or flatter. Undo, redo and "reset flight" sit under the view.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FrameData } from "../hooks/useAnalysis";
 import type { CalibrationResult } from "../utils/cameraSolver";
 import { ballRay, touchColor, type EditedTouch } from "../utils/rallyEdits";
-import { ARC_MAX_G, ARC_MIN_G, arcAt, gravityForMidHeight, type RefitSegment } from "../utils/rallyRefit";
-import type { SolverTrace } from "../utils/ballReconstruction";
-import { SPAN_COLORS, spanAt, type PathSpan } from "../utils/pathExplain";
+import type { RefitSegment } from "../utils/rallyRefit";
+import RallyEditor3DView from "./RallyEditor3DView";
 
 type V3 = [number, number, number];
 
-/** View extents (m): along the court (z), across it (x), height (y). */
-const Z_MAX = 13, X_MAX = 7, Y_MAX = 8.5;
-/** A drag this close (m) to the line of sight snaps onto it. */
-const SNAP_M = 1.2;
-const HIT_PX = 11;
-
-const css = (name: string, fallback: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+/** Canvas height over width: the video's shape, so the two sit level side by side. */
+const VIEW_ASPECT = 9 / 16;
 
 interface Props {
   frames: FrameData[];
@@ -54,307 +47,46 @@ interface Props {
   onRedo: () => void;
   canUndo: boolean;
   canRedo: boolean;
-  /**
-   * Developer view (see PathExplain): the path coloured by how each stretch
-   * was made, the arcs the solver fitted where it refused them, every knot,
-   * and the candidate players at the knot nearest the current frame.
-   */
-  spans?: PathSpan[];
-  trace?: SolverTrace;
   /** Draw attention to the editor (a problem's fix points here). */
   flash?: boolean;
 }
 
-type View = "top" | "side";
-
 export default function CourtEditor3D(p: Readonly<Props>) {
   const wrapRef = useRef<HTMLDivElement>(null);
-  const topRef = useRef<HTMLCanvasElement>(null);
-  const sideRef = useRef<HTMLCanvasElement>(null);
   const [w, setW] = useState(0);
-  /** Touch being dragged and where it is now (not yet committed). */
-  const [drag, setDrag] = useState<{ frame: number; pos: V3; snapped: boolean } | null>(null);
-  /** Arc handle being dragged: the flight's first touch frame and the height it is at now. */
-  const [arcDrag, setArcDrag] = useState<{ from: number; midY: number } | null>(null);
+  /** Drags hold to the selected touch's line of sight (Shift flips it). */
+  const [snap, setSnap] = useState(false);
 
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setW(Math.floor((el.clientWidth - 20) / 2)));
+    const ro = new ResizeObserver(() => setW(Math.max(0, Math.floor(el.clientWidth - 8))));
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
 
-  const s = w / (2 * Z_MAX); // px per metre, both views
-  const topH = Math.round(2 * X_MAX * s), sideH = Math.round(Y_MAX * s);
-  // Court z runs left to right in both views; x down the top view; y up the side view.
-  const mapper = (view: View) => view === "top"
-    ? { px: (q: V3): [number, number] => [w / 2 + q[2] * s, topH / 2 + q[0] * s], h: topH }
-    : { px: (q: V3): [number, number] => [w / 2 + q[2] * s, sideH - q[1] * s], h: sideH };
-
+  const h = Math.round(w * VIEW_ASPECT);
   const selTouch = p.touches.find((t) => t.frame === p.selected) ?? null;
   const ray = useMemo(
     () => (p.calibration && p.selected != null && p.aspect ? ballRay(p.frames, p.selected, p.calibration, p.aspect) : null),
     [p.calibration, p.selected, p.aspect, p.frames],
   );
-  const shown = (t: EditedTouch): V3 => (drag && drag.frame === t.frame ? drag.pos : t.position);
   /** The flight that starts at the selected touch, or the one that ends at it for the last touch. */
   const selSegment = p.segments.find((x) => x.from === p.selected) ?? p.segments.find((x) => x.to === p.selected) ?? null;
-
-  useEffect(() => {
-    if (!w) return;
-    for (const view of ["top", "side"] as View[]) {
-      const cv = view === "top" ? topRef.current : sideRef.current;
-      if (!cv) continue;
-      const { px, h } = mapper(view);
-      const dpr = window.devicePixelRatio || 1;
-      cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
-      cv.style.width = `${w}px`; cv.style.height = `${h}px`;
-      const ctx = cv.getContext("2d")!;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.fillStyle = css("--bg-stage", "#0d1014"); ctx.fillRect(0, 0, w, h);
-      const line = (pts: V3[], color: string, width = 1, dash: number[] = []) => {
-        ctx.beginPath(); ctx.setLineDash(dash); ctx.strokeStyle = color; ctx.lineWidth = width;
-        pts.forEach((q, i) => (i ? ctx.lineTo(...px(q)) : ctx.moveTo(...px(q))));
-        ctx.stroke(); ctx.setLineDash([]);
-      };
-      const courtLine = "rgba(255,255,255,.45)";
-      if (view === "top") {
-        ctx.fillStyle = "rgba(61,94,128,.32)";
-        const [x0, y0] = px([-4.5, 0, -9]), [x1, y1] = px([4.5, 0, 9]);
-        ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
-        line([[-4.5, 0, -9], [-4.5, 0, 9], [4.5, 0, 9], [4.5, 0, -9], [-4.5, 0, -9]], courtLine);
-        line([[-4.5, 0, -3], [4.5, 0, -3]], courtLine); line([[-4.5, 0, 3], [4.5, 0, 3]], courtLine);
-        line([[-5, 0, 0], [5, 0, 0]], "rgba(255,220,90,.9)", 2);
-      } else {
-        line([[0, 0, -Z_MAX], [0, 0, Z_MAX]], courtLine);
-        line([[0, 0, -9], [0, 0, 9]], "rgba(93,113,134,.9)", 3);
-        line([[0, 0, 0], [0, 2.43, 0]], "rgba(255,220,90,.9)", 2);
-        ctx.fillStyle = "rgba(255,255,255,.4)"; ctx.font = "10px 'Inter Variable', -apple-system, 'Segoe UI', sans-serif";
-        ctx.fillText("net 2.43 m", px([0, 2.43, 0])[0] + 4, px([0, 2.43, 0])[1] - 2);
-        line([[0, 2.43, -Z_MAX], [0, 2.43, Z_MAX]], "rgba(255,255,255,.08)", 1, [3, 4]);
-      }
-      // The camera, or an arrow towards it at the edge.
-      if (p.calibration) {
-        const c = p.calibration.position;
-        const [cx, cy] = px(c);
-        const inView = cx >= 0 && cx <= w && cy >= 0 && cy <= h;
-        const [ex, ey] = [Math.max(8, Math.min(w - 8, cx)), Math.max(8, Math.min(h - 8, cy))];
-        ctx.fillStyle = "rgba(255,255,255,.6)"; ctx.font = "11px 'Inter Variable', -apple-system, 'Segoe UI', sans-serif";
-        ctx.fillText(inView ? "◉ camera" : "▸ camera", ex - (ex > w / 2 ? 56 : 0), ey + 4);
-      }
-      // Line of sight through the ball at the selected touch.
-      if (ray) {
-        const a = ray.origin, d = ray.dir;
-        line([a, [a[0] + d[0] * 90, a[1] + d[1] * 90, a[2] + d[2] * 90]], "rgba(0,229,255,.55)", 1.5, [5, 4]);
-      }
-      // Solved path: the whole rally faint, the last second bright.
-      const runsOf = (from: number, to: number) => {
-        const out: V3[][] = [];
-        let run: V3[] = [];
-        for (let f = from; f <= to; f++) {
-          const q = p.positions.get(f);
-          if (q) run.push(q); else if (run.length) { out.push(run); run = []; }
-        }
-        if (run.length) out.push(run);
-        return out;
-      };
-      if (p.spans && p.trace) {
-        // The path by how it was made. Each frame takes its stretch's colour.
-        let run: V3[] = [], color = "";
-        const flush = () => { if (run.length > 1) line(run, color, 2); run = []; };
-        for (let f = 0; f < p.frames.length; f++) {
-          const q = p.positions.get(f);
-          const c = q ? SPAN_COLORS[spanAt(p.spans, f)?.status ?? "bridge"] : "";
-          if (!q || c !== color) { const last = run[run.length - 1]; flush(); if (q && last && c) run.push(last); color = c; }
-          if (q) run.push(q);
-        }
-        flush();
-        // What the solver fitted where it refused the flight: the gap between
-        // this and the drawn line is what the detections pulled it by.
-        for (const rally of p.trace.rallies) {
-          for (const fl of rally.flights) {
-            if (!fl.accepted) line(fl.arc.map(([, x, y, z]): V3 => [x, y, z]), "rgba(255,82,82,.85)", 1, [2, 3]);
-          }
-          // Every knot; the ones not reported as touches are hollow.
-          for (const k of rally.knots) {
-            if (k.reported) continue;
-            const [x, y] = px(k.position);
-            ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2);
-            ctx.strokeStyle = "rgba(255,255,255,.7)"; ctx.lineWidth = 1.2; ctx.stroke();
-          }
-        }
-        // Candidate players at the knot nearest the current frame.
-        const knots = p.trace.rallies.flatMap((r) => r.knots);
-        const near = knots.reduce<typeof knots[number] | null>((b, k) => (!b || Math.abs(k.frame - p.cur) < Math.abs(b.frame - p.cur) ? k : b), null);
-        if (near && Math.abs(near.frame - p.cur) <= 15) {
-          for (const [cx, cz] of near.candidates) {
-            const [x, y] = px([cx, 0, cz]);
-            ctx.strokeStyle = "#ff80ab"; ctx.lineWidth = 1.5; ctx.strokeRect(x - 4, y - 4, 8, 8);
-            line([[cx, 0, cz], near.position], "rgba(255,128,171,.45)", 1, [2, 3]);
-          }
-        }
-      } else {
-        for (const r of runsOf(0, p.frames.length - 1)) line(r, "rgba(242,194,48,.28)", 1.5);
-        for (const r of runsOf(p.cur - 30, p.cur)) line(r, "#f2c230", 2);
-      }
-      // Flights rebuilt from an edit: dashed over the solid line, as estimates.
-      for (const sg of p.segments) {
-        if (!sg.rebuilt) continue;
-        const pts: V3[] = [];
-        for (let f = sg.from; f <= sg.to; f++) { const q = p.positions.get(f); if (q) pts.push(q); }
-        line(pts, css("--bg-stage", "#0d1014"), 3);
-        line(pts, sg.warning ? "#ff7043" : "#f2c230", 1.5, [5, 4]);
-      }
-      // The arc being reshaped, as it will be.
-      if (arcDrag) {
-        const sg = p.segments.find((x) => x.from === arcDrag.from);
-        const a = p.touches.find((t) => t.frame === sg?.from), b = p.touches.find((t) => t.frame === sg?.to);
-        if (sg && a && b) {
-          const g = Math.min(ARC_MAX_G * 9.81, Math.max(ARC_MIN_G * 9.81, gravityForMidHeight(a.position, b.position, sg.from, sg.to, p.fps, arcDrag.midY)));
-          const pts: V3[] = [];
-          for (let f = sg.from; f <= sg.to; f++) pts.push(arcAt(a.position, b.position, sg.from, sg.to, g, p.fps, f));
-          line(pts, "#00e5ff", 2);
-        }
-      }
-      // Arc handles: a diamond midway through each flight.
-      for (const sg of p.segments) {
-        const q: V3 = arcDrag && arcDrag.from === sg.from ? [sg.mid[0], arcDrag.midY, sg.mid[2]] : sg.mid;
-        const [x, y] = px(q), r = view === "side" ? 5 : 3.5;
-        ctx.beginPath(); ctx.moveTo(x, y - r); ctx.lineTo(x + r, y); ctx.lineTo(x, y + r); ctx.lineTo(x - r, y); ctx.closePath();
-        ctx.fillStyle = sg.manual ? "#00e5ff" : css("--bg-stage", "#0d1014"); ctx.fill();
-        ctx.strokeStyle = sg.warning ? "#ff7043" : sg.manual ? "#00e5ff" : "rgba(242,194,48,.9)"; ctx.lineWidth = 1.5; ctx.stroke();
-      }
-      const now = p.positions.get(p.cur);
-      if (now) {
-        ctx.beginPath(); ctx.arc(...px(now), 4, 0, Math.PI * 2); ctx.fillStyle = "#fff"; ctx.fill();
-      }
-      // Touches
-      ctx.font = "600 11px -apple-system, Segoe UI, sans-serif";
-      for (const t of p.touches) {
-        const q = shown(t), [x, y] = px(q), sel = t.frame === p.selected;
-        ctx.beginPath(); ctx.arc(x, y, sel ? 7 : 5.5, 0, Math.PI * 2);
-        ctx.fillStyle = touchColor(t.label); ctx.fill();
-        if (t.pinned || sel) { ctx.strokeStyle = sel ? "#00e5ff" : "#fff"; ctx.lineWidth = 2; ctx.stroke(); }
-        if (sel || Math.abs(t.frame - p.cur) <= 30) {
-          ctx.fillStyle = touchColor(t.label);
-          ctx.fillText(`${t.label}${t.pinned ? " 📌" : ""}`, x + 9, y - 6);
-        }
-        // Drop line to the floor in the side view.
-        if (view === "side") line([q, [q[0], 0, q[2]]], "rgba(255,255,255,.25)", 1, [2, 3]);
-      }
-      if (drag) {
-        const q = drag.pos;
-        ctx.fillStyle = "#00e5ff"; ctx.font = "11px ui-monospace, Consolas, monospace";
-        ctx.fillText(`x ${q[0].toFixed(1)}  h ${q[1].toFixed(1)}  z ${q[2].toFixed(1)} m${drag.snapped ? "  on line of sight" : ""}`, 6, 13);
-      }
-      if (arcDrag && view === "side") {
-        ctx.fillStyle = "#00e5ff"; ctx.font = "11px ui-monospace, Consolas, monospace";
-        ctx.fillText(`arc ${arcDrag.midY.toFixed(1)} m high midway`, 6, 13);
-      }
-    }
-  }, [w, s, topH, sideH, p.positions, p.touches, p.frames.length, p.cur, p.selected, p.calibration, ray, drag, arcDrag, p.segments, p.fps, p.spans, p.trace]);
-
-  /** Mouse position -> court point in a view, keeping the coordinate the view does not show. */
-  const toWorld = (view: View, mx: number, my: number, keep: V3, free: boolean): { pos: V3; snapped: boolean } => {
-    const mz = (mx - w / 2) / s;
-    const other = view === "top" ? (my - topH / 2) / s : (sideH - my) / s;
-    let pos: V3 = view === "top" ? [other, keep[1], mz] : [keep[0], other, mz];
-    let snapped = false;
-    if (ray && !free) {
-      // Point of the line of sight nearest the mouse, as seen in this view.
-      const [o, d] = [ray.origin, ray.dir];
-      const [i, j] = view === "top" ? [0, 2] : [1, 2];
-      const tgt = [other, mz];
-      const dd = d[i] * d[i] + d[j] * d[j];
-      if (dd > 1e-9) {
-        const t = Math.max(0, ((tgt[0] - o[i]) * d[i] + (tgt[1] - o[j]) * d[j]) / dd);
-        const q: V3 = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
-        if (Math.hypot(q[i] - tgt[0], q[j] - tgt[1]) <= SNAP_M && q[1] >= 0) { pos = q; snapped = true; }
-      }
-    }
-    pos[1] = Math.max(0, pos[1]);
-    return { pos, snapped };
-  };
-
-  const hit = (view: View, mx: number, my: number): EditedTouch | null => {
-    const { px } = mapper(view);
-    let best: EditedTouch | null = null, bestD = HIT_PX;
-    for (const t of p.touches) {
-      const [x, y] = px(t.position);
-      const d = Math.hypot(x - mx, y - my);
-      if (d < bestD) { bestD = d; best = t; }
-    }
-    return best;
-  };
-
-  /** The arc handle under the mouse (side view only: height is what it changes). */
-  const hitArc = (view: View, mx: number, my: number): RefitSegment | null => {
-    if (view !== "side") return null;
-    const { px } = mapper(view);
-    let best: RefitSegment | null = null, bestD = HIT_PX;
-    for (const sg of p.segments) {
-      const [x, y] = px(sg.mid);
-      const d = Math.hypot(x - mx, y - my);
-      if (d < bestD) { bestD = d; best = sg; }
-    }
-    return best;
-  };
-
-  const handlers = (view: View) => ({
-    onPointerDown: (e: React.PointerEvent<HTMLCanvasElement>) => {
-      const r = e.currentTarget.getBoundingClientRect();
-      const t = hit(view, e.clientX - r.left, e.clientY - r.top);
-      if (!t) {
-        const sg = hitArc(view, e.clientX - r.left, e.clientY - r.top);
-        if (sg) {
-          e.currentTarget.setPointerCapture(e.pointerId);
-          setArcDrag({ from: sg.from, midY: sg.mid[1] });
-        }
-        return;
-      }
-      p.onSelect(t.frame);
-      e.currentTarget.setPointerCapture(e.pointerId);
-      setDrag({ frame: t.frame, pos: t.position, snapped: false });
-    },
-    onPointerMove: (e: React.PointerEvent<HTMLCanvasElement>) => {
-      const r = e.currentTarget.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      if (arcDrag) {
-        setArcDrag({ from: arcDrag.from, midY: Math.max(0.2, Math.min(Y_MAX + 4, (sideH - my) / s)) });
-        return;
-      }
-      if (!drag) {
-        e.currentTarget.style.cursor = hit(view, mx, my) ? "grab" : hitArc(view, mx, my) ? "ns-resize" : "default";
-        return;
-      }
-      // The line of sight is the selected touch's, and the dragged touch is selected.
-      setDrag({ frame: drag.frame, ...toWorld(view, mx, my, drag.pos, e.shiftKey) });
-    },
-    onPointerUp: () => {
-      if (arcDrag) {
-        const sg = p.segments.find((x) => x.from === arcDrag.from);
-        if (sg && Math.abs(sg.mid[1] - arcDrag.midY) > 0.03) p.onArc(arcDrag.from, arcDrag.midY);
-        setArcDrag(null);
-        return;
-      }
-      if (!drag) return;
-      const t = p.touches.find((x) => x.frame === drag.frame);
-      const moved = t && Math.hypot(t.position[0] - drag.pos[0], t.position[1] - drag.pos[1], t.position[2] - drag.pos[2]) > 0.05;
-      if (moved) p.onPin(drag.frame, drag.pos.map((v) => Math.round(v * 100) / 100) as V3);
-      setDrag(null);
-    },
-  });
 
   return (
     <div className={`court3d ${p.flash ? "flash" : ""}`} ref={wrapRef}>
       <div className="court3d-view">
-        <div className="court3d-title">From above</div>
-        <canvas ref={topRef} {...handlers("top")} />
-      </div>
-      <div className="court3d-view">
-        <div className="court3d-title">From the side · height</div>
-        <canvas ref={sideRef} {...handlers("side")} />
+        <div className="court3d-bar">
+          <label className="court3d-snap" title="Hold dragged touches to the camera's line of sight through the ball. Shift flips it for one drag.">
+            <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} /> Snap to line of sight
+          </label>
+        </div>
+        <RallyEditor3DView
+          w={w} h={h} positions={p.positions} touches={p.touches} segments={p.segments} calibration={p.calibration}
+          ray={ray} selected={p.selected} cur={p.cur} fps={p.fps} snap={snap}
+          onSelect={p.onSelect} onPin={p.onPin} onArc={p.onArc}
+        />
       </div>
       <div className="court3d-tools">
         <button className="inspect-btn" onClick={p.onUndo} disabled={!p.canUndo} title="Ctrl+Z">Undo</button>
@@ -369,24 +101,32 @@ export default function CourtEditor3D(p: Readonly<Props>) {
             Reset flight to automatic
           </button>
         )}
+        {selTouch && (
+          <label className="court3d-height" title="Height of the ball at this touch (m). Enter to set it.">
+            {selTouch.label} height
+            <input
+              key={`${selTouch.frame}:${selTouch.position[1]}`}
+              type="number" step={0.1} min={0} max={30}
+              defaultValue={selTouch.position[1].toFixed(2)}
+              onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+              onBlur={(e) => {
+                const y = Number(e.currentTarget.value);
+                const q = selTouch.position;
+                if (Number.isFinite(y) && y >= 0 && Math.abs(y - q[1]) > 0.005) p.onPin(selTouch.frame, [q[0], Math.round(y * 100) / 100, q[2]]);
+              }}
+            />
+            m
+          </label>
+        )}
         {selSegment?.warning && <span className="court3d-warn">This flight {selSegment.warning}.</span>}
       </div>
-      {p.spans && (
-        <div className="court3d-help">
-          <b style={{ color: SPAN_COLORS.fitted }}>green</b> fitted to the detections ·{" "}
-          <b style={{ color: SPAN_COLORS.refused }}>orange</b> refused flight, drawn along the detections ·{" "}
-          <b style={{ color: "#ff5252" }}>red dots</b> the arc the solver fitted there ·{" "}
-          <b style={{ color: SPAN_COLORS.bridge }}>grey</b> hole bridged or followed on ·{" "}
-          <b style={{ color: SPAN_COLORS.rebuilt }}>cyan</b> rebuilt from an edit · hollow rings: knots that are not touches ·{" "}
-          <b style={{ color: "#ff80ab" }}>pink squares</b> candidate players at the nearest knot
-        </div>
-      )}
       <div className="court3d-help">
         {selTouch
           ? <>Drag the <b style={{ color: touchColor(selTouch.label) }}>{selTouch.label}</b> to where the ball was played.
-              {ray ? " It snaps to the camera's line of sight (cyan): the ball is somewhere on it. Shift: place freely." : " The ball is hidden at this touch: place it freely."}</>
+              {ray ? ` The cyan line is the camera's line of sight: the ball is somewhere on it.${snap ? " Drags hold to it; Shift: place freely." : " Shift: hold to it."}` : " The ball is hidden at this touch."}</>
           : "Click a touch to select it, then drag it to where the ball was played. The flights either side follow."}
-        {" "}Drag a diamond in the side view to make that flight higher or flatter.
+        {" "}Grab the path anywhere else to put a touch there.
+        {" "}Drag a ball up or down for its height, or the ring under it along the floor (Alt flips) · drag empty space: orbit · right-drag: pan · wheel: zoom. Drag a diamond to make that flight higher or flatter.
       </div>
     </div>
   );
