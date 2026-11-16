@@ -475,6 +475,55 @@ def _detect_players(frame, model):
     return out, (arms if kps is not None else None)
 
 
+# The person detector was the slowest stage (YOLOv8m: ~39 ms a frame, filling
+# the GPU on its own). Measured on the 11 labelled clips with
+# python/bench_players.py (EVAL.md section 14):
+#   - YOLOv8s finds the players as well as YOLOv8m at half the time; YOLO11s
+#     and YOLO26 n/s/m were no better and no faster;
+#   - players move little in 0.1 s, so the detector runs on every
+#     _PLAYER_STRIDE-th frame at 25-30 fps and the frames between repeat the
+#     last result (moving the boxes in a straight line between detections
+#     scored worse: touches 1.4 m off instead of 1.2).
+# PLAYER_STRIDE=1 detects on every frame again.
+_PLAYER_STRIDE = max(1, int(os.environ.get("PLAYER_STRIDE", "2")))
+
+_player_model = None
+
+
+def _get_player_model():
+    """Lazy-load the person detector. Returns model or None.
+
+    PLAYER_MODEL names the weights; else a detector trained on your own
+    footage (python/train_players.py saves python/models/players.pt) when
+    there is one; else YOLOv8s, downloaded into the project root when missing.
+    """
+    global _player_model
+    if _player_model is not None:
+        return _player_model
+    try:
+        from ultralytics import YOLO
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        own = os.path.join(script_dir, "models", "players.pt")
+        path = os.environ.get("PLAYER_MODEL") or (
+            own if os.path.isfile(own) else os.path.abspath(os.path.join(script_dir, os.pardir, "yolov8s.pt")))
+        _player_model = YOLO(path)
+        print(f"[players] Loaded {path}", file=sys.stderr)
+    except Exception as e:
+        print(f"[players] No person detector ({e})", file=sys.stderr)
+    return _player_model
+
+
+def _fill_player_frames(players, n_frames):
+    """Players on every frame, given them on some (see _PLAYER_STRIDE)."""
+    last = None
+    for f in range(n_frames):
+        if f in players:
+            last = players[f]
+        elif last is not None:
+            players[f] = last
+    return players
+
+
 def _players_near_ball(boxes, aspect, cx_norm, cy_norm):
     """The boxes near the ball (aspect = width / height of the frame)."""
     out = []
@@ -2226,7 +2275,9 @@ def analyze_video_cv(video_path: str):
         # players near the ball (partly hidden ones especially), which cost
         # the touch anchors and dropped the labelled real clips from 66.6 to
         # 62.8. The pose model only adds arms, in a second pass (_arms_in_gaps).
-        person_model = _get_yolo_model()
+        person_model = _get_player_model()
+    # Frames between detections, in the same time at any frame rate.
+    player_stride = max(1, int(round(_PLAYER_STRIDE * _FRAME_SCALE)))
     ball_players = {}  # frame_idx -> person boxes near the ball
     all_players = {}   # frame_idx -> every person box
     all_arms = {}      # frame_idx -> arm keypoints per box, in short ball gaps only
@@ -2404,7 +2455,7 @@ def analyze_video_cv(video_path: str):
         if want_mask or want_court:
             to_court.put((frame_idx, timestamp, frame, want_mask, want_court))
 
-        if person_model is not None:
+        if person_model is not None and frame_idx % player_stride == 0:
             try:
                 with _timed("players"):
                     all_players[frame_idx], _ = _detect_players(frame, person_model)
@@ -2442,6 +2493,7 @@ def analyze_video_cv(video_path: str):
             )
         frame_idx += 1
 
+    _fill_player_frames(all_players, frame_idx)
     to_motion.put(_DONE)
     to_court.put(_DONE)
     motion_thread.join()
@@ -2751,7 +2803,7 @@ def main():
     if "--warm" in sys.argv and HAS_CV2 and HAS_TORCH:
         t0 = time.time()
         _get_tracknet_detector()
-        _get_yolo_model()     # players (and the ball when TrackNet is unavailable)
+        _get_player_model()
         _get_pose_model()     # arms
         print(f"[analyzer] Detectors loaded in {time.time() - t0:.1f}s", file=sys.stderr)
 

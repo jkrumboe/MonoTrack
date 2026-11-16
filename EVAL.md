@@ -319,3 +319,41 @@ Not done: the net and lens distortion in the court calibration. The eval scores 
 Found on the way: with `torch.backends.cudnn.benchmark` on (set by the TrackNet detector), cuDNN picks its kernels by timing, and the player boxes then differ in the third decimal from run to run. That alone moves the holdout score by up to 0.7. With it off, two runs are identical.
 
 Next for speed: a TensorRT engine for the person detector (not installed here, so not tried), or running the detector only where the ball is in play, which is also what full-length matches need.
+
+## 14. Person detector: which model, and making your own (2026-11-16)
+
+After section 13 the person detector was the bottleneck: YOLOv8m at 1280 px took ~39 ms a frame and filled the GPU on its own. `python/bench_players.py` swaps the detector, times it on the 11 labelled clips and rebuilds the fixtures' player fields, so the eval shows what a detector does to the touches.
+
+| Detector (1280 px unless noted) | ms per video frame | People per frame | Tuning score | Holdout score | Touch pos, tuning / holdout (m) |
+|---|---|---|---|---|---|
+| YOLOv8m, every frame (before) | 38.8 | 33.7 | 75.7 | 75.2 | 1.18 / 1.61 |
+| YOLOv8m at 960 px | 22.9 | 26.7 | 74.9 | 75.2 | 1.28 / 1.74 |
+| YOLOv8m, every 2nd frame | 17.3 | 33.7 | 75.2 | 75.6 | 1.23 / 1.57 |
+| YOLOv8m, every 3rd frame | 11.2 | 33.7 | 75.5 | 75.2 | 1.19 / 1.58 |
+| YOLOv8s | 18.5 | 35.6 | 75.8 | 76.9 | 1.16 / 1.45 |
+| **YOLOv8s, every 2nd frame (now)** | **9.9** | 35.5 | 75.2 | 77.4 | 1.21 / 1.44 |
+| YOLOv8s, every 3rd frame | 5.9 | 35.5 | 75.5 | 74.1 | 1.17 / 1.56 |
+| YOLO11s | 21.9 | 27.1 | 74.9 | 73.2 | 1.31 / 1.75 |
+| YOLO26n | 23.4 | 24.7 | 75.7 | 75.7 | 1.21 / 1.77 |
+| YOLO26s | 23.1 | 23.0 | 74.7 | 74.4 | 1.56 / 1.59 |
+| YOLO26s at 960 px | 21.9 | 16.5 | 74.5 | 75.2 | 1.37 / 1.61 |
+| YOLO26m | 38.9 | 29.6 | 75.3 | 73.1 | 1.23 / 1.74 |
+
+- **YOLOv8s finds the players as well as YOLOv8m in half the time.** The newer YOLO11 and YOLO26 models were neither faster nor better here: every small model costs ~22 ms at 1280 px whatever its size, so the time is in the resolution, not the network, and they find fewer of the far players.
+- **Every 2nd frame is enough.** Frames between detections repeat the last boxes. Moving the boxes in a straight line between detections instead scored worse (touch position 1.38-1.46 m against 1.19).
+- Two runs of the same setup differ by about a point on the holdout score (section 13), so the rows from 74 to 77 cannot be told apart on 11 clips. Resolution is the one clear effect: at 960 px the touch position gets worse.
+
+**Now:** YOLOv8s on every 2nd frame (`PLAYER_STRIDE`, `PLAYER_MODEL` to change). All 11 clips: 302 s at the start of section 13 → **136 s (1.36 s per second of video)**; tuning 75.2, holdout 77.4, touch position 1.21 / 1.45 m.
+
+### Where the time goes now
+
+`usa_jap_r3` (19.2 s, moving camera), 27 s: ball pass 12.3 s, of which ~7 s is warping full 1080p frames to cancel the camera motion and ~4.3 s the network; camera motion 10.2 s on its own thread, which is what pass 1 now waits for; players 6.4 s; court 4.8 s (own thread); arms 3.0 s. On a camera that does not move the warp is skipped: the same clip without it takes 22.4 s (1.17 s per second).
+
+Tried on the warp and not kept: sampling the frame once per network pixel (12 ms a frame faster, but one more false touch on the holdout clips in each of two paired comparisons), and computing only the pixels the network reads with the same two-step sampling (pixels equal to within one grey level, but slower in Python than OpenCV's full warp).
+
+### Making your own detector
+
+No published volleyball model was better than what is used: VballNet scores 55 against TrackNetV2's 71 here (see `_get_tracknet_detector`), TrackNetV5 has no volleyball weights, and the public volleyball player datasets are small Roboflow sets from other camera positions. What can be made from your own footage:
+
+- **Players**: `python/train_players.py`. A large detector labels every 5th frame of your videos, keeping only people on or near the court where the clip has a court, and a small one is trained on those labels (`label`, then `train`; it saves `python/models/players.pt`, which the analyzer then uses). Tested end to end with one epoch; no real training run was done, so whether a trained student beats YOLOv8s is not measured. Compare it with `python/bench_players.py mine python/models/players.pt --stride 2`. The court filter leaves ~16 people a frame instead of ~35.
+- **Ball**: `python/label_ball.py` and `python/train_ball.py` (section 11) fine-tune TrackNetV2 on hand-labelled frames and keep the new weights only if they score better on held-out frames. This is where tripod footage will need it most.

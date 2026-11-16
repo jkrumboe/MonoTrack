@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # The detectors save weights next to their module (python/models/), so they
 # run from /app/python; the full COPY below replaces these files with the same ones.
 COPY python/ball_tracknet.py python/ball_tracknetv3.py python/ball_vballnet.py /app/python/
-RUN cd /app && python -c "from ultralytics import YOLO; YOLO('yolov8m.pt'); YOLO('yolov8m-pose.pt')" \
+RUN cd /app && python -c "from ultralytics import YOLO; YOLO('yolov8s.pt'); YOLO('yolov8m.pt'); YOLO('yolov8m-pose.pt')" \
  && cd /app/python && python -c "\
 import ball_tracknet, ball_tracknetv3, ball_vballnet; \
 ball_tracknet.ensure_weights(); \
