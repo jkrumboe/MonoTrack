@@ -60,6 +60,7 @@ class CameraMotion:
         self.ref = 0
         self.orb = cv2.ORB_create(1500)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.key_orb = None           # (keyframe gray, its ORB keypoints, descriptors)
 
     # ── per-frame update ──────────────────────────────────────────────────
     def update(self, frame):
@@ -101,7 +102,11 @@ class CameraMotion:
         return H, inl
 
     def _orb_step(self, key, cur):
-        k1, d1 = self.orb.detectAndCompute(key, None)
+        # A keyframe is matched against later frames until one replaces it:
+        # its features are found once.
+        if self.key_orb is None or self.key_orb[0] is not key:
+            self.key_orb = (key, *self.orb.detectAndCompute(key, None))
+        k1, d1 = self.key_orb[1], self.key_orb[2]
         k2, d2 = self.orb.detectAndCompute(cur, None)
         if d1 is None or d2 is None:
             return None, 0

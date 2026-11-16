@@ -170,6 +170,25 @@ def _get_pose_model():
 # Line masks spread over a clip for the multi-frame court fit.
 COURT_FIT_MASKS = 16
 
+# Seconds spent per stage of the analysis in progress, printed as one [time]
+# line at its end and read by bench_pipeline.py. Stages on worker threads run
+# alongside the others, so the stages can add up to more than the total.
+stage_seconds = {}
+
+
+class _timed:
+    """with _timed("players"): ... adds the block's duration to stage_seconds."""
+
+    def __init__(self, stage):
+        self.stage = stage
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+
+    def __exit__(self, *exc):
+        stage_seconds[self.stage] = stage_seconds.get(self.stage, 0.0) + time.perf_counter() - self.t0
+        return False
+
 
 def _fit_court_to_lines(entry, candidates, all_frame_data, line_masks, motion, fh, fw):
     """Pick the court the painted lines support best, and snap it onto them.
@@ -435,17 +454,21 @@ def _detect_players(frame, model):
     """
     h, w = frame.shape[:2]
     # Half precision on a GPU: ~2x faster, the same people found. Full
-    # resolution stays: at 960 far-side players were lost.
+    # resolution stays: at 960 far-side players were lost. One frame per call:
+    # the detector alone fills the GPU, and batches of 4-16 frames were slower
+    # per frame (43 ms against 30 on an RTX 3070 Ti).
     results = model.predict(frame, classes=[_PERSON_CLASS], conf=0.25,
                             verbose=False, imgsz=_BALL_IMGSZ,
                             quantize=16 if _HALF_OK else None)
     r = results[0]
     kps = r.keypoints.data.tolist() if getattr(r, "keypoints", None) is not None else None
+    # One transfer for the frame, not one per box.
+    xyxy = r.boxes.xyxy.tolist()
+    conf = r.boxes.conf.tolist()
     out, arms = [], []
-    for i, box in enumerate(r.boxes):
-        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
+    for i, (x1, y1, x2, y2) in enumerate(xyxy):
         out.append([round(x1 / w, 5), round(y1 / h, 5), round(x2 / w, 5), round(y2 / h, 5),
-                    round(float(box.conf[0]), 3)])
+                    round(conf[i], 3)])
         if kps is not None:
             arms.append([[round(kps[i][j][0] / w, 5), round(kps[i][j][1] / h, 5), round(kps[i][j][2], 2)]
                          for j in _ARM_KEYPOINTS])
@@ -2183,6 +2206,8 @@ def analyze_video_cv(video_path: str):
 
     send_progress(0, f"Analyzing {total_frames} frames at {fps:.1f} FPS...")
     _set_frame_rate(fps)
+    stage_seconds.clear()
+    t_start = time.perf_counter()
 
     court_interval = max(int(fps), 1)
     global _prev_corners, _last_court_keypoints
@@ -2273,12 +2298,81 @@ def analyze_video_cv(video_path: str):
 
     def _track_motion():
         while (f := to_motion.get()) is not _DONE:
-            motion.update(f)
+            with _timed("camera_motion"):
+                motion.update(f)
+
+    def _court_frame(fi, timestamp, frame, want_mask, want_court):
+        """Line mask and court search on one sampled frame."""
+        fh, fw = frame.shape[:2]
+        full_mask = None
+        try:
+            from court_lines import white_line_mask
+            full_mask = white_line_mask(frame)
+            if want_mask:
+                line_masks[fi] = full_mask
+        except Exception as e:
+            print(f"[court] Line mask at frame {fi}: {e}", file=sys.stderr)
+        if not want_court:
+            return
+        try:
+            corners = None
+            # Painted-line fit first: it handles side cameras and courts
+            # whose baselines are out of shot, which the colour detector
+            # cannot (python/bench_court_lines.py scores both).
+            try:
+                from court_lines import detect_court_lines
+                corners, cinfo = detect_court_lines(frame, full_mask=full_mask)
+                if corners is None:
+                    print(f"[court] Frame {fi}: lines: {cinfo}", file=sys.stderr)
+                else:
+                    court_quality[fi] = cinfo["quality"] * cinfo["contrast"]
+                    print(f"[court] Frame {fi}: lines: {cinfo['view']} view "
+                          f"quality={cinfo['quality']} contrast={cinfo['contrast']} "
+                          f"fovY={cinfo['fov_y']}", file=sys.stderr)
+            except Exception as le:
+                print(f"[court] line detector failed ({le})", file=sys.stderr)
+            if corners is None:
+                try:
+                    from court_detect import detect_court_corners
+                    corners, cinfo = detect_court_corners(frame)
+                    if corners is None and fi % 60 == 0:
+                        print(f"[court] Frame {fi}: {cinfo}", file=sys.stderr)
+                    elif corners is not None and fi % 60 == 0:
+                        print(f"[court] Frame {fi}: {cinfo['hypothesis']} "
+                              f"score={cinfo['score']} lines={cinfo['lines']}", file=sys.stderr)
+                except Exception as ce:
+                    print(f"[court] colour detector failed ({ce}); using Hough", file=sys.stderr)
+            if corners is None:
+                # Fall back to the old line-based detector.
+                corners = _detect_court_hough_fast(frame)
+            if corners is not None:
+                camC = _court_quad_score(corners, fh, fw)
+                if camC is None:
+                    print(f"[court] Frame {fi}: quad rejected "
+                          f"(no plausible camera)", file=sys.stderr)
+                else:
+                    court_candidates.append((camC, fi, timestamp, corners))
+                    print(f"[court] Frame {fi}: candidate cam="
+                          f"[{camC[0]:.1f}, {camC[1]:.1f}, {camC[2]:.1f}]", file=sys.stderr)
+        except Exception as e:
+            print(f"[court] Frame {fi} error: {e}", file=sys.stderr)
+
+    # The court search is CPU work too (about 0.25 s a sampled frame), so it
+    # has its own thread instead of holding up the detectors. Frames arrive in
+    # order, so the candidates are found in the order they always were.
+    to_court = queue.Queue(maxsize=8)
+
+    def _search_court():
+        while (job := to_court.get()) is not _DONE:
+            with _timed("court"):
+                _court_frame(*job)
 
     decode_thread = threading.Thread(target=_decode, daemon=True)
     motion_thread = threading.Thread(target=_track_motion, daemon=True)
+    court_thread = threading.Thread(target=_search_court, daemon=True)
     decode_thread.start()
     motion_thread.start()
+    court_thread.start()
 
     # A court placed by hand on an earlier clip of the same match (same camera
     # spot, so the venue matches) is the starting point when there is one. The
@@ -2302,65 +2396,18 @@ def analyze_video_cv(video_path: str):
             except Exception as e:
                 print(f"[court] Saved-court lookup failed: {e}", file=sys.stderr)
 
-        if frame_idx % LINE_MASK_STRIDE == 0:
-            try:
-                from court_lines import white_line_mask
-                line_masks[frame_idx] = white_line_mask(frame)
-            except Exception as e:
-                print(f"[court] Line mask at frame {frame_idx}: {e}", file=sys.stderr)
-
-        frame_court_corners = None
-        frame_court_keypoints = None
+        want_mask = frame_idx % LINE_MASK_STRIDE == 0
         # Sample several frames rather than trusting whichever quad frame 0
         # happened to produce: a single bad detection there poisons the
         # calibration and therefore every 3D position in the clip.
-        if frame_idx <= COURT_SEARCH_LAST_FRAME                 and frame_idx % COURT_SEARCH_STRIDE == 0:
-            try:
-                corners = None
-                # Painted-line fit first: it handles side cameras and courts
-                # whose baselines are out of shot, which the colour detector
-                # cannot (python/bench_court_lines.py scores both).
-                try:
-                    from court_lines import detect_court_lines
-                    corners, cinfo = detect_court_lines(frame)
-                    if corners is None:
-                        print(f"[court] Frame {frame_idx}: lines: {cinfo}", file=sys.stderr)
-                    else:
-                        court_quality[frame_idx] = cinfo["quality"] * cinfo["contrast"]
-                        print(f"[court] Frame {frame_idx}: lines: {cinfo['view']} view "
-                              f"quality={cinfo['quality']} contrast={cinfo['contrast']} "
-                              f"fovY={cinfo['fov_y']}", file=sys.stderr)
-                except Exception as le:
-                    print(f"[court] line detector failed ({le})", file=sys.stderr)
-                if corners is None:
-                    try:
-                        from court_detect import detect_court_corners
-                        corners, cinfo = detect_court_corners(frame)
-                        if corners is None and frame_idx % 60 == 0:
-                            print(f"[court] Frame {frame_idx}: {cinfo}", file=sys.stderr)
-                        elif corners is not None and frame_idx % 60 == 0:
-                            print(f"[court] Frame {frame_idx}: {cinfo['hypothesis']} "
-                                  f"score={cinfo['score']} lines={cinfo['lines']}", file=sys.stderr)
-                    except Exception as ce:
-                        print(f"[court] colour detector failed ({ce}); using Hough", file=sys.stderr)
-                if corners is None:
-                    # Fall back to the old line-based detector.
-                    corners = _detect_court_hough_fast(frame)
-                if corners is not None:
-                    camC = _court_quad_score(corners, fh, fw)
-                    if camC is None:
-                        print(f"[court] Frame {frame_idx}: quad rejected "
-                              f"(no plausible camera)", file=sys.stderr)
-                    else:
-                        court_candidates.append((camC, frame_idx, timestamp, corners))
-                        print(f"[court] Frame {frame_idx}: candidate cam="
-                              f"[{camC[0]:.1f}, {camC[1]:.1f}, {camC[2]:.1f}]", file=sys.stderr)
-            except Exception as e:
-                print(f"[court] Frame {frame_idx} error: {e}", file=sys.stderr)
+        want_court = frame_idx <= COURT_SEARCH_LAST_FRAME and frame_idx % COURT_SEARCH_STRIDE == 0
+        if want_mask or want_court:
+            to_court.put((frame_idx, timestamp, frame, want_mask, want_court))
 
         if person_model is not None:
             try:
-                all_players[frame_idx], _ = _detect_players(frame, person_model)
+                with _timed("players"):
+                    all_players[frame_idx], _ = _detect_players(frame, person_model)
             except Exception as e:
                 print(f"[players] Frame {frame_idx} error: {e}", file=sys.stderr)
 
@@ -2383,8 +2430,8 @@ def analyze_video_cv(video_path: str):
         all_frame_data.append({
             'frame': frame_idx,
             'timestamp': timestamp,
-            'corners': frame_court_corners,
-            'keypoints': frame_court_keypoints,
+            'corners': None,
+            'keypoints': None,
         })
 
         percent = int((frame_idx + 1) / max(total_frames, 1) * 100)
@@ -2396,7 +2443,9 @@ def analyze_video_cv(video_path: str):
         frame_idx += 1
 
     to_motion.put(_DONE)
+    to_court.put(_DONE)
     motion_thread.join()
+    court_thread.join()
 
     # ── Pick the best-scoring court detection across the sampled frames ────
     if saved_corners is not None:
@@ -2457,8 +2506,9 @@ def analyze_video_cv(video_path: str):
     motion.set_reference(ref_frame)
     camera_moving = not motion.is_static()
     if court_data and line_masks:
-        _fit_court_to_lines(court_data[0], [(c[1], c[3]) for c in court_candidates],
-                            all_frame_data, line_masks, motion, fh, fw)
+        with _timed("court_fit"):
+            _fit_court_to_lines(court_data[0], [(c[1], c[3]) for c in court_candidates],
+                                all_frame_data, line_masks, motion, fh, fw)
     if camera_moving:
         zooms = [z for z in (motion.zoom(i) for i in range(frame_idx)) if z]
         n_bad = sum(1 for i in range(frame_idx) if motion.ref_from_frame(i) is None)
@@ -2480,19 +2530,19 @@ def analyze_video_cv(video_path: str):
             if hasattr(tracknet, "begin_clip"):
                 tracknet.begin_clip(video_path, ball_motion)
             stream = WindowStream(tracknet, getattr(tracknet, "stride", None), ball_motion)
-            cap2 = cv2.VideoCapture(video_path)
+            cap = cv2.VideoCapture(video_path)
+            decoded = queue.Queue(maxsize=32)
+            threading.Thread(target=_decode, daemon=True).start()
             fi2 = 0
-            while True:
-                ret2, frame2 = cap2.read()
-                if not ret2:
-                    break
-                _take_ball(stream.push(frame2))
-                fi2 += 1
-                percent = int(fi2 / max(total_frames, 1) * 100)
-                if percent % 5 == 0:
-                    send_progress(33 + percent // 7, f"Tracking the ball: frame {fi2}/{total_frames}")
-            _take_ball(stream.flush())
-            cap2.release()
+            with _timed("ball"):
+                while (frame2 := decoded.get()) is not _DONE:
+                    _take_ball(stream.push(frame2))
+                    fi2 += 1
+                    percent = int(fi2 / max(total_frames, 1) * 100)
+                    if percent % 5 == 0:
+                        send_progress(33 + percent // 7, f"Tracking the ball: frame {fi2}/{total_frames}")
+                _take_ball(stream.flush())
+            cap.release()
         except Exception as e:
             # Nothing tracked: the safety net below then retries with YOLO.
             print(f"[{tracknet.name}] Ball pass failed: {e}", file=sys.stderr)
@@ -2541,7 +2591,8 @@ def analyze_video_cv(video_path: str):
     ball_raw = _reject_ball_outliers(ball_raw)
     ball_path = _interpolate_ball_path(ball_raw)
     if all_players:
-        all_arms = _arms_in_gaps(video_path, ball_raw, all_players, fps)
+        with _timed("arms"):
+            all_arms = _arms_in_gaps(video_path, ball_raw, all_players, fps)
     n_ball_detected = len(ball_raw)
     n_ball_total = len(ball_path)
     print(f"[ball] {detector_name}: {n_ball_candidates} candidates -> {n_ball_detected} tracked, "
@@ -2641,6 +2692,10 @@ def analyze_video_cv(video_path: str):
         if fi % 200 == 0 and fi > 0:
             pct = 70 + int(fi / max(n_frames, 1) * 28)
             send_progress(pct, f"Sending frame {fi + 1}/{n_frames}")
+
+    stage_seconds["total"] = time.perf_counter() - t_start
+    print("[time] " + ", ".join(f"{k} {v:.1f}s" for k, v in stage_seconds.items())
+          + f" ({stage_seconds['total'] / max(frame_idx / fps, 1e-9):.2f} s per s of video)", file=sys.stderr)
 
     send({
         "action": "complete",

@@ -12,7 +12,7 @@ one video. The 3D solver runs in the app (TypeScript) and is timed by
 `npm run eval`, not here.
 
 Prints one line of JSON at the end (also appended to runs/bench_pipeline.jsonl):
-analysis seconds, seconds per second of video, peak VRAM added (MiB, from
+analysis seconds, seconds per stage, seconds per second of video, peak VRAM added (MiB, from
 nvidia-smi, so it covers ONNX and OpenCV too), mean and peak GPU power (W),
 GPU utilisation, CPU model.
 """
@@ -108,7 +108,7 @@ def analyse(video):
     dt = time.perf_counter() - t0
     frames = sum(1 for m in messages if m.get("action") == "frame")
     balls = sum(1 for m in messages if m.get("action") == "frame" and m.get("ball_img_pos") and not m.get("ball_interpolated"))
-    return dt, frames, balls
+    return dt, frames, balls, {k: round(v, 2) for k, v in analyzer.stage_seconds.items()}
 
 
 def main():
@@ -136,7 +136,7 @@ def main():
     watch.start()
     times = []
     for _ in range(args.repeat):
-        dt, frames, balls = analyse(video)
+        dt, frames, balls, stages = analyse(video)
         times.append(dt)
     watch.stop()
 
@@ -149,6 +149,9 @@ def main():
         "size": f"{size[0]}x{size[1]}", "frames": frames, "frames_with_ball": balls,
         "analysis_s": round(times[len(times) // 2], 2), "analysis_s_best": round(times[0], 2),
         "s_per_s_of_video": round(times[len(times) // 2] / (n / fps), 2),
+        # Seconds per stage of the last run. Camera motion and the court search
+        # run on their own threads, alongside the players.
+        "stages_s": stages,
         "warmup_s": round(warmup, 1),
         "vram_idle_mib": idle[0] if idle else None,
         "vram_peak_mib": max(mem) if mem else None,

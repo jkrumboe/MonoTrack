@@ -443,6 +443,8 @@ class TrackNetBallDetector:
         self.half = self.device.type == "cuda"
         if self.half:
             torch.backends.cudnn.benchmark = True
+        self._mean = torch.tensor(IMAGENET_MEAN, device=self.device).view(3, 1, 1, 1)
+        self._std = torch.tensor(IMAGENET_STD, device=self.device).view(3, 1, 1, 1)
         self.threshold = threshold
         self.affine = None
         self.last_heatmaps = None
@@ -458,17 +460,21 @@ class TrackNetBallDetector:
             not a plain stretch;
           - RGB, ToTensor (/255), then ImageNet mean/std normalisation.
         Feeding raw [0,1] pixels was the main reason the model never fired.
+
+        Only the resize runs on the CPU; the colour order and normalisation
+        are done on the device (in float32 on the CPU they took as long as
+        the network itself).
         """
         h, w = frames_bgr[0].shape[:2]
         self.affine = letterbox_affine(w, h)
-        chans = []
-        for f in frames_bgr:
-            img = cv2.warpAffine(f, self.affine, (INPUT_W, INPUT_H), flags=cv2.INTER_LINEAR)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            img = (img - IMAGENET_MEAN) / IMAGENET_STD
-            chans.append(img.transpose(2, 0, 1))  # HWC -> CHW
-        stacked = np.concatenate(chans, axis=0)   # (9, H, W), oldest frame first
-        return torch.from_numpy(stacked).unsqueeze(0).to(self.device)
+        small = np.empty((len(frames_bgr), INPUT_H, INPUT_W, 3), np.uint8)
+        for j, f in enumerate(frames_bgr):
+            cv2.warpAffine(f, self.affine, (INPUT_W, INPUT_H), dst=small[j], flags=cv2.INTER_LINEAR)
+        x = torch.from_numpy(small).to(self.device)
+        # (frame, H, W, BGR) -> (frame, RGB, H, W) in 0-1, oldest frame first.
+        x = x.permute(0, 3, 1, 2).flip(1).float().div_(255.0)
+        x = (x - self._mean.view(1, 3, 1, 1)) / self._std.view(1, 3, 1, 1)
+        return x.reshape(1, 3 * len(frames_bgr), INPUT_H, INPUT_W)   # (1, 9, H, W)
 
     def heatmaps(self, frames_bgr):
         """Raw sigmoid heatmaps (3, 288, 512) for a 3-frame window, for debugging."""
