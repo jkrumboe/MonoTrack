@@ -887,47 +887,91 @@ export function createCourt(): THREE.Group {
   addCourtLine(group, lineMaterial, -halfW,  ATTACK_DIST, halfW,  ATTACK_DIST);
 
   // ── Net assembly ───────────────────────────────────────────────────────
+  // A real net is 9.5–10 m wide (wider than the 9 m court), hung on a steel
+  // cable strung between the poles, with a bottom rope and end lacing tying
+  // each side to its pole. Without those the net reads as floating.
   const netDrop = 1.0;
   const netTopY = NET_HEIGHT;
   const netBottomY = NET_HEIGHT - netDrop;
   const netCenterY = (netTopY + netBottomY) / 2;
+  const netHalfW = 5.0;                 // 10 m net
+  const poleOffset = halfW + 0.9;       // poles 0.9 m outside the sidelines
+  const poleHeight = NET_HEIGHT + 0.25;
+  const topCableY = netTopY - 0.035;
+  const bottomRopeY = netBottomY + 0.025;
 
+  // Netting: a tiled 10 cm square-mesh texture. Mipmapping fades it to a
+  // soft grey at distance instead of the shimmering hairlines a
+  // LineSegments grid gives.
+  const meshTex = makeNetTexture();
+  meshTex.repeat.set((2 * netHalfW) / 0.1, netDrop / 0.1);
   const netPanel = new THREE.Mesh(
-    new THREE.PlaneGeometry(COURT_WIDTH, netDrop),
+    new THREE.PlaneGeometry(2 * netHalfW, netDrop - 0.06),
     new THREE.MeshStandardMaterial({
-      color: 0x0f0f14,
+      map: meshTex,
+      color: 0xe8e8e8,
       transparent: true,
-      opacity: 0.38,
+      alphaTest: 0.05,
       side: THREE.DoubleSide,
       depthWrite: false,
+      roughness: 0.9,
     })
   );
-  netPanel.position.set(0, netCenterY, 0);
+  netPanel.name = "net-mesh";
+  netPanel.position.set(0, netCenterY - 0.005, 0);
   group.add(netPanel);
 
-  // 10 cm mesh, matching a real net.
-  const gridPoints: THREE.Vector3[] = [];
-  const cell = 0.1;
-  for (let x = -halfW; x <= halfW + 1e-6; x += cell) {
-    gridPoints.push(new THREE.Vector3(x, netBottomY, 0), new THREE.Vector3(x, netTopY, 0));
-  }
-  for (let y = netBottomY; y <= netTopY + 1e-6; y += cell) {
-    gridPoints.push(new THREE.Vector3(-halfW, y, 0), new THREE.Vector3(halfW, y, 0));
-  }
-  const netGrid = new THREE.LineSegments(
-    new THREE.BufferGeometry().setFromPoints(gridPoints),
-    new THREE.LineBasicMaterial({ color: 0xdcdcdc, transparent: true, opacity: 0.3, depthWrite: false })
-  );
-  group.add(netGrid);
-
+  // Top and bottom tape span the full net width.
   const tapeMaterial = new THREE.MeshStandardMaterial({ color: 0xf7f7f7, roughness: 0.7 });
-  const topTape = new THREE.Mesh(new THREE.BoxGeometry(COURT_WIDTH + 0.02, 0.07, 0.05), tapeMaterial);
-  topTape.position.set(0, netTopY - 0.035, 0);
+  const topTape = new THREE.Mesh(new THREE.BoxGeometry(2 * netHalfW, 0.07, 0.05), tapeMaterial);
+  topTape.position.set(0, topCableY, 0);
   group.add(topTape);
 
-  const bottomTape = new THREE.Mesh(new THREE.BoxGeometry(COURT_WIDTH + 0.02, 0.05, 0.04), tapeMaterial);
-  bottomTape.position.set(0, netBottomY + 0.025, 0);
+  const bottomTape = new THREE.Mesh(new THREE.BoxGeometry(2 * netHalfW, 0.05, 0.04), tapeMaterial);
+  bottomTape.position.set(0, bottomRopeY, 0);
   group.add(bottomTape);
+
+  // Steel top cable running pole to pole through the top tape, and the
+  // bottom rope from the net's lower corners to the poles.
+  const cableMaterial = new THREE.MeshStandardMaterial({ color: 0x3a3f46, metalness: 0.7, roughness: 0.35 });
+  const ropeMaterial = new THREE.MeshStandardMaterial({ color: 0xcfcfcf, roughness: 0.85 });
+  const addSpan = (x0: number, x1: number, y: number, r: number, mat: THREE.Material) => {
+    const len = Math.abs(x1 - x0);
+    const span = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 8), mat);
+    span.rotation.z = Math.PI / 2;
+    span.position.set((x0 + x1) / 2, y, 0);
+    group.add(span);
+  };
+  addSpan(-poleOffset, poleOffset, topCableY, 0.007, cableMaterial);
+  for (const sign of [-1, 1]) {
+    addSpan(sign * netHalfW, sign * poleOffset, bottomRopeY, 0.006, ropeMaterial);
+  }
+
+  // End rods through the net's side edges, laced to the pole.
+  const rodMaterial = new THREE.MeshStandardMaterial({ color: 0x8a6a45, roughness: 0.7 });
+  const lacePoints: THREE.Vector3[] = [];
+  for (const sign of [-1, 1]) {
+    const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, netDrop, 10), rodMaterial);
+    rod.position.set(sign * netHalfW, netCenterY, 0);
+    group.add(rod);
+
+    // Zig-zag lacing between rod and pole.
+    const laces = 6;
+    for (let i = 0; i < laces; i++) {
+      const y0 = netBottomY + 0.1 + (i * (netDrop - 0.2)) / laces;
+      const y1 = netBottomY + 0.1 + ((i + 1) * (netDrop - 0.2)) / laces;
+      lacePoints.push(
+        new THREE.Vector3(sign * netHalfW, y0, 0),
+        new THREE.Vector3(sign * (poleOffset - 0.05), (y0 + y1) / 2, 0),
+        new THREE.Vector3(sign * (poleOffset - 0.05), (y0 + y1) / 2, 0),
+        new THREE.Vector3(sign * netHalfW, y1, 0),
+      );
+    }
+  }
+  group.add(new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(lacePoints),
+    new THREE.LineBasicMaterial({ color: 0xd8d8d8, transparent: true, opacity: 0.8 })
+  ));
 
   // Vertical side bands sit directly above the sidelines and mark the
   // in-bounds width of the net.
@@ -953,25 +997,57 @@ export function createCourt(): THREE.Group {
     }
   }
 
-  // Poles, set back from the sidelines as the rules require.
-  const poleOffset = halfW + 0.9;
-  const poleHeight = NET_HEIGHT + 0.55;
-  const poleMaterial = new THREE.MeshStandardMaterial({ color: 0x8b9199, metalness: 0.55, roughness: 0.4 });
+  // Poles, set back from the sidelines as the rules require, with the
+  // padded sleeve used in competition, a cap, a winch for the top cable and
+  // a floor plate.
+  const poleMaterial = new THREE.MeshStandardMaterial({ color: 0xa3a9b0, metalness: 0.6, roughness: 0.35 });
+  const padMaterial = new THREE.MeshStandardMaterial({ color: 0x2f5f9e, roughness: 0.8 });
+  const padHeight = 1.9;
   for (const sign of [-1, 1]) {
-    const pole = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.055, 0.055, poleHeight, 20), poleMaterial
-    );
-    pole.position.set(sign * poleOffset, poleHeight / 2, 0);
+    const x = sign * poleOffset;
+
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, poleHeight, 20), poleMaterial);
+    pole.position.set(x, poleHeight / 2, 0);
     group.add(pole);
 
-    const base = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.22, 0.26, 0.06, 20), poleMaterial
-    );
-    base.position.set(sign * poleOffset, 0.03, 0);
+    const cap = new THREE.Mesh(new THREE.SphereGeometry(0.05, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2), poleMaterial);
+    cap.position.set(x, poleHeight, 0);
+    group.add(cap);
+
+    const pad = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, padHeight, 24), padMaterial);
+    pad.position.set(x, padHeight / 2 + 0.02, 0);
+    group.add(pad);
+
+    // Winch housing on the outside face, where the top cable is tensioned.
+    const winch = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.14, 0.1), cableMaterial);
+    winch.position.set(x + sign * 0.07, topCableY - 0.2, 0);
+    group.add(winch);
+
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.22, 0.03, 24), poleMaterial);
+    base.position.set(x, 0.0, 0);
     group.add(base);
   }
 
   return group;
+}
+
+/** One 10 cm net cell: a transparent square bordered by a cord, tiled across the net. */
+function makeNetTexture(): THREE.Texture {
+  const size = 32;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  ctx.clearRect(0, 0, size, size);
+  ctx.strokeStyle = "rgba(255,255,255,0.95)";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.anisotropy = 8;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
 /** Draw a court line of official width as a flat quad on the playing surface. */
