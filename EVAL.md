@@ -285,3 +285,37 @@ Checked for this: `export_fixture.py` on a static 30 fps clip reproduces the com
 | `npm run eval:splits` | every candidate touch split with its evidence, on the synthetic and tuning clips |
 | `npm test` | unit tests, per-case regression gate (raised to the current scores), acceptance tests, coverage floor, editor re-fit tests |
 | `python python/bench_pipeline.py clip.mp4 --seconds 10` | analysis time, VRAM, GPU power |
+
+## 13. Analysis speed (2026-11-16)
+
+Same machine and clips as section 7, measured with `python python/bench_pipeline.py` (warm).
+
+| | 10 s rally | 19.2 s rally | All 11 eval clips (99 s) |
+|---|---|---|---|
+| Before | 32.3 s | 54.9 s | 302 s (3.04 s per s of video) |
+| After | **19.7 s** | **37.3 s** | **~215 s (2.1-2.2 s per s)** |
+
+What changed:
+- **Court search**: `white_line_mask` in 8-bit integers (140 → ~15 ms a frame, bit-identical) and the line assignments scored as arrays (690 → 230 ms a sampled frame, same winner). It now runs on its own thread instead of inside the frame loop.
+- **Ball**: colour order and normalisation on the GPU (heatmaps identical), pass 2 decoded on a thread.
+- **Camera motion**: the keyframe's ORB features are found once.
+- `bench_pipeline.py` reports seconds per stage (`stages_s`); the analyzer prints a `[time]` line.
+
+Results are unchanged: ball positions and camera homographies are identical to before on all 11 clips, the tuning-set score is 75.7 as before. The laptop's GPU throttles with heat within seconds, so single timings vary by ±15%; the totals over all clips are the reliable figure.
+
+Where the time goes now (19.2 s rally): players 18.5 s, ball 13.8 s, camera motion 12.8 s and court 6.2 s (both on their own threads), arms 3.4 s. The person detector fills the GPU by itself (~30 ms a frame), so it is the limit.
+
+Tried and not kept:
+- **Batches of frames for the person detector**: slower per frame (43 ms against 30 at batch 1).
+- **Batches of windows for TrackNet**: no gain (12.0 against 12.4 ms a frame). A new batch size at the end of a clip also made cuDNN re-tune for ~20 s.
+- **Stabilising warp folded into the 512×288 resize**: 2-4 ms a frame faster, but the detections shift by up to 4 px and the holdout score fell from 75.9 to 74.2.
+- **Skipping the motion estimate on still frames**: 2 ms a frame faster on a tripod, 2 ms slower on a moving camera; that thread is not the limit.
+- **Whole-clip ball track selection (dynamic programming)** instead of the frame-by-frame tracker: there is almost always one candidate per frame, so with mild penalties it picks the same detections, and with strong ones it drops real ones (tuning 75.3 → 71.9 on the replay).
+- **Ball centre from the colour segment in the full-resolution crop**: noisier than the network's own centre (tuning 75.3 → 75.0 at best, 72.7 without a limit on the shift).
+- **Choosing the toucher by the nearest wrist**, with arm keypoints on every frame: `pol_ita_r7` +4.4, `usa_jap_r3` −5.5; holdout 75.9 → 74.9.
+
+Not done: the net and lens distortion in the court calibration. The eval scores the real clips with their labelled courts and there is no tripod footage, so it could not be measured.
+
+Found on the way: with `torch.backends.cudnn.benchmark` on (set by the TrackNet detector), cuDNN picks its kernels by timing, and the player boxes then differ in the third decimal from run to run. That alone moves the holdout score by up to 0.7. With it off, two runs are identical.
+
+Next for speed: a TensorRT engine for the person detector (not installed here, so not tried), or running the detector only where the ball is in play, which is also what full-length matches need.
