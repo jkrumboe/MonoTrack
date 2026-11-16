@@ -115,17 +115,38 @@ def white_line_mask(frame, out_size=None):
     while the wider pale strips between advertising letters survive. The
     result is max-pooled down to out_size (w, h).
     """
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L = lab[:, :, 0]
-    chroma = np.hypot(lab[:, :, 1] - 128.0, lab[:, :, 2] - 128.0)
-    r = max(2, int(round(frame.shape[1] / 480)))   # 4 px at 1920 wide
+    m = _full_line_mask(frame)
+    return m if out_size is None else shrink_line_mask(m, out_size)
+
+
+def _full_line_mask(frame):
+    """white_line_mask at the frame's own size.
+
+    All in 8-bit integers (it was 140 ms a 1080p frame in float32, now ~15):
+    a pixel is a ridge when it is more than 10 brighter than both neighbours
+    r px away along some direction, i.e. L - max(a, b) > 10.
+    """
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    L = np.ascontiguousarray(lab[:, :, 0])
+    h, w = L.shape
+    r = max(2, int(round(w / 480)))   # 4 px at 1920 wide
+    pad = cv2.copyMakeBorder(L, r, r, r, r, cv2.BORDER_WRAP)
     ridge = np.zeros_like(L)
     for dx, dy in ((r, 0), (0, r), (r, r), (r, -r)):
-        a = np.roll(L, (dy, dx), (0, 1))
-        b = np.roll(L, (-dy, -dx), (0, 1))
-        np.maximum(ridge, np.minimum(L - a, L - b), out=ridge)
-    m = ((ridge > 10) & (chroma < 25) & (L > 150)).astype(np.uint8) * 255
-    if out_size is not None and (m.shape[1], m.shape[0]) != tuple(out_size):
+        a = pad[r - dy:r - dy + h, r - dx:r - dx + w]
+        b = pad[r + dy:r + dy + h, r + dx:r + dx + w]
+        cv2.max(ridge, cv2.subtract(L, cv2.max(a, b)), dst=ridge)
+    # Chroma below 25: squared distance from grey below 625.
+    chroma2 = _SQUARES[cv2.absdiff(lab[:, :, 1], 128)] + _SQUARES[cv2.absdiff(lab[:, :, 2], 128)]
+    return ((ridge > 10) & (chroma2 < 625) & (L > 150)).astype(np.uint8) * 255
+
+
+_SQUARES = (np.arange(256, dtype=np.uint16) ** 2)
+
+
+def shrink_line_mask(m, out_size):
+    """A full-size line mask max-pooled down to out_size (w, h)."""
+    if (m.shape[1], m.shape[0]) != tuple(out_size):
         m = cv2.resize(m, tuple(out_size), interpolation=cv2.INTER_AREA)
         m = np.where(m > 40, 255, 0).astype(np.uint8)
     return m
@@ -176,10 +197,14 @@ def _y_at(line, x):
 
 
 def _meet(l1, l2):
-    p = np.cross(np.array(l1[:3]), np.array(l2[:3]))
-    if abs(p[2]) < 1e-12:
+    # Cross product of the two lines, in plain floats: called per corner of
+    # every quadrilateral, where np.cross was a quarter of the detector's time.
+    a1, b1, c1 = l1[:3]
+    a2, b2, c2 = l2[:3]
+    z = a1 * b2 - b1 * a2
+    if abs(z) < 1e-12:
         return None
-    return p[:2] / p[2]
+    return ((b1 * c2 - c1 * b2) / z, (c1 * a2 - a1 * c2) / z)
 
 
 def camera_from_homography(H, img_w, img_h):
@@ -318,46 +343,130 @@ def _rank(score, H, lab):
     return max(score, 1.0) * _side_contrast(H, lab) ** 2 * _boundary_contrast(H, lab)
 
 
+_Z_PAIRS = list(itertools.combinations(TRANSVERSE_Z, 2))
+_UNIT_SQUARE = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
+# Court (x, z, 1) -> unit square, per pair of transverse lines (za, zb), for
+# the two views. The square's corners are, in order, the meets of
+# (top, left), (top, right), (bottom, right), (bottom, left).
+#   side: (HALF_W, za), (HALF_W, zb), (-HALF_W, zb), (-HALF_W, za)
+#   end:  (-HALF_W, za), (HALF_W, za), (HALF_W, zb), (-HALF_W, zb)
+_TO_SQUARE_SIDE = np.array([[[0, 1 / (zb - za), -za / (zb - za)], [-1 / (2 * HALF_W), 0, 0.5], [0, 0, 1]]
+                            for za, zb in _Z_PAIRS])
+_TO_SQUARE_END = np.array([[[1 / (2 * HALF_W), 0, 0.5], [0, 1 / (zb - za), -za / (zb - za)], [0, 0, 1]]
+                           for za, zb in _Z_PAIRS])
+
+
 def _hypotheses(shallow, steep, img_w, img_h):
-    """Yield (homography, view) for every line assignment worth scoring."""
+    """(homographies (N, 3, 3), index where the "end" views start): every line
+    assignment worth scoring.
+
+    Two lines of each family bound a quadrilateral; which two transverse court
+    lines they are is one of 10 choices, each only a different affine map in
+    front of the same square -> quadrilateral homography. So that homography
+    is solved once per quadrilateral and the 10 follow by a matrix product.
+    """
     mid_x, mid_y = img_w / 2.0, img_h / 2.0
-    z_pairs = list(itertools.combinations(TRANSVERSE_Z, 2))
+
+    def pairs(lines, at, mid, min_gap):
+        """Pairs of lines as (first, second) across the picture, far enough apart."""
+        out = []
+        for l1, l2 in itertools.combinations(lines, 2):
+            a, b = (l1, l2) if at(l1, mid) < at(l2, mid) else (l2, l1)
+            if abs(at(a, mid) - at(b, mid)) >= min_gap:
+                out.append((a, b))
+        return out
+
+    def quads(min_dx, min_dy, steep_first):
+        rows = pairs(shallow, _y_at, mid_x, min_dy * img_h)     # (top, bottom)
+        cols = pairs(steep, _x_at, mid_y, min_dx * img_w)       # (left, right)
+        order = [(r, c) for c in cols for r in rows] if steep_first else [(r, c) for r in rows for c in cols]
+        out = []
+        for (top, bot), (left, right) in order:
+            pts = [_meet(top, left), _meet(top, right), _meet(bot, right), _meet(bot, left)]
+            if all(p is not None for p in pts):
+                out.append(cv2.getPerspectiveTransform(_UNIT_SQUARE, np.array(pts, np.float32)))
+        return np.array(out).reshape(-1, 3, 3)
 
     # Side camera at -x: far sideline (x=+4.5) is the upper shallow line,
     # z grows to the right.
-    for s1, s2 in itertools.combinations(shallow, 2):
-        top, bot = (s1, s2) if _y_at(s1, mid_x) < _y_at(s2, mid_x) else (s2, s1)
-        if abs(_y_at(top, mid_x) - _y_at(bot, mid_x)) < 0.06 * img_h:
-            continue
-        for t1, t2 in itertools.combinations(steep, 2):
-            left, right = (t1, t2) if _x_at(t1, mid_y) < _x_at(t2, mid_y) else (t2, t1)
-            if abs(_x_at(left, mid_y) - _x_at(right, mid_y)) < 0.04 * img_w:
-                continue
-            pts = [_meet(top, left), _meet(top, right), _meet(bot, right), _meet(bot, left)]
-            if any(p is None for p in pts):
-                continue
-            img = np.array(pts, np.float32)
-            for za, zb in z_pairs:
-                world = np.array([[HALF_W, za], [HALF_W, zb], [-HALF_W, zb], [-HALF_W, za]], np.float32)
-                yield cv2.getPerspectiveTransform(world, img), "side"
-
+    side = (quads(0.04, 0.06, False)[:, None] @ _TO_SQUARE_SIDE[None]).reshape(-1, 3, 3)
     # Camera behind the +z baseline: sidelines are the steep lines (x=-4.5 on
     # the left), z grows towards the bottom of the picture.
-    for t1, t2 in itertools.combinations(steep, 2):
-        left, right = (t1, t2) if _x_at(t1, mid_y) < _x_at(t2, mid_y) else (t2, t1)
-        if abs(_x_at(left, mid_y) - _x_at(right, mid_y)) < 0.06 * img_w:
-            continue
-        for s1, s2 in itertools.combinations(shallow, 2):
-            top, bot = (s1, s2) if _y_at(s1, mid_x) < _y_at(s2, mid_x) else (s2, s1)
-            if abs(_y_at(top, mid_x) - _y_at(bot, mid_x)) < 0.03 * img_h:
-                continue
-            pts = [_meet(top, left), _meet(top, right), _meet(bot, right), _meet(bot, left)]
-            if any(p is None for p in pts):
-                continue
-            img = np.array(pts, np.float32)
-            for za, zb in z_pairs:
-                world = np.array([[-HALF_W, za], [HALF_W, za], [HALF_W, zb], [-HALF_W, zb]], np.float32)
-                yield cv2.getPerspectiveTransform(world, img), "end"
+    end = (quads(0.06, 0.03, True)[:, None] @ _TO_SQUARE_END[None]).reshape(-1, 3, 3)
+    H = np.concatenate([side, end])
+    # Scaled so that H[2, 2] = 1, as a homography solved directly would be.
+    ok = np.abs(H[:, 2, 2]) > 1e-12
+    n_side = int(ok[:len(side)].sum())
+    H = H[ok]
+    return H / H[:, 2:3, 2:3], n_side
+
+
+def _plausible_many(H, img_w, img_h):
+    """_plausible for a stack of homographies: a boolean per homography.
+
+    The same tests in the same order as camera_from_homography and _plausible,
+    on arrays; the rotation is only worked out for those the cheap tests pass.
+    """
+    cx, cy = img_w / 2.0, img_h / 2.0
+    h31, h32 = H[:, 2, 0], H[:, 2, 1]
+    h11, h12 = H[:, 0, 0] - cx * h31, H[:, 0, 1] - cx * h32
+    h21, h22 = H[:, 1, 0] - cy * h31, H[:, 1, 1] - cy * h32
+    with np.errstate(divide="ignore", invalid="ignore"):
+        den1 = h31 * h32
+        c1 = np.where(np.abs(den1) > 1e-18, -(h11 * h12 + h21 * h22) / den1, np.nan)
+        den2 = h32 * h32 - h31 * h31
+        c2 = np.where(np.abs(den2) > 1e-18, ((h11 ** 2 + h21 ** 2) - (h12 ** 2 + h22 ** 2)) / den2, np.nan)
+        ok1 = np.isfinite(c1) & (c1 > 1.0)
+        ok2 = np.isfinite(c2) & (c2 > 1.0)
+        n = ok1.astype(int) + ok2
+        f = np.sqrt((np.where(ok1, c1, 0.0) + np.where(ok2, c2, 0.0)) / np.maximum(n, 1))
+        n1 = np.sqrt((h11 / f) ** 2 + (h21 / f) ** 2 + h31 ** 2)
+        n2 = np.sqrt((h12 / f) ** 2 + (h22 / f) ** 2 + h32 ** 2)
+        good = (n > 0) & (n1 >= 1e-12) & (n2 >= 1e-12)
+        good &= np.maximum(n1, n2) / np.minimum(n1, n2) <= 1.25
+        fov_y = 2 * np.degrees(np.arctan(img_h / (2 * f)))
+        good &= (fov_y >= 3.0) & (fov_y <= 90.0)
+    idx = np.nonzero(good)[0]
+    if len(idx) == 0:
+        return good
+    f, lam = f[idx], 2.0 / (n1[idx] + n2[idx])
+    # Columns of diag(1/f, 1/f, 1) @ (H with the principal point removed).
+    r1 = np.stack([h11[idx] / f, h21[idx] / f, h31[idx]], axis=1) * lam[:, None]
+    r3 = np.stack([h12[idx] / f, h22[idx] / f, h32[idx]], axis=1) * lam[:, None]
+    t = np.stack([(H[idx, 0, 2] - cx * H[idx, 2, 2]) / f, (H[idx, 1, 2] - cy * H[idx, 2, 2]) / f,
+                  H[idx, 2, 2]], axis=1) * lam[:, None]
+    flip = np.where(t[:, 2] < 0, -1.0, 1.0)[:, None]
+    r1, r3, t = r1 * flip, r3 * flip, t * flip
+    R = np.stack([r1, np.cross(r3, r1), r3], axis=2)
+    U, _, Vt = np.linalg.svd(R)
+    R = U @ Vt
+    C = -np.einsum("nji,nj->ni", R, t)
+    keep = np.all(np.isfinite(C), axis=1)
+    # Above the floor, outside the court, not absurdly far.
+    keep &= (C[:, 1] >= 2.0) & (C[:, 1] <= 45.0)
+    horiz = np.hypot(C[:, 0], C[:, 2])
+    keep &= (horiz >= 8.0) & (horiz <= 160.0)
+    keep &= ~((np.abs(C[:, 0]) < HALF_W + 1.0) & (np.abs(C[:, 2]) < HALF_L + 1.0))
+    good[idx] = keep
+    return good
+
+
+def _score_many(H, dist, img_w, img_h, sigma=2.5, chunk=2000):
+    """_score for a stack of homographies: the scores as an array."""
+    out = np.empty(len(H))
+    for i in range(0, len(H), chunk):
+        p = H[i:i + chunk] @ _SAMPLES_H
+        w = p[:, 2]
+        ok = w > 1e-9
+        ws = np.where(ok, w, 1)
+        u = np.where(ok, p[:, 0] / ws, -1)
+        v = np.where(ok, p[:, 1] / ws, -1)
+        vis = ok & (u >= 2) & (u < img_w - 2) & (v >= 2) & (v < img_h - 2)
+        d = dist[np.where(vis, v, 0).astype(int), np.where(vis, u, 0).astype(int)]
+        hit = np.exp(-(d * d) / (2 * sigma * sigma))
+        sc = (hit * vis).sum(axis=1) - 0.35 * ((hit < 0.2) & vis).sum(axis=1)
+        out[i:i + chunk] = np.where(vis.sum(axis=1) < 40, -1e9, sc)
+    return out
 
 
 def _homography_from_camera(f, R, C, img_w, img_h):
@@ -482,39 +591,38 @@ def snap_court_to_lines(corners, line_mask):
     return out, before, after
 
 
-def detect_court_lines(frame, debug=False):
+def detect_court_lines(frame, debug=False, full_mask=None):
     """Detect the court from its lines.
 
     Returns (corners, info) with corners as four [x, y] normalised to the
     frame, in the analyzer's order (centred court (-4.5,-9), (4.5,-9),
-    (4.5,9), (-4.5,9)), or (None, reason).
+    (4.5,9), (-4.5,9)), or (None, reason). full_mask: the frame's
+    white_line_mask, when the caller already has it.
     """
     ih, iw = frame.shape[:2]
     s = WORK_W / float(iw)
     img = cv2.resize(frame, (WORK_W, int(round(ih * s)))) if abs(s - 1) > 1e-6 else frame
     h, w = img.shape[:2]
-    mask = white_line_mask(frame, (w, h))
+    mask = white_line_mask(frame, (w, h)) if full_mask is None else shrink_line_mask(full_mask, (w, h))
     shallow, steep = _segment_lines(mask)
     if len(shallow) < 2 or len(steep) < 2:
         return None, f"too few lines (shallow {len(shallow)}, steep {len(steep)})"
     dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
 
-    scored = []
-    n_tried = 0
-    for H, view in _hypotheses(shallow, steep, w, h):
-        n_tried += 1
-        if _plausible(H, w, h) is None:
-            continue
-        sc, _nvis = _score(H, dist, w, h)
-        scored.append((sc, H, view))
-    if not scored:
+    Hs, n_side = _hypotheses(shallow, steep, w, h)
+    n_tried = len(Hs)
+    ok = _plausible_many(Hs, w, h) if n_tried else np.zeros(0, bool)
+    if not ok.any():
         return None, f"no plausible camera among {n_tried} line assignments"
-    n_ok = len(scored)
+    keep = np.nonzero(ok)[0]
+    scores = _score_many(Hs[keep], dist, w, h)
+    n_ok = len(keep)
 
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    scored.sort(key=lambda r: -r[0])
-    best = max(scored[:RERANK_TOP], key=lambda r: _rank(r[0], r[1], lab))
-    _sc, H, view = best
+    # Stable, so equal scores keep the order the assignments were made in.
+    top = np.argsort(-scores, kind="stable")[:RERANK_TOP]
+    best = max(top, key=lambda i: _rank(scores[i], Hs[keep[i]], lab))
+    H, view = Hs[keep[best]], ("side" if keep[best] < n_side else "end")
     H = refine_camera(H, dist, w, h)
     cam = _plausible(H, w, h)
     if cam is None:
