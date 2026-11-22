@@ -197,23 +197,56 @@ def _probe_fps(path):
     return min((24, 25, 30, 50, 60), key=lambda r: abs(r - fps)) if fps > 0 else 30
 
 
+# What a browser <video> can play: an MP4/MOV/WebM container holding one of these codecs.
+_PLAYABLE_FORMATS = ("mov", "mp4", "m4a", "3gp", "matroska", "webm")
+_PLAYABLE_CODECS = {"h264", "vp8", "vp9", "av1"}
+
+
+def _browser_playable(path):
+    """True if the browser can play the file as is. AVI, MPEG-TS, ProRes, MJPEG, ... cannot."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "format=format_name:stream=codec_name",
+             "-of", "default=nw=1", path],
+            capture_output=True, text=True, timeout=60,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True  # can't tell: leave it as uploaded
+    info = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    fmt, codec = info.get("format_name", ""), info.get("codec_name", "")
+    if not fmt:
+        return True
+    return any(f in fmt.split(",") for f in _PLAYABLE_FORMATS) and codec in _PLAYABLE_CODECS
+
+
 def prepare_video(jid, meta):
-    """Re-encode phone recordings (variable frame rate, often WebM) to constant-rate MP4."""
+    """Re-encode to MP4 what the browser can't play as uploaded.
+
+    Phone recordings (variable frame rate, often WebM) also get a constant rate.
+    Other files (e.g. AVI) keep their own rate: analysis and player must share frame times.
+    """
     src = os.path.join(job_dir(jid), "upload.bin")
     dst = os.path.join(job_dir(jid), "video.mp4")
     if os.path.exists(dst):
         return
     name = meta.get("name", "").lower()
-    needs = meta.get("source") == "recording" or name.endswith(".webm") or "webm" in meta.get("mime", "")
-    if not needs:
-        return
+    recording = meta.get("source") == "recording" or name.endswith(".webm") or "webm" in meta.get("mime", "")
     if not shutil.which("ffmpeg"):
-        log(f"{jid}: ffmpeg not found; analysing the recording as uploaded (frame times may drift)")
+        if recording or not name.endswith((".mp4", ".mov", ".m4v")):
+            log(f"{jid}: ffmpeg not found; using the video as uploaded (it may not play in the browser)")
         return
-    fps = _probe_fps(src)
-    write_meta(jid, message=f"Converting the recording to {fps} fps")
+    if not recording and _browser_playable(src):
+        return
+    rate = []
+    if recording:
+        fps = _probe_fps(src)
+        rate = ["-r", str(fps)]
+        write_meta(jid, message=f"Converting the recording to {fps} fps")
+    else:
+        write_meta(jid, message="Converting the video so the browser can play it")
+    log(f"{jid}: converting {meta.get('name', 'upload')} to MP4")
     tmp = dst + ".part.mp4"
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", src, "-an", "-r", str(fps), "-c:v", "libx264", "-preset", "veryfast",
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", src, "-an", *rate, "-c:v", "libx264", "-preset", "veryfast",
            "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

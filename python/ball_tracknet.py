@@ -316,6 +316,32 @@ def warp_normalised(img, Hn, border=cv2.BORDER_REPLICATE):
                                flags=cv2.INTER_LINEAR, borderMode=border)
 
 
+_GRIDS = {}
+
+
+def warp_gpu(imgs, Ms, out_w, out_h, padding):
+    """cv2.warpPerspective / warpAffine with INTER_LINEAR, on the GPU.
+
+    imgs: (N, C, H, W) float tensor; Ms: N 3x3 matrices, destination <- source
+    in pixel coordinates (what OpenCV takes). padding "border" is
+    BORDER_REPLICATE and "zeros" BORDER_CONSTANT 0: grid_sample with
+    align_corners=True puts pixel centres where OpenCV does.
+    """
+    n, _, h, w = imgs.shape
+    key = (out_h, out_w, imgs.device)
+    if key not in _GRIDS:
+        ys, xs = torch.meshgrid(torch.arange(out_h, dtype=torch.float32, device=imgs.device),
+                                torch.arange(out_w, dtype=torch.float32, device=imgs.device), indexing="ij")
+        _GRIDS[key] = torch.stack([xs, ys, torch.ones_like(xs)], -1).reshape(-1, 3)
+    inv = torch.tensor(np.stack([np.linalg.inv(M) for M in Ms]), dtype=torch.float32, device=imgs.device)
+    src = _GRIDS[key] @ inv.transpose(1, 2)                         # (N, out_h*out_w, 3)
+    xy = src[..., :2] / src[..., 2:]
+    scale = torch.tensor([2.0 / (w - 1), 2.0 / (h - 1)], device=imgs.device)
+    grid = (xy * scale - 1.0).reshape(n, out_h, out_w, 2)
+    return torch.nn.functional.grid_sample(imgs, grid, mode="bilinear", padding_mode=padding,
+                                           align_corners=True)
+
+
 def candidates_from_heatmap(hm, threshold, to_norm):
     """Blobs of one heatmap as [cx_norm, cy_norm, conf, x1, y1, x2, y2] (normalised).
 
@@ -358,14 +384,28 @@ class WindowStream:
         self.sums = {}       # frame index -> (weighted heatmap sum, weight sum)
         self.next_start = 0
         self.count = 0
+        # BALL_GPU_WARP=0 warps on the CPU with OpenCV instead (the reference).
+        self.gpu_warp = (hasattr(detector, "window_heatmaps_warped")
+                         and getattr(detector, "device", None) is not None
+                         and detector.device.type == "cuda"
+                         and os.environ.get("BALL_GPU_WARP") != "0")
+        self.dev = {}        # frame index -> frame on the GPU, while frames holds it
 
     def _run(self, start):
         idx = [min(start + i, self.count - 1) for i in range(self.n)]
         frames = [self.frames[i] for i in idx]
         views = self._views(idx) if self.motion is not None else None
-        if views is not None:
-            frames = [warp_normalised(f, M) for f, M in zip(frames, views)]
-        hms = self.det.window_heatmaps(frames)
+        if views is not None and self.gpu_warp:
+            # Each frame goes to the GPU once and is warped there; on the CPU
+            # the 1080p warp was ~15 ms a frame, over half the ball stage.
+            for i in idx:
+                if i not in self.dev:
+                    self.dev[i] = self.det.upload(self.frames[i])
+            hms = self.det.window_heatmaps_warped([self.dev[i] for i in idx], views)
+        else:
+            if views is not None:
+                frames = [warp_normalised(f, M) for f, M in zip(frames, views)]
+            hms = self.det.window_heatmaps(frames)
         for j, f in enumerate(idx):
             if f != start + j:
                 break        # padding: the repeated frame isn't this frame
@@ -392,6 +432,7 @@ class WindowStream:
         out = []
         for f in sorted(k for k in self.sums if k < before):
             hm, w = self.sums.pop(f)
+            self.dev.pop(f, None)
             out.append((f, self.frames.pop(f), hm / w))
         return out
 
@@ -482,10 +523,40 @@ class TrackNetBallDetector:
             logits = self.model(self._preprocess(frames_bgr))
         return torch.sigmoid(logits)[0].cpu().numpy()
 
+    def upload(self, frame_bgr):
+        """A decoded frame on the device, for window_heatmaps_warped."""
+        return torch.from_numpy(frame_bgr).to(self.device)
+
+    def _preprocess_warped(self, dev_frames, views):
+        """_preprocess for frames already on the GPU, each first warped by its view.
+
+        The same two steps as warp_normalised then _preprocess, each rounded
+        to 8 bits as OpenCV does: the full-resolution warp, then the letterbox.
+        Folding them into one resample moved detections by up to 4 px and cost
+        points (EVAL.md section 13), so they stay separate.
+        """
+        h, w = dev_frames[0].shape[:2]
+        self.affine = letterbox_affine(w, h)
+        S, S_inv = np.diag([float(w), float(h), 1.0]), np.diag([1.0 / w, 1.0 / h, 1.0])
+        imgs = torch.stack(dev_frames).permute(0, 3, 1, 2).float()       # (frame, BGR, H, W)
+        full = warp_gpu(imgs, [S @ M @ S_inv for M in views], w, h, "border").round_().clamp_(0, 255)
+        A = np.vstack([self.affine.astype(np.float64), [0.0, 0.0, 1.0]])
+        small = warp_gpu(full, [A] * len(views), INPUT_W, INPUT_H, "zeros").round_().clamp_(0, 255)
+        x = small.flip(1).div_(255.0)
+        x = (x - self._mean.view(1, 3, 1, 1)) / self._std.view(1, 3, 1, 1)
+        return x.reshape(1, 3 * len(dev_frames), INPUT_H, INPUT_W)
+
+    @torch.no_grad()
+    def window_heatmaps_warped(self, dev_frames, views):
+        """window_heatmaps for GPU frames, each warped by its view (WindowStream)."""
+        return self._heatmaps(self._preprocess_warped(dev_frames, views))
+
     @torch.no_grad()
     def window_heatmaps(self, frames_bgr):
         """Sigmoid heatmaps (3, 288, 512) for a window of 3 consecutive frames."""
-        inp = self._preprocess(frames_bgr)
+        return self._heatmaps(self._preprocess(frames_bgr))
+
+    def _heatmaps(self, inp):
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.half):
             logits = self.model(inp).float()
         hms = torch.sigmoid(logits)[0].cpu().numpy()

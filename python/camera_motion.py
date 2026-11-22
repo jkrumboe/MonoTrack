@@ -27,6 +27,9 @@ TRACK_W = 640                 # tracking resolution; homographies are rescaled
 KEYFRAME_EVERY = 15
 MIN_INLIERS = 40
 RANSAC_PX = 1.0               # at TRACK_W
+# Lucas-Kanade pyramid levels above the base image. 2 instead of 3: ~15% less
+# time a frame, homographies within 1.4 px (at 1920) of 3 on the moving clips.
+LK_LEVELS = 2
 # A camera that never moves more than this (px at 1920 wide, corner drift over
 # the whole clip) is treated as static: no ref fields are emitted.
 STATIC_MAX_DRIFT_PX = 2.0
@@ -96,7 +99,7 @@ class CameraMotion:
         p0 = cv2.goodFeaturesToTrack(prev, 600, 0.01, 7, blockSize=7)
         if p0 is None:
             return None, 0
-        p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, cur, p0, None, winSize=(21, 21), maxLevel=3)
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, cur, p0, None, winSize=(21, 21), maxLevel=LK_LEVELS)
         ok = st.reshape(-1) == 1
         H, inl = _fit(p1[ok].reshape(-1, 2), p0[ok].reshape(-1, 2))
         return H, inl

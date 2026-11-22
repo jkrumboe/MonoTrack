@@ -148,7 +148,7 @@ export default function PlayerTrackingOverlay({
       // Ball trail
       for (let i = 0; i < ballTrail.length; i++) {
         const alpha = ((i + 1) / ballTrail.length) * 0.7;
-        const radius = 3 + (i / ballTrail.length) * 4;
+        const radius = 1.5 + (i / ballTrail.length) * 2;
         const [tx, ty] = toPixel(ballTrail[i].pos);
         ctx.beginPath();
         ctx.arc(tx, ty, radius, 0, Math.PI * 2);
@@ -159,7 +159,7 @@ export default function PlayerTrackingOverlay({
 
       // Ball marker
       ctx.beginPath();
-      ctx.arc(bx, by, 11, 0, Math.PI * 2);
+      ctx.arc(bx, by, 7, 0, Math.PI * 2);
       ctx.strokeStyle = isInterpolated ? "#aaaaaa" : "#ffb300";
       ctx.lineWidth = isInterpolated ? 1.5 : 2.5;
       if (isInterpolated) ctx.setLineDash([4, 3]);
@@ -167,7 +167,7 @@ export default function PlayerTrackingOverlay({
       ctx.setLineDash([]);
 
       ctx.beginPath();
-      ctx.arc(bx, by, 7, 0, Math.PI * 2);
+      ctx.arc(bx, by, 4, 0, Math.PI * 2);
       ctx.fillStyle = isInterpolated ? "#cccccc" : "#ffe082";
       ctx.fill();
 

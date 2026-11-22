@@ -47,3 +47,6 @@ __pycache__/
 
 # Generated court check images (python/propagate_court.py)
 eval/labels/court_checks/
+
+# TypeScript incremental build info
+*.tsbuildinfo

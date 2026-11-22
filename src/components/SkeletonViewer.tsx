@@ -249,7 +249,7 @@ export default function SkeletonViewer({
 
     // Ball visualisation (3D reconstructed position)
     const ballMesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.16, 24, 24),
+      new THREE.SphereGeometry(0.105, 24, 24),
       new THREE.MeshStandardMaterial({
         color: 0xffc107,
         emissive: 0x332200,
@@ -262,7 +262,7 @@ export default function SkeletonViewer({
     scene.add(ballMesh);
 
     const ballShadow = new THREE.Mesh(
-      new THREE.CircleGeometry(0.13, 24),
+      new THREE.CircleGeometry(0.09, 24),
       new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.28, depthWrite: false }),
     );
     ballShadow.rotation.x = -Math.PI / 2;
@@ -637,7 +637,7 @@ export default function SkeletonViewer({
       const color = touchColor(t.label);
       const [x, y, z] = t.position;
       const dot = new THREE.Mesh(
-        new THREE.SphereGeometry(0.12, 16, 16),
+        new THREE.SphereGeometry(0.08, 16, 16),
         new THREE.MeshBasicMaterial({ color }),
       );
       dot.position.set(x, y, z);
