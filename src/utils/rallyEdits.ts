@@ -135,15 +135,51 @@ export function applyBallEdits(frames: FrameData[], ball: RallyEdits["ball"]): F
   return out;
 }
 
-/** Solver hints for the touch edits. */
+/**
+ * Solver hints for the touch edits. A marked touch whose frame also has the
+ * ball placed by hand is the contact itself: the solver times the touch on
+ * that frame and puts it on that point in the image.
+ */
 export function touchEditsForSolver(
   touches: RallyEdits["touches"],
   pins: RallyEdits["pins"],
+  ball: RallyEdits["ball"] = {},
 ): BallReconstructionOptions["touchEdits"] {
   const touchAt: number[] = [], noTouchAt: number[] = [];
   for (const [f, kind] of Object.entries(touches)) (kind === "none" ? noTouchAt : touchAt).push(Number(f));
   const pinList = Object.entries(pins).map(([f, pos]) => ({ frame: Number(f), pos }));
-  return touchAt.length || noTouchAt.length || pinList.length ? { touchAt, noTouchAt, pins: pinList } : undefined;
+  const ballAt = touchAt.filter((f) => ball[f]);
+  return touchAt.length || noTouchAt.length || pinList.length ? { touchAt, noTouchAt, pins: pinList, ballAt } : undefined;
+}
+
+/**
+ * The pins after the ball is placed by hand on a frame. A touch held in 3D on
+ * that frame moves onto the camera's line of sight through the new ball: a net
+ * or floor touch snaps again (net plane, floor), any other keeps its depth (the
+ * point on the line nearest where it was). Pins on other frames are unchanged.
+ */
+export function pinsAfterBallMark(
+  e: Pick<RallyEdits, "touches" | "pins">,
+  frame: number,
+  pos: [number, number],
+  frames: FrameData[],
+  positions: Map<number, V3>,
+  calibration: { position: V3; lookAt: V3; fov: number; roll?: number } | null,
+  aspect: number,
+): RallyEdits["pins"] {
+  const pin = e.pins[frame];
+  const kind = e.touches[frame];
+  if (!pin || !calibration || !aspect || kind === "none") return e.pins;
+  const marked = applyBallEdits(frames, { [frame]: pos });
+  let next: V3 | null = kind ? touchSnapPosition(kind, frame, marked, positions, calibration, aspect) : null;
+  if (!next) {
+    const ray = ballRay(marked, frame, calibration, aspect);
+    if (!ray) return e.pins;
+    const t = Math.max(0, dot(sub(pin, ray.origin), ray.dir));
+    next = [0, 1, 2].map((c) => ray.origin[c] + ray.dir[c] * t) as V3;
+    next[1] = Math.max(BALL_R, next[1]);
+  }
+  return { ...e.pins, [frame]: next };
 }
 
 /** How far (frames) a found touch may be from an edit and still be the touch it edits. */
@@ -238,6 +274,7 @@ type V3 = [number, number, number];
 const sub = (a: V3, b: V3): V3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const cross = (a: V3, b: V3): V3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const unit = (a: V3): V3 => { const l = Math.hypot(...a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const dot = (a: V3, b: V3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
 /**
  * The camera's line of sight through the ball on a frame, in court coords:

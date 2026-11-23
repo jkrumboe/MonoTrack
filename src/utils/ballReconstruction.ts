@@ -100,9 +100,11 @@ export interface BallReconstructionOptions {
    * where a found touch was removed; a split within a few frames of one is
    * merged back into a single flight. `pins`: where in 3D (m) the ball was
    * at a touch, placed by hand; the touch's knot is held there and the
-   * flights either side fit to it. A pin is also a `touchAt`.
+   * flights either side fit to it. A pin is also a `touchAt`. `ballAt`:
+   * marked touches whose frame also has the ball placed by hand; the contact
+   * is that frame and that point in the image (the depth is still solved).
    */
-  touchEdits?: { touchAt?: number[]; noTouchAt?: number[]; pins?: { frame: number; pos: [number, number, number] }[] };
+  touchEdits?: { touchAt?: number[]; noTouchAt?: number[]; pins?: { frame: number; pos: [number, number, number] }[]; ballAt?: number[] };
 }
 
 export interface ReconstructionStats {
@@ -1895,6 +1897,8 @@ interface HiddenContact {
   img: [number, number];
   /** The player's take-off spot on the court. */
   spot: TouchCandidate;
+  /** The ball placed by hand on a touch marked by hand: no player found, the user saw it. */
+  byHand?: boolean;
 }
 
 /**
@@ -2147,15 +2151,33 @@ const PIN_WEIGHT = 200;
  * near one is reused rather than doubled. Returns the arcs and the first
  * frame of each arc that starts at a marked touch.
  */
-function splitAtMarkedTouches(arcs: ArcObsEx[][], touchAt: number[]): { arcs: ArcObsEx[][]; starts: Set<number> } {
+function splitAtMarkedTouches(
+  arcs: ArcObsEx[][],
+  touchAt: number[],
+  /** Marked touches with the ball placed on their frame: the split goes exactly there, the ball starting the next arc. */
+  exact: Set<number> = new Set(),
+): { arcs: ArcObsEx[][]; starts: Set<number> } {
   const starts = new Set<number>();
   if (!touchAt.length) return { arcs, starts };
   let out = arcs;
   for (const f of touchAt) {
     // Near an existing split, or inside the detection gap it spans.
-    const near = out.find((a, i) => i > 0 && a.length > 0 && out[i - 1].length > 0 &&
+    const ni = out.findIndex((a, i) => i > 0 && a.length > 0 && out[i - 1].length > 0 &&
       f >= out[i - 1][out[i - 1].length - 1].fi - EDIT_TOUCH_SNAP_FRAMES && f <= a[0].fi + EDIT_TOUCH_SNAP_FRAMES);
-    if (near) { starts.add(near[0].fi); continue; }
+    if (ni >= 0) {
+      // The user saw the ball at the contact: move the split onto that frame.
+      if (exact.has(f)) {
+        const both = [...out[ni - 1], ...out[ni]];
+        const i = both.findIndex((o) => o.fi >= f);
+        if (i > 0 && both[i].fi === f) {
+          out = [...out.slice(0, ni - 1), both.slice(0, i), both.slice(i), ...out.slice(ni + 1)];
+          starts.add(f);
+          continue;
+        }
+      }
+      starts.add(out[ni][0].fi);
+      continue;
+    }
     const next: ArcObsEx[][] = [];
     for (const a of out) {
       const i = a.findIndex((o) => o.fi >= f);
@@ -3788,9 +3810,12 @@ function _solveBallTrajectories(
         trackBoxes = allPlayersByFrame.size ? allPlayersByFrame : null;
       }
       const touchPins = options?.touchEdits?.pins ?? [];
+      // Marked touches with the ball placed on their frame (and so detected there).
+      const ballAtTouch = new Set((options?.touchEdits?.ballAt ?? []).filter((f) => obsEx.some((o) => o.fi === f)));
       const { arcs: rawArcs, starts: markedTouches } = splitAtMarkedTouches(
         splitArcsEx(obsEx, vW, vH),
         [...(options?.touchEdits?.touchAt ?? []), ...touchPins.map((pin) => pin.frame)],
+        ballAtTouch,
       );
       const removedTouches = options?.touchEdits?.noTouchAt ?? [];
       const buildArcs = (skip: Set<number>, joined?: number[], log?: TouchSplitDecision[]) => {
@@ -3846,6 +3871,18 @@ function _solveBallTrajectories(
             anchors.push(cands);
           }
           anchors.push([]);
+        }
+        // A marked touch with the ball placed on its frame: the contact is that
+        // frame and that point in the image, which beats both the mid-gap guess
+        // and the arms. The player anchors stay: the depth is still unknown.
+        if (ballAtTouch.size) {
+          for (let k = 1; k < rally.length; k++) {
+            const o = rally[k][0];
+            if (!ballAtTouch.has(o.fi) || free.has(k)) continue;
+            // The knot needs some flight after it (a last one-sample piece has none).
+            if (rally[k].length < 2 && k === rally.length - 1) continue;
+            contacts[k] = { t: o.t, frame: o.fi, img: [o.u, o.v], spot: anchors[k]?.[0] ?? [0, 0], byHand: true };
+          }
         }
         // Knot times as solveRally sets them: mid-gap, or the contact at the arms.
         const knotT = rally.map((seg, k) => k === 0 ? seg[0].t
@@ -4024,7 +4061,8 @@ function _solveBallTrajectories(
           touches.push({ frame, position, label, candidates: anchors[k] ?? [] });
           knot.frame = frame; knot.reported = true; knot.label = label;
           knot.why = (zones[k] ? `touch ${k + 1} of the rally by the rules` : "a break in the path with a player in reach; the rules had no type for it") +
-            (contacts[k] ? ", timed at a player's wrists while the ball was hidden" : "") +
+            (contacts[k]?.byHand ? ", at the ball placed by hand on the marked touch frame"
+              : contacts[k] ? ", timed at a player's wrists while the ball was hidden" : "") +
             ((anchors[k]?.length ?? 0) > 0 ? `, pulled towards ${anchors[k].length > 1 ? `the nearest of ${anchors[k].length} candidate players` : "one candidate player"}` : ", no player to anchor it: placed by its zone and the flights");
         });
         // The rally's last point is where the ball was last seen.

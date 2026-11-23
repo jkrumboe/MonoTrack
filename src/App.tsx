@@ -317,7 +317,7 @@ function App() {
 
   /** Frames with the hand ball corrections applied (passed to the solver). */
   const framesForSolver = useMemo(() => applyBallEdits(frames, edits.ball), [frames, edits.ball]);
-  const solverTouchEdits = useMemo(() => touchEditsForSolver(edits.touches, edits.pins), [edits.touches, edits.pins]);
+  const solverTouchEdits = useMemo(() => touchEditsForSolver(edits.touches, edits.pins, edits.ball), [edits.touches, edits.pins, edits.ball]);
 
   /**
    * After analysis completes and camera calibration is available, run the

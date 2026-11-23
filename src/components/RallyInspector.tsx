@@ -10,7 +10,7 @@ import * as THREE from "three";
 import type { FrameData } from "../hooks/useAnalysis";
 import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
 import type { PhysicsReprojectionDebug, SolverTrace, TouchSplitDecision } from "../utils/ballReconstruction";
-import { TOUCH_KINDS, touchColor, touchKindsAfter, touchMatchFrames, touchSnapPosition, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
+import { pinsAfterBallMark, TOUCH_KINDS, touchColor, touchKindsAfter, touchMatchFrames, touchSnapPosition, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
 import { resetSegmentEdits, type RefitSegment } from "../utils/rallyRefit";
 import { traceSpans } from "../utils/pathExplain";
 import PathExplain from "./PathExplain";
@@ -135,6 +135,10 @@ export default function RallyInspector(p: Readonly<Props>) {
   const [pickedAdd, setPickedAdd] = useState<{ after: string; kind: TouchKind } | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   const [flash, setFlash] = useState<"ball" | "touch" | "3d" | null>(null);
+  /** The frames of the problem "Mark the ball" was opened from: placing stops once it is fixed. */
+  const [markTarget, setMarkTarget] = useState<{ from: number; to: number } | null>(null);
+  /** A short note after placing stopped by itself. */
+  const [markDone, setMarkDone] = useState<string | null>(null);
   /** Developer view: colour the path by how each stretch was made, and say why. Remembered. */
   const [explain, setExplain] = useState(() => {
     try { return localStorage.getItem("inspect.explain") === "1"; } catch { return false; }
@@ -156,10 +160,20 @@ export default function RallyInspector(p: Readonly<Props>) {
   const aligning = useRef(false);
   aligning.current = !!p.align;
 
+  // Judged positions: what the solver fitted, plus the flights the user shaped
+  // by hand (those are drawn as estimates, but they are the user's answer).
+  const judgedPositions = useMemo(() => {
+    const out = new Map(p.fittedPositions);
+    for (const s of p.segments) {
+      if (!s.byHand) continue;
+      for (let f = s.from; f <= s.to; f++) { const x = p.positions.get(f); if (x) out.set(f, x); }
+    }
+    return out;
+  }, [p.fittedPositions, p.positions, p.segments]);
   const insp = useMemo(() => inspectRally({
-    frames, fps, positions: p.fittedPositions, physicsDebug: p.physicsDebug, touches, touchSplits: p.touchSplits,
-    edits, courtErrPx: p.courtErrPx, hasCalibration: !!p.calibration,
-  }), [frames, fps, p.fittedPositions, p.physicsDebug, touches, p.touchSplits, edits, p.courtErrPx, p.calibration]);
+    frames, fps, positions: judgedPositions, physicsDebug: p.physicsDebug, touches, touchSplits: p.touchSplits,
+    edits, courtErrPx: p.courtErrPx, hasCalibration: !!p.calibration, range: p.range ?? undefined,
+  }), [frames, fps, judgedPositions, p.physicsDebug, touches, p.touchSplits, edits, p.courtErrPx, p.calibration, p.range]);
   const dismissed = useMemo(() => new Set(edits.dismissed), [edits.dismissed]);
 
   // The rally being edited, for the 3D editor and the timeline.
@@ -204,7 +218,12 @@ export default function RallyInspector(p: Readonly<Props>) {
   );
 
   // ── Editing ───────────────────────────────────────────────────────────────
-  const setBall = useCallback((frame: number, pos: V2 | null) => onEdit((e) => ({ ...e, ball: { ...e.ball, [frame]: pos } })), [onEdit]);
+  // A touch held in 3D on this frame follows the ball placed on it (see pinsAfterBallMark).
+  const setBall = useCallback((frame: number, pos: V2 | null) => onEdit((e) => ({
+    ...e,
+    ball: { ...e.ball, [frame]: pos },
+    pins: pos ? pinsAfterBallMark(e, frame, pos, frames, p.positions, p.calibration, aspect) : e.pins,
+  })), [onEdit, frames, p.positions, p.calibration, aspect]);
   const clearBall = useCallback((frame: number) => onEdit((e) => {
     const ball = { ...e.ball }; delete ball[frame]; return { ...e, ball };
   }), [onEdit]);
@@ -249,7 +268,10 @@ export default function RallyInspector(p: Readonly<Props>) {
   };
   const applyFix = (fix: Fix, pr: Problem) => {
     switch (fix.kind) {
-      case "mark-ball": onSeek(pr.frame); setTool("ball"); flashPanel("ball"); break;
+      case "mark-ball":
+        onSeek(pr.frame); setTool("ball"); flashPanel("ball");
+        setMarkTarget({ from: pr.frame, to: pr.frameEnd ?? pr.frame }); setMarkDone(null);
+        break;
       case "remove-ball": onEdit((e) => ({ ...e, ball: { ...e.ball, ...Object.fromEntries(fix.frames.map((f) => [f, null])) } })); break;
       case "add-touch": onSeek(fix.frame); flashPanel("touch"); break;
       case "set-touch": onSeek(fix.frame); flashPanel("touch"); break;
@@ -278,7 +300,7 @@ export default function RallyInspector(p: Readonly<Props>) {
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === "b" || e.key === "B") setTool((x) => (x === "ball" ? "none" : "ball"));
-      else if (e.key === "x" || e.key === "X") setBall(cur, null);
+      else if (e.key === "x" || e.key === "X") markNoBall();
       else if (e.key === "t" || e.key === "T") { if (!touchHere || touchHere.frame !== cur) setTouch(cur, addType); }
       else if (e.key === "[") stepProblem(-1);
       else if (e.key === "]") stepProblem(1);
@@ -288,7 +310,7 @@ export default function RallyInspector(p: Readonly<Props>) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [cur, touchHere, addType, setBall, setTouch, stepProblem, p.onUndo, p.onRedo]);
+  }, [cur, touchHere, addType, setBall, setTouch, stepProblem, p.onUndo, p.onRedo, tool, advance, markTarget]);
 
   // ── Video stage: zoom, pan, click to place the ball ──────────────────────
   useEffect(() => {
@@ -349,8 +371,30 @@ export default function RallyInspector(p: Readonly<Props>) {
     const nx = (lx - b.x) / b.w, ny = (ly - b.y) / b.h;
     if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
     setBall(cur, [nx, ny]);
+    nextAfterMark();
+  };
+  /** After a frame is answered while placing: on to the next, but not past the problem being fixed. */
+  const nextAfterMark = () => {
+    if (tool !== "ball") return;
+    if (markTarget && cur >= markTarget.to) { stopMarking(`Marked through frame ${markTarget.to}`); return; }
     if (advance) onSeek(cur + 1);
   };
+  /** The ball cannot be seen on this frame: hidden behind a player, or out of the picture. */
+  const markNoBall = () => { setBall(cur, null); nextAfterMark(); };
+  const stopMarking = useCallback((note: string) => {
+    setTool("none"); setMarkTarget(null); setMarkDone(note);
+    window.setTimeout(() => setMarkDone((n) => (n === note ? null : n)), 2500);
+  }, []);
+  // Placing opened from a problem stops as soon as no problem asking for the
+  // ball is left on those frames. A gap's key moves as it is filled from its
+  // start, so this goes by frames, not by key.
+  useEffect(() => {
+    if (!markTarget) return;
+    if (tool !== "ball") { setMarkTarget(null); return; }
+    const left = insp.open.some((x) => x.fixes.some((f) => f.kind === "mark-ball")
+      && (x.frameEnd ?? x.frame) >= markTarget.from && x.frame <= markTarget.to);
+    if (!left) stopMarking(`Fixed: frames ${markTarget.from}–${markTarget.to} need no more marks`);
+  }, [insp.open, markTarget, tool, stopMarking]);
 
   // ── Overlay ───────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -429,7 +473,7 @@ export default function RallyInspector(p: Readonly<Props>) {
       const out = p.physicsDebug?.find((d) => d.frame === cur)?.isOutlier;
       circle(fr.ball_img_pos, 9, out ? "#ff5252" : fr.ball_interpolated ? "#bbbbbb" : "#69f0ae", null, 2, fr.ball_interpolated ? [3, 3] : []);
     }
-    if (mine === null) label([0.01, 0.06], "ball removed on this frame", "#00e5ff", 0, 0);
+    if (mine === null) label([0.01, 0.06], "you marked: ball not visible on this frame", "#00e5ff", 0, 0);
     else if (!project && p.calibration) label([0.01, 0.06], "camera motion unknown on this frame: 3D hidden", "#ffab40", 0, 0);
   }, [innerSize, aspect, videoSize, zoom.k, project, p.positions, p.physicsDebug, p.calibration, touches, frames, cur, edits.ball]);
 
@@ -438,7 +482,7 @@ export default function RallyInspector(p: Readonly<Props>) {
   const mine = edits.ball[cur];
   let ballState: string;
   if (mine) ballState = "placed by you";
-  else if (mine === null) ballState = "removed by you";
+  else if (mine === null) ballState = "not visible (you said)";
   else if (!fr?.ball_img_pos) ballState = "not detected";
   else if (fr.ball_interpolated) ballState = "gap fill (not seen)";
   else ballState = `detected · conf ${(fr.ball_conf ?? 0).toFixed(2)}`;
@@ -456,7 +500,7 @@ export default function RallyInspector(p: Readonly<Props>) {
       const group = ballFrames.slice(i, j + 1);
       rows.push({
         from: group[0], to: group[group.length - 1],
-        text: `${removed ? "Ball removed" : "Ball placed"}${group.length > 1 ? ` on ${group.length} frames` : ""}`,
+        text: `${removed ? "Ball not visible" : "Ball placed"}${group.length > 1 ? ` on ${group.length} frames` : ""}`,
         undo: () => onEdit((e) => { const ball = { ...e.ball }; group.forEach((f) => delete ball[f]); return { ...e, ball }; }),
       });
       i = j + 1;
@@ -513,9 +557,11 @@ export default function RallyInspector(p: Readonly<Props>) {
           </div>
           {tool === "ball" && (
             <div className="inspect-tool-hint">
-              Click the ball's centre for frame {cur}{advance ? ", then the next frame shows" : ""} · <kbd>Esc</kbd> to stop
+              Click the ball's centre for frame {cur}{advance ? ", then the next frame shows" : ""} · <kbd>X</kbd> not visible
+              {markTarget ? ` · stops when frames ${markTarget.from}–${markTarget.to} are fixed` : ""} · <kbd>Esc</kbd> to stop
             </div>
           )}
+          {tool !== "ball" && markDone && <div className="inspect-tool-hint">✓ {markDone}</div>}
           {p.solving && <div className="inspect-solving">Re-solving…</div>}
         </div>
         <div className="inspect-legend">
@@ -616,7 +662,7 @@ export default function RallyInspector(p: Readonly<Props>) {
               <button className={`inspect-btn ${tool === "ball" ? "active" : "primary"}`} onClick={() => setTool((t) => (t === "ball" ? "none" : "ball"))} title="B">
                 {tool === "ball" ? "Stop placing" : "Place ball"} <kbd>B</kbd>
               </button>
-              <button className="inspect-btn" onClick={() => setBall(cur, null)} disabled={mine === null} title="X">No ball here <kbd>X</kbd></button>
+              <button className="inspect-btn" onClick={markNoBall} disabled={mine === null && tool !== "ball"} title="X: the ball cannot be seen here (behind a player, out of the picture)">Not visible <kbd>X</kbd></button>
               {cur in edits.ball && <button className="inspect-btn" onClick={() => clearBall(cur)}>Undo</button>}
             </div>
             <label className="inspect-check">

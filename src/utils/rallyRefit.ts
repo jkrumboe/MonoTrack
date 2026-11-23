@@ -77,6 +77,8 @@ export interface RefitSegment {
   rebuilt: boolean;
   /** Its arc was set with the handle. */
   manual: boolean;
+  /** Shaped by the user: its arc set with the handle, or a touch at either end placed by hand. */
+  byHand: boolean;
   /** Launch speed (m/s) of a rebuilt arc. */
   speedMps: number | null;
   /** Why a rebuilt arc is not a plausible flight, if it is not. */
@@ -186,11 +188,12 @@ export function refitEditedPath(input: RefitInput): RefitResult {
     // A flight across a removed touch still has the solver's kink in it
     // until the background solve returns: only then is it one arc.
     const kinked = spansRemoved && !isOneArc(input.positions, fa, fb, fps);
-    const rebuild = manual || moved(A) || moved(B) || holes || kinked;
+    const byHand = manual || moved(A) || moved(B);
+    const rebuild = byHand || holes || kinked;
 
     if (!rebuild) {
       const mf = Math.round((fa + fb) / 2);
-      segments.push({ from: fa, to: fb, g: null, mid: input.positions.get(mf) ?? arcAt(a, b, fa, fb, G, fps, mf), rebuilt: false, manual: false, speedMps: null, warning: null });
+      segments.push({ from: fa, to: fb, g: null, mid: input.positions.get(mf) ?? arcAt(a, b, fa, fb, G, fps, mf), rebuilt: false, manual: false, byHand: false, speedMps: null, warning: null });
       continue;
     }
     const g = manual
@@ -216,7 +219,7 @@ export function refitEditedPath(input: RefitInput): RefitResult {
       if (Math.abs(at[0]) <= 4.5 && at[1] < 2.43) warning = `passes through the net (${at[1].toFixed(1)} m high at it)`;
     }
     segments.push({
-      from: fa, to: fb, g, mid: arcAt(a, b, fa, fb, g, fps, (fa + fb) / 2), rebuilt: true, manual, speedMps: Math.hypot(...v0), warning,
+      from: fa, to: fb, g, mid: arcAt(a, b, fa, fb, g, fps, (fa + fb) / 2), rebuilt: true, manual, byHand, speedMps: Math.hypot(...v0), warning,
     });
   }
   return { positions, methods, segments, rebuiltFrames };

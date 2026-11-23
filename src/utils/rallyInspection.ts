@@ -46,6 +46,8 @@ export interface InspectionInput {
   /** Worst court keypoint reprojection error (px), when known. */
   courtErrPx: number | null;
   hasCalibration: boolean;
+  /** The rally being edited: the score judges only these frames. Whole video when absent. */
+  range?: [number, number];
 }
 
 export interface ScorePart {
@@ -116,9 +118,10 @@ export function inspectRally(inp: InspectionInput): Inspection {
   const touchNear = (f: number, within = tol) => inp.touches.find((t) => Math.abs(t.frame - f) <= within);
   const problems: Problem[] = [];
 
-  // Ball lost: gaps in detection inside the rally.
+  // Ball lost: gaps in detection inside the rally. Frames the user marked as
+  // having no visible ball (behind a player) are answered, not lost.
   const minGap = Math.max(3, Math.round(0.2 * fps));
-  for (const [a, b] of runs(inRally, (f) => !seenAt(f))) {
+  for (const [a, b] of runs(inRally, (f) => !seenAt(f) && edits.ball[f] !== null)) {
     const n = b - a + 1;
     if (n < minGap || n > MAX_GAP_REPORTED_S * fps) continue;
     const hides = touchNear((a + b) / 2, n / 2 + 1);
@@ -126,8 +129,8 @@ export function inspectRally(inp: InspectionInput): Inspection {
       key: `gap:${a}`, severity: hides ? "high" : n >= 0.5 * fps ? "medium" : "low", frame: a, frameEnd: b,
       title: `Ball lost for ${n} frames (${secs(n, fps)})`,
       detail: hides
-        ? `The ${hides.label} at frame ${hides.frame} sits in this gap, so its timing and place are guesses. Click the ball on a few frames here.`
-        : "Click the ball on a few of these frames (every 2nd or 3rd is enough) to fill the path in.",
+        ? `The ${hides.label} at frame ${hides.frame} sits in this gap, so its timing and place are guesses. Click the ball on a few frames here, or press X where it is hidden.`
+        : "Click the ball on a few of these frames (every 2nd or 3rd is enough) to fill the path in, or press X where it is hidden.",
       fixes: [{ kind: "mark-ball", label: "Mark the ball" }],
     });
   }
@@ -296,17 +299,26 @@ export function inspectRally(inp: InspectionInput): Inspection {
   const open = listed.filter((p) => !dismissed.has(p.key));
 
   // Score: how complete and consistent the rally is, and what is left to fix.
-  const reproj = (inp.physicsDebug ?? []).flatMap((d) => (d.usedInFit && d.reprojectionErrorPx != null ? [d.reprojectionErrorPx] : []));
+  // Judged on the rally being edited, not on the whole video around it.
+  const [r0, r1] = inp.range ?? [-Infinity, Infinity];
+  const inRange = (f: number) => f >= r0 && f <= r1;
+  const seenInRange = seen.filter(inRange);
+  const scoreFrames = seenInRange.length ? inRally.filter((f) => f >= seenInRange[0] && f <= seenInRange[seenInRange.length - 1]) : [];
+  const reproj = (inp.physicsDebug ?? []).flatMap((d) => (inRange(d.frame) && d.usedInFit && d.reprojectionErrorPx != null && !edited(d.frame) ? [d.reprojectionErrorPx] : []));
   const reprojMedianPx = median(reproj);
-  const seenInRally = inRally.filter(seenAt);
+  const seenInRally = scoreFrames.filter(seenAt);
+  const visibleFrames = scoreFrames.filter((f) => edits.ball[f] !== null).length;
   const solvedSeen = seenInRally.filter((f) => positions.has(f));
-  const typed = inp.touches.filter((t) => t.label !== "touch");
-  const cost = open.reduce((s, p) => s + SEV_COST[p.severity], 0);
+  const rangeTouches = inp.touches.filter((t) => inRange(t.frame));
+  const typed = rangeTouches.filter((t) => t.label !== "touch");
+  const openInRange = open.filter((p) => (p.frameEnd ?? p.frame) >= r0 && p.frame <= r1);
+  const cost = openInRange.reduce((s, p) => s + SEV_COST[p.severity], 0);
   const parts: ScorePart[] = [
-    { name: "Ball seen", weight: 0.2, value: inRally.length ? seenInRally.length / inRally.length : null },
+    // Frames the user marked as not visible could not have been seen: they do not count against it.
+    { name: "Ball seen", weight: 0.2, value: visibleFrames ? seenInRally.length / visibleFrames : null },
     { name: "3D path", weight: 0.2, value: seenInRally.length ? solvedSeen.length / seenInRally.length : null },
     { name: "Path fit", weight: 0.15, value: reprojMedianPx == null ? null : Math.exp(-reprojMedianPx / 10) },
-    { name: "Touches known", weight: 0.15, value: inp.touches.length ? typed.length / inp.touches.length : null },
+    { name: "Touches known", weight: 0.15, value: rangeTouches.length ? typed.length / rangeTouches.length : null },
     { name: "Open problems", weight: 0.3, value: Math.exp(-cost / 4) },
   ];
   const have = parts.filter((p) => p.value != null);
@@ -315,6 +327,6 @@ export function inspectRally(inp: InspectionInput): Inspection {
 
   return {
     problems: listed, open, score, parts, rally,
-    stats: { seen: seenInRally.length, rallyFrames: inRally.length, solved: positions.size, reprojMedianPx, touches: inp.touches.length },
+    stats: { seen: seenInRally.length, rallyFrames: scoreFrames.length, solved: solvedSeen.length, reprojMedianPx, touches: rangeTouches.length },
   };
 }
