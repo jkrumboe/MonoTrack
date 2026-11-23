@@ -112,10 +112,14 @@ function opensRally(t: BallTouch, prev: BallTouch | undefined): boolean {
 /**
  * True when a group of touches is play. Between points the ball is knocked
  * or thrown back to the next server; the rally rules find no type for those
- * touches ("touch"), so a group with nothing but those is not a rally.
+ * touches ("touch"), so a short group with nothing but those is not a rally.
+ * Untyped touches also happen in real play when the 3D positions are off
+ * (a bad court calibration): with three or more it is kept, as a ball
+ * return is a throw and a catch, or a bounce or two.
  */
+const MIN_UNTYPED_RALLY_TOUCHES = 3;
 function isPlay(group: readonly BallTouch[]): boolean {
-  return group.some((t) => touchKind(t.label) !== "touch");
+  return group.some((t) => touchKind(t.label) !== "touch") || group.length >= MIN_UNTYPED_RALLY_TOUCHES;
 }
 
 /** Where the ball ended up: the last solved position in [from, to]. */

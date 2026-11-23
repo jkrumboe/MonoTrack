@@ -31,6 +31,13 @@ export const ARC_MAX_G = 2.5;
 const MOVED_M = 0.05;
 /** Fastest a ball flies (m/s); faster flights are reported, not refused. */
 export const MAX_SPEED_MPS = 40;
+/**
+ * Longest a ball is in the air between two touches (s). Touches further apart
+ * are not one flight (the ball went dead, or they are in different rallies):
+ * nothing is drawn between them, which an arc that long would put tens of
+ * metres up.
+ */
+export const MAX_FLIGHT_S = 4;
 
 /** What the editor needs of a touch. */
 export interface RefitTouch extends BallTouch {
@@ -169,7 +176,7 @@ export function refitEditedPath(input: RefitInput): RefitResult {
   for (let k = 0; k + 1 < touches.length; k++) {
     const A = touches[k], B = touches[k + 1];
     const fa = A.frame, fb = B.frame;
-    if (fb <= fa) continue;
+    if (fb <= fa || (fb - fa) / fps > MAX_FLIGHT_S) continue;
     const a = A.position, b = B.position;
     const arcMid = input.arcs?.[fa];
     const manual = arcMid != null;

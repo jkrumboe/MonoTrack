@@ -10,7 +10,7 @@ import * as THREE from "three";
 import type { FrameData } from "../hooks/useAnalysis";
 import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
 import type { PhysicsReprojectionDebug, SolverTrace, TouchSplitDecision } from "../utils/ballReconstruction";
-import { TOUCH_KINDS, touchColor, touchMatchFrames, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
+import { TOUCH_KINDS, touchColor, touchMatchFrames, touchSnapPosition, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
 import { resetSegmentEdits, type RefitSegment } from "../utils/rallyRefit";
 import { traceSpans } from "../utils/pathExplain";
 import PathExplain from "./PathExplain";
@@ -38,6 +38,11 @@ interface Props {
   trace?: SolverTrace;
   /** Touches with the touch edits applied. */
   touches: EditedTouch[];
+  /**
+   * First and last frame of the rally being edited: the 3D editor and the
+   * timeline show only it. The whole clip when null.
+   */
+  range?: [number, number] | null;
   courtErrPx: number | null;
   edits: RallyEdits;
   onEdit: (change: (e: RallyEdits) => RallyEdits) => void;
@@ -157,6 +162,18 @@ export default function RallyInspector(p: Readonly<Props>) {
   }), [frames, fps, p.fittedPositions, p.physicsDebug, touches, p.touchSplits, edits, p.courtErrPx, p.calibration]);
   const dismissed = useMemo(() => new Set(edits.dismissed), [edits.dismissed]);
 
+  // The rally being edited, for the 3D editor and the timeline.
+  const r0 = p.range?.[0] ?? -Infinity, r1 = p.range?.[1] ?? Infinity;
+  const rallyPositions = useMemo(() => {
+    if (!p.range) return p.positions;
+    const m = new Map<number, V3>();
+    for (const [f, q] of p.positions) if (f >= r0 && f <= r1) m.set(f, q);
+    return m;
+  }, [p.positions, p.range, r0, r1]);
+  const rallyTouches = useMemo(() => touches.filter((t) => t.frame >= r0 && t.frame <= r1), [touches, r0, r1]);
+  const rallySegments = useMemo(() => p.segments.filter((s) => s.from >= r0 && s.to <= r1), [p.segments, r0, r1]);
+  const rallyProblems = useMemo(() => insp.open.filter((x) => (x.frameEnd ?? x.frame) >= r0 && x.frame <= r1), [insp.open, r0, r1]);
+
   const aspect = videoSize.width && videoSize.height ? videoSize.width / videoSize.height : 0;
   const project = useProjector(p.calibration, aspect, frames, cur);
   const tol = touchMatchFrames(fps);
@@ -183,8 +200,13 @@ export default function RallyInspector(p: Readonly<Props>) {
     // Not a touch: nor anywhere in 3D.
     const pins = { ...e.pins };
     if (kind === "none") for (const f of Object.keys(pins)) if (Math.abs(Number(f) - frame) <= 2) delete pins[Number(f)];
+    // A net touch starts on the net, a floor touch on the floor. A pin you placed yourself stays.
+    if (!(frame in pins)) {
+      const snap = touchSnapPosition(kind, frame, frames, p.positions, p.calibration, aspect);
+      if (snap) pins[frame] = snap;
+    }
     return { ...e, touches: t, pins };
-  }), [onEdit]);
+  }), [onEdit, frames, p.positions, p.calibration, aspect]);
   const setPin = useCallback((frame: number, pos: V3 | null) => onEdit((e) => {
     const pins = { ...e.pins };
     if (pos) pins[frame] = pos; else delete pins[frame];
@@ -241,7 +263,7 @@ export default function RallyInspector(p: Readonly<Props>) {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === "b" || e.key === "B") setTool((x) => (x === "ball" ? "none" : "ball"));
       else if (e.key === "x" || e.key === "X") setBall(cur, null);
-      else if (e.key === "t" || e.key === "T") { if (!touchHere) setTouch(cur, addType); }
+      else if (e.key === "t" || e.key === "T") { if (!touchHere || touchHere.frame !== cur) setTouch(cur, addType); }
       else if (e.key === "[") stepProblem(-1);
       else if (e.key === "]") stepProblem(1);
       else if (e.key === "Escape") setTool("none");
@@ -436,8 +458,9 @@ export default function RallyInspector(p: Readonly<Props>) {
   }, [edits.ball, edits.touches, edits.pins, edits.arcs, onEdit, clearTouch, setPin, setArc]);
 
   const scoreColor = insp.score >= 80 ? "var(--ok)" : insp.score >= 55 ? "var(--warn)" : "var(--bad)";
-  const shown = showHidden ? insp.problems : insp.open;
-  const hiddenCount = insp.problems.length - insp.open.length;
+  const inRally = (x: Problem) => (x.frameEnd ?? x.frame) >= r0 && x.frame <= r1;
+  const shown = (showHidden ? insp.problems : insp.open).filter(inRally);
+  const hiddenCount = insp.problems.filter(inRally).length - rallyProblems.length;
   const isCurrent = (pr: Problem) => cur >= pr.frame && cur <= (pr.frameEnd ?? pr.frame);
 
   let saveText = "";
@@ -489,15 +512,15 @@ export default function RallyInspector(p: Readonly<Props>) {
         </div>
         <CourtEditor3D
           flash={flash === "3d"}
-          frames={frames} positions={p.positions} touches={touches} calibration={p.calibration} aspect={aspect}
+          frames={frames} positions={rallyPositions} touches={rallyTouches} calibration={p.calibration} aspect={aspect}
           cur={cur} selected={touchHere?.frame ?? null} onSelect={onSeek} onPin={(f, q) => setPin(f, q)}
-          fps={fps} segments={p.segments} onArc={setArc} onResetSegment={resetSegment}
+          fps={fps} segments={rallySegments} onArc={setArc} onResetSegment={resetSegment}
           onUndo={p.onUndo} onRedo={p.onRedo} canUndo={p.canUndo} canRedo={p.canRedo}
         />
         </div>
         <Timeline
-          frames={frames} fps={fps} positions={p.positions} touches={touches} edits={edits}
-          problems={insp.open} rally={insp.rally} cur={cur} onSeek={onSeek}
+          frames={frames} fps={fps} positions={rallyPositions} touches={rallyTouches} edits={edits}
+          problems={rallyProblems} rally={insp.rally} range={p.range ?? null} cur={cur} onSeek={onSeek}
         />
       </div>
 
@@ -509,7 +532,7 @@ export default function RallyInspector(p: Readonly<Props>) {
               <div className="inspect-score-num" style={{ color: scoreColor }}>{insp.score.toFixed(0)}</div>
             </div>
             <div className="inspect-score-meta">
-              <div>{insp.open.length} open problem{insp.open.length === 1 ? "" : "s"}</div>
+              <div>{rallyProblems.length} open problem{rallyProblems.length === 1 ? "" : "s"}{p.range ? " in this rally" : ""}</div>
               <div>{corrections.length} correction{corrections.length === 1 ? "" : "s"}</div>
               <div className="muted">{insp.stats.touches} touches</div>
             </div>
@@ -612,6 +635,15 @@ export default function RallyInspector(p: Readonly<Props>) {
                   {touchHere.frame in edits.touches && <button className="inspect-btn" onClick={() => clearTouch(touchHere.frame)}>Undo type</button>}
                   {touchHere.pinned && <button className="inspect-btn" onClick={() => setPin(touchHere.frame, null)}>Reset 3D position</button>}
                 </div>
+                {/* A touch a few frames away (an attack, then the net) must not stop another one being added here. */}
+                {touchHere.frame !== cur && (
+                  <div className="inspect-buttons">
+                    <select value={addType} onChange={(e) => setAddType(e.target.value as TouchKind)} aria-label="Type of touch to add">
+                      {TOUCH_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+                    </select>
+                    <button className="inspect-btn primary" onClick={() => setTouch(cur, addType)} title="T">Add another touch at f{cur} <kbd>T</kbd></button>
+                  </div>
+                )}
               </>
             ) : (
               <>
@@ -674,15 +706,21 @@ function Timeline(p: Readonly<{
   edits: RallyEdits;
   problems: Problem[];
   rally: [number, number];
+  /** Frames shown before any zoom: the rally being edited, or the whole clip. */
+  range: [number, number] | null;
   cur: number;
   onSeek: (f: number) => void;
 }>) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const scrubFrame = useRef<number | null>(null);
   const [view, setView] = useState<[number, number] | null>(null);
+  // A new rally starts unzoomed.
+  const r0 = p.range?.[0], r1 = p.range?.[1];
+  useEffect(() => setView(null), [r0, r1]);
   const [width, setWidth] = useState(0);
   const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null);
   const n = Math.max(1, p.frames.length - 1);
-  const [f0, f1] = view ?? [0, n];
+  const [f0, f1] = view ?? (p.range ? [p.range[0], Math.max(p.range[0] + 1, p.range[1])] : [0, n]);
   const top = 18;
   const lanes = useMemo(() => {
     let y = top;
@@ -830,13 +868,28 @@ function Timeline(p: Readonly<{
     <div className="inspect-timeline">
       <canvas
         ref={ref}
-        style={{ height }}
-        onClick={(e) => { const f = frameAt(e); if (f != null) p.onSeek(f); }}
+        style={{ height, touchAction: "none" }}
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          const f = frameAt(e);
+          if (f == null) return;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          scrubFrame.current = f;
+          p.onSeek(f);
+        }}
+        onPointerMove={(e) => {
+          const f = frameAt(e);
+          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+            const g = f ?? Math.max(0, Math.round(F(GUTTER)));
+            if (g !== scrubFrame.current) { scrubFrame.current = g; p.onSeek(g); }
+          }
+          if (e.pointerType === "mouse") setTip(f == null ? null : { x: e.clientX, y: e.clientY, text: tipText(f) });
+        }}
+        onPointerUp={() => { scrubFrame.current = null; }}
         onDoubleClick={() => setView(null)}
-        onMouseMove={(e) => { const f = frameAt(e); setTip(f == null ? null : { x: e.clientX, y: e.clientY, text: tipText(f) }); }}
-        onMouseLeave={() => setTip(null)}
+        onPointerLeave={() => setTip(null)}
       />
-      <div className="inspect-tl-help">Click to jump · wheel to zoom · double-click to reset · lines: touches (solid = yours) · cyan: your corrections</div>
+      <div className="inspect-tl-help">Click or drag to scrub · wheel to zoom · double-click to reset · lines: touches (solid = yours) · cyan: your corrections</div>
       {tip && <div className="inspect-tip" style={{ left: Math.min(tip.x + 14, window.innerWidth - 320), top: tip.y + 14 }}>{tip.text}</div>}
     </div>
   );

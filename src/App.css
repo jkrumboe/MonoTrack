@@ -734,6 +734,20 @@ button, input, select {
   font-variant-numeric: tabular-nums;
 }
 
+.scoreboard-final {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  padding: 4px 14px;
+  border-top: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.scoreboard-final-score { color: var(--text-primary); font-weight: 600; }
+
 /* === Rallies === */
 .match-panel {
   padding: 12px;

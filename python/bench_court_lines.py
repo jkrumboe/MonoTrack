@@ -77,6 +77,84 @@ def draw(frame, corners, color):
         cv2.polylines(frame, [pts], False, color, 2)
 
 
+VB14 = os.path.join(EVAL, "videos", "vb14")
+# The flips of the court onto itself: a detection may number the court from
+# the other end or side, which is the same court in the picture.
+_FLIPS = [np.diag([sx, sz, 1.0]) for sx in (1, -1) for sz in (1, -1)]
+
+
+def vb14_truth(court):
+    """Centred court (x, z) -> normalised image, from a VB14 calibration.
+
+    VB14's homography maps image pixels to a 9 x 9 m half court in 1 cm units
+    from 1 to 900: u across, v from the centre line (1) to the end line nearest
+    the camera (900), which is +z here.
+    """
+    A = np.array([[899 / 9.0, 0, 1 + 899 / 2.0], [0, 899 / 9.0, 1], [0, 0, 1]])
+    H = np.linalg.inv(np.array(court["homography"], np.float64)) @ A
+    return np.diag([1 / 1920.0, 1 / 1080.0, 1.0]) @ H
+
+
+def bench_vb14(detect, args, only):
+    """Detector on frames spread over each VB14 video, against its calibration.
+
+    The camera is fixed, so one calibration holds for the whole video.
+    """
+    errs_all, n_frames, n_found, total_t = [], 0, 0, 0.0
+    for court_path in sorted(glob.glob(os.path.join(VB14, "labels", "*", "court.json"))):
+        name = os.path.basename(os.path.dirname(court_path)).removeprefix("vb14-")
+        video = os.path.join(VB14, name + ".avi")
+        if (only and name not in only) or not os.path.exists(video):
+            continue
+        Ht = vb14_truth(json.load(open(court_path)))
+        cap = cv2.VideoCapture(video)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        errs, misses = [], []
+        for k in range(args.vb14_frames):
+            i = int((k + 0.5) * total / args.vb14_frames)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            n_frames += 1
+            t0 = time.time()
+            corners, info = detect(frame)
+            total_t += time.time() - t0
+            if corners is None:
+                misses.append((i, info))
+            else:
+                n_found += 1
+                es = [frame_error(Ht, _flip_corners(corners, F)) for F in _FLIPS]
+                es = [x for x in es if x is not None]
+                e = min(es) if es else None
+                errs.append((i, e, info.get("view")))
+            if args.draw:
+                os.makedirs(args.draw, exist_ok=True)
+                out = frame.copy()
+                draw(out, _apply(Ht, CORNERS), (0, 255, 0))
+                if corners is not None:
+                    draw(out, corners, (0, 0, 255))
+                cv2.imwrite(os.path.join(args.draw, f"vb14-{name}_{i:05d}.jpg"), cv2.resize(out, (960, 540)))
+        cap.release()
+        es = [e for _, e, _ in errs if e is not None]
+        errs_all += es
+        why = f"  (missed: {misses[0][1]})" if misses else ""
+        print(f"{name:20s} found {len(errs)}/{len(errs) + len(misses)}  "
+              f"median {np.median(es) if es else float('nan'):7.1f} px  "
+              f"max {max(es) if es else float('nan'):7.1f} px{why}")
+    if errs_all:
+        a = np.array(errs_all)
+        print(f"\nVB14  found {n_found}/{n_frames}  median {np.median(a):.1f} px  "
+              f"<20px {np.mean(a < 20) * 100:.0f}%  <50px {np.mean(a < 50) * 100:.0f}%  "
+              f"mean time {total_t / max(1, n_frames) * 1000:.0f} ms/frame")
+
+
+def _flip_corners(corners, F):
+    """The detected court numbered from the other end and/or side."""
+    Hd, _ = cv2.findHomography(CORNERS, np.array(corners, np.float64))
+    return _apply(Hd @ F, CORNERS)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stride", type=int, default=25)
@@ -84,6 +162,8 @@ def main():
     ap.add_argument("--detector", default="lines", choices=["lines", "colour"])
     ap.add_argument("--draw", default="")
     ap.add_argument("--label-frames", action="store_true")
+    ap.add_argument("--vb14", action="store_true", help="score the VB14 videos against their calibration instead")
+    ap.add_argument("--vb14-frames", type=int, default=8, help="frames per VB14 video")
     args = ap.parse_args()
 
     if args.detector == "lines":
@@ -92,6 +172,9 @@ def main():
         from court_detect import detect_court_corners as detect
 
     only = set(filter(None, args.only.split(",")))
+    if args.vb14:
+        bench_vb14(detect, args, only)
+        return
     all_err, n_frames, n_found, total_t = [], 0, 0, 0.0
     for label_path in sorted(glob.glob(os.path.join(EVAL, "labels", "*.json"))):
         clip = os.path.splitext(os.path.basename(label_path))[0]

@@ -4,7 +4,8 @@
  *
  * Each touch is a ball with a ring on the floor below it. Dragging the ball
  * moves it up and down only (in a wall facing the view); dragging the ring
- * moves it along the floor at its height. Alt flips the two. With "snap to
+ * moves it along the floor at its height. Alt flips the two. A floor touch
+ * only moves along the floor, by the ball or the ring. With "snap to
  * line of sight" on
  * (Shift flips it), the touch slides along the camera's line of sight
  * through the ball instead. Grabbing the path anywhere else puts a new touch
@@ -30,6 +31,8 @@ const G = 9.81;
 const HIT_PX = 12, PATH_HIT_PX = 8;
 /** Furthest (m) a drag may put a touch from the centre of the court, and highest. */
 const REACH_M = 60, TOP_M = 30;
+/** Ball radius (m): a floor touch has the ball's centre this high. */
+const BALL_R = 0.105;
 const ORBIT_TARGET = new THREE.Vector3(0, 1, 0);
 const CYAN = 0x00e5ff;
 
@@ -55,6 +58,8 @@ type Drag =
   /** A touch, or a new one on the path (`fresh`), and where it is now. */
   | {
     kind: "touch"; frame: number; pos: V3; fresh: boolean; snapped: boolean; mode: "height" | "floor";
+    /** A floor touch: it only moves along the floor, the ball resting on it. */
+    onFloor?: boolean;
     /** Screen offset (px) from the pointer to the ball and to its ring at the grab, so neither jumps to the cursor. */
     offBall: [number, number]; offRing: [number, number];
   }
@@ -205,7 +210,11 @@ export default function RallyEditor3DView(p: Readonly<Props>) {
       };
       if (hit.kind === "touch") {
         cur.onSelect(hit.t.frame);
-        setDrag({ kind: "touch", frame: hit.t.frame, pos: hit.t.position, fresh: false, snapped: false, mode: hit.mode, ...offsets(hit.t.position) });
+        const onFloor = hit.t.label === "floor";
+        setDrag({
+          kind: "touch", frame: hit.t.frame, pos: hit.t.position, fresh: false, snapped: false,
+          mode: onFloor ? "floor" : hit.mode, onFloor, ...offsets(hit.t.position),
+        });
       } else if (hit.kind === "arc") {
         setDrag({ kind: "arc", from: hit.sg.from, midY: hit.sg.mid[1] });
       } else {
@@ -218,7 +227,7 @@ export default function RallyEditor3DView(p: Readonly<Props>) {
       const d = dragRef.current;
       if (!d) {
         const hit = controls.enabled ? pick(mx, my) : null;
-        renderer.domElement.style.cursor = !hit ? "" : hit.kind === "touch" ? (hit.mode === "height" ? "ns-resize" : "move") : hit.kind === "arc" ? "ns-resize" : "copy";
+        renderer.domElement.style.cursor = !hit ? "" : hit.kind === "touch" ? (hit.mode === "height" && hit.t.label !== "floor" ? "ns-resize" : "move") : hit.kind === "arc" ? "ns-resize" : "copy";
         return;
       }
       const r = mouseRay(mx, my);
@@ -227,6 +236,18 @@ export default function RallyEditor3DView(p: Readonly<Props>) {
         if (!sg) return;
         const at = r.intersectPlane(new THREE.Plane().setFromNormalAndCoplanarPoint(wallNormal(), vec(sg.mid)), new THREE.Vector3());
         if (at) setDrag({ ...d, midY: Math.max(0.2, Math.min(TOP_M, at.y)) });
+        return;
+      }
+      if (d.onFloor) {
+        // Along the floor only, whichever of ball and ring was grabbed: they are on top of each other.
+        const pr = mouseRay(mx + d.offBall[0], my + d.offBall[1]);
+        const at = pr.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -BALL_R), new THREE.Vector3());
+        if (at) {
+          setDrag({
+            ...d, snapped: false,
+            pos: [Math.max(-REACH_M, Math.min(REACH_M, at.x)), BALL_R, Math.max(-REACH_M, Math.min(REACH_M, at.z))],
+          });
+        }
         return;
       }
       const { ray, snap } = props.current;

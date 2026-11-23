@@ -26,6 +26,17 @@ function solved(fx: Fixture, truth: Truth | null) {
   return { base, fps: fx.video.fps };
 }
 
+describe("touches too far apart for one flight", () => {
+  it("are not joined by an arc", () => {
+    const fps = 25;
+    const at = (frame: number, z: number): RefitTouch => ({ frame, position: [0, 2, z], label: "attack" });
+    // One rally ends at frame 100; the next starts 20 s later, with no ball solved between.
+    const r = refitEditedPath({ touches: [at(100, -3), at(600, 8)], positions: new Map(), fps });
+    expect(r.segments).toHaveLength(0);
+    expect(r.positions.size).toBe(0);
+  });
+});
+
 const synth = syntheticCases().find((c) => c.name === "tripod-long-30")!;
 const long = realCases().find((c) => c.name === "usa_jap_r3");
 

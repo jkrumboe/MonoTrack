@@ -133,11 +133,24 @@ export function Scrubber({ timeline, totalFrames, currentFrame, fps, kinds, onSe
 
 interface ScoreboardProps {
   timeline: MatchTimeline;
+  /** The score shown is the one at this frame: points of the rallies that have ended by then. */
+  currentFrame: number;
   teams: Partial<Record<Side, string>> | undefined;
   onRenameTeam: (side: Side, name: string) => void;
 }
 
-export function Scoreboard({ timeline, teams, onRenameTeam }: ScoreboardProps) {
+/** The score once every rally that has ended by `frame` is counted. */
+export function scoreAt(timeline: MatchTimeline, frame: number): Record<Side, number> {
+  let score: Record<Side, number> = { near: 0, far: 0 };
+  for (const r of timeline.rallies) {
+    if (r.endFrame > frame) break;
+    score = r.score;
+  }
+  return score;
+}
+
+export function Scoreboard({ timeline, currentFrame, teams, onRenameTeam }: ScoreboardProps) {
+  const score = scoreAt(timeline, currentFrame);
   return (
     <div className="scoreboard">
       {SIDES.map((s) => (
@@ -150,9 +163,14 @@ export function Scoreboard({ timeline, teams, onRenameTeam }: ScoreboardProps) {
             aria-label={`Name of the team on the ${s} side`}
             title="Click to name this team"
           />
-          <div className="scoreboard-score">{timeline.score[s]}</div>
+          <div className="scoreboard-score">{score[s]}</div>
         </div>
       ))}
+      <div className="scoreboard-final">
+        <span>Final</span>
+        <span className="scoreboard-final-score">{timeline.score.near}–{timeline.score.far}</span>
+        <span>{timeline.rallies.length} rallies</span>
+      </div>
     </div>
   );
 }

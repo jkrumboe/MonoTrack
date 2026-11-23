@@ -357,3 +357,21 @@ No published volleyball model was better than what is used: VballNet scores 55 a
 
 - **Players**: `python/train_players.py`. A large detector labels every 5th frame of your videos, keeping only people on or near the court where the clip has a court, and a small one is trained on those labels (`label`, then `train`; it saves `python/models/players.pt`, which the analyzer then uses). Tested end to end with one epoch; no real training run was done, so whether a trained student beats YOLOv8s is not measured. Compare it with `python/bench_players.py mine python/models/players.pt --stride 2`. The court filter leaves ~16 people a frame instead of ~35.
 - **Ball**: `python/label_ball.py` and `python/train_ball.py` (section 11) fine-tune TrackNetV2 on hand-labelled frames and keep the new weights only if they score better on held-out frames. This is where tripod footage will need it most.
+
+## 15. Court detection in a multi-sport hall (VB14, 2026-11-23)
+
+`python python/bench_court_lines.py --vb14` scores the line detector on 8 frames spread over each of the 6 VB14 videos (Austrian league, fixed camera behind one end line), against the dataset's own court calibration. None of these videos is in the eval set.
+
+| | Found | Median error | < 50 px |
+|---|---|---|---|
+| `white_line_mask` (now) | 40/48 | 390 px | 0% |
+
+Every frame is wrong. The volleyball court in this hall is not what the detector looks for:
+- The lines are pairs of thin grey hairlines (~2 px each, ~5 px apart at 1080p), darker than the parquet (L 100-120 on 180 near the camera, 160 on 172 far away), not bright white ones.
+- The right sideline is fainter than the wood grain: it does not appear in a dark-line mask even at a contrast of 12. The near end line is the thin blue edge of an orange stripe.
+- The strong lines on the floor belong to other sports: orange stripes (a larger court), black basketball lines, yellow lines.
+
+Tried and not kept:
+- **A dark-line mask** (ridge darker than the floor on both sides, near grey), the same detector run on it. It finds a court on the sample frame, but a wrong one (side view). With it the left sideline ranks 2nd of the steep line candidates, but the centre and far end lines rank 31st and 39th of the shallow ones, behind basketball lines, and the right sideline is not found at all.
+
+For courts like this one the usable route is the hand alignment in the app. Detecting them would need lines averaged over many frames (players removed) and a line filter for paired hairlines, then a fit that tolerates a missing sideline: a larger piece of work, to be measured with `--vb14`.

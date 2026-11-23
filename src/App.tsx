@@ -1328,6 +1328,7 @@ function App() {
                   trace={solverTrace}
                   touchSplits={touchSplits}
                   touches={displayTouches}
+                  range={pathRange}
                   // A hand-aligned court is checked by eye; its error against
                   // the detected keypoints says nothing.
                   courtErrPx={manualCalibrationLocked ? null : calibrationLog?.maxKpErr ?? null}
@@ -1419,7 +1420,7 @@ function App() {
               />
             </div>
             {viewMode !== "inspect" && <div className="sidebar">
-              <Scoreboard timeline={timeline} teams={edits.teams} onRenameTeam={renameTeam} />
+              <Scoreboard timeline={timeline} currentFrame={currentFrame} teams={edits.teams} onRenameTeam={renameTeam} />
               <div className="sidebar-tabs" role="tablist">
                 <button
                   role="tab"

@@ -117,6 +117,44 @@ export function touchMatchFrames(fps: number): number {
   return Math.max(3, Math.round(0.15 * fps));
 }
 
+/** Ball radius (m): a ball on the floor has its centre this high. */
+const BALL_R = 0.105;
+
+/**
+ * Where a net or floor touch starts in 3D: the camera's line of sight through
+ * the ball where it crosses the net plane (z = 0) or meets the floor. Without a
+ * ball in the picture, the solved position moved onto the net or the floor.
+ * Null for other kinds, or when there is nothing to go on.
+ */
+export function touchSnapPosition(
+  kind: TouchKind | "none",
+  frame: number,
+  frames: FrameData[],
+  positions: Map<number, V3>,
+  calibration: { position: V3; lookAt: V3; fov: number; roll?: number } | null,
+  aspect: number,
+): V3 | null {
+  if (kind !== "net" && kind !== "floor") return null;
+  const ray = calibration && aspect ? ballRay(frames, frame, calibration, aspect) : null;
+  if (ray) {
+    const { origin: o, dir: d } = ray;
+    if (kind === "net" && Math.abs(d[2]) > 1e-6) {
+      const t = -o[2] / d[2];
+      const y = o[1] + t * d[1], x = o[0] + t * d[0];
+      // Somewhere a ball can touch the net: up to the top of the antennas, between them with some slack.
+      if (t > 0 && y > 0 && y < 4 && Math.abs(x) < 6) return [x, y, 0];
+    }
+    if (kind === "floor" && d[1] < -1e-6) {
+      const t = (BALL_R - o[1]) / d[1];
+      const x = o[0] + t * d[0], z = o[2] + t * d[2];
+      if (t > 0 && Math.abs(x) < 15 && Math.abs(z) < 20) return [x, BALL_R, z];
+    }
+  }
+  const q = positionNear(positions, frame);
+  if (!q) return null;
+  return kind === "net" ? [q[0], q[1], 0] : [q[0], BALL_R, q[2]];
+}
+
 /** Solved position at a frame, or the nearest solved one up to half a second away. */
 function positionNear(positions: Map<number, V3>, f: number): V3 | null {
   for (let d = 0; d <= 15; d++) {
