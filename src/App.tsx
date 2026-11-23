@@ -37,6 +37,9 @@ type ViewMode = "side-by-side" | "overlay" | "inspect";
 const DEFAULT_SPLIT_PCT = 56;
 const MIN_SPLIT_PCT = 25;
 
+/** localStorage key for the "Rallies only" playback switch. */
+const RALLIES_ONLY_KEY = "playback.ralliesOnly";
+
 const COURT_KEYPOINTS_3D: [number, number, number][] = [
   [-4.5, 0, -9.0], // far-left corner
   [ 4.5, 0, -9.0], // far-right corner
@@ -221,7 +224,12 @@ function App() {
   /** Touch kinds picked in the Match tab; all when empty. */
   const [matchKinds, setMatchKinds] = useState<Set<string>>(new Set());
   /** Playback jumps over the breaks between rallies. */
-  const [ralliesOnly, setRalliesOnly] = useState(false);
+  const [ralliesOnly, setRalliesOnly] = useState(() => {
+    try { return localStorage.getItem(RALLIES_ONLY_KEY) === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(RALLIES_ONLY_KEY, ralliesOnly ? "1" : "0"); } catch { /* private window */ }
+  }, [ralliesOnly]);
 
   const [currentFrame, setCurrentFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -962,6 +970,15 @@ function App() {
     setCurrentFrame(next.clipStart);
   }, [ralliesOnly, isPlaying, isRealVideo, result, timeline, currentFrame]);
 
+  // The 3D view draws one rally's path: the one playing, or in a break the one
+  // just played (the next one before the first). Null without rallies: whole clip.
+  const pathRally =
+    rallyAt(timeline.rallies, currentFrame) ??
+    [...timeline.rallies].reverse().find((r) => r.clipEnd < currentFrame) ??
+    timeline.rallies[0] ??
+    null;
+  const pathRange: [number, number] | null = pathRally ? [pathRally.clipStart, pathRally.clipEnd] : null;
+
   // Scrubbing or stepping always pauses, so the video doesn't fight the slider.
   // The slider can fire several input events per screen refresh; re-rendering
   // the whole app for each is wasted work, so apply at most one per frame.
@@ -1280,6 +1297,7 @@ function App() {
                       resetViewTrigger={resetViewTrigger}
                       trajectoryMode={trajectoryMode}
                       touches={displayTouches}
+                      pathRange={pathRange}
                     />
                     <span className="pane-label">3D reconstruction</span>
                     <button

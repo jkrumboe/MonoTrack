@@ -111,6 +111,8 @@ interface SkeletonViewerProps {
   trajectoryMode?: TrajectoryMode;
   /** Player touches from the rally solver, drawn as coloured markers. */
   touches?: BallTouch[];
+  /** First and last frame of the path to draw (the current rally); the whole clip when null. */
+  pathRange?: [number, number] | null;
 }
 
 /** Behind the 3D court: the stage colour of the app (--bg-stage in App.css). */
@@ -164,7 +166,11 @@ export default function SkeletonViewer({
   resetViewTrigger,
   trajectoryMode,
   touches,
+  pathRange,
 }: SkeletonViewerProps) {
+  const pathStart = pathRange?.[0] ?? -Infinity;
+  const pathEnd = pathRange?.[1] ?? Infinity;
+  const inPath = (frame: number) => frame >= pathStart && frame <= pathEnd;
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayModeRef = useRef(overlay);
   const overlayAspectRef = useRef<number | undefined>(overlayVideoAspect);
@@ -594,6 +600,7 @@ export default function SkeletonViewer({
     for (let i = 1; i < ballTrajectory.length; i++) {
       const prev = ballTrajectory[i - 1];
       const curr = ballTrajectory[i];
+      if (!inPath(prev.frame) || !inPath(curr.frame)) continue;
       // Over the video only the ball's recent past is drawn.
       if (overlay && (curr.frame > currentFrame || prev.frame < currentFrame - OVERLAY_TRAIL_FRAMES)) continue;
       const frameDiff = curr.frame - prev.frame;
@@ -609,7 +616,7 @@ export default function SkeletonViewer({
       }
     }
     for (const p of ballTrajectory) {
-      if (overlay || p.frame % 4 !== 0) continue;
+      if (overlay || p.frame % 4 !== 0 || !inPath(p.frame)) continue;
       dropPoints.push(new THREE.Vector3(p.x, FLOOR_Y, p.z), new THREE.Vector3(p.x, p.y, p.z));
     }
     for (const [line, pts] of [[ballTrail, segPoints], [estimatedTrail, estimatedPoints], [groundTrail, groundPoints], [dropLines, dropPoints]] as const) {
@@ -617,7 +624,7 @@ export default function SkeletonViewer({
       line.geometry = new THREE.BufferGeometry().setFromPoints(pts);
     }
     estimatedTrail.computeLineDistances();
-  }, [ballTrajectory, currentFrame, overlay]);
+  }, [ballTrajectory, currentFrame, overlay, pathStart, pathEnd]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Touch markers: a small sphere where the ball was played, and a ring on the
   // floor below it at the player's spot.
@@ -632,6 +639,7 @@ export default function SkeletonViewer({
       }
     }
     for (const t of touches ?? []) {
+      if (!inPath(t.frame)) continue;
       // Over the video: only the touches around now, and no floor ring.
       if (overlay && Math.abs(t.frame - (currentFrame ?? 0)) > OVERLAY_TOUCH_FRAMES) continue;
       const color = touchColor(t.label);
@@ -651,7 +659,7 @@ export default function SkeletonViewer({
       ring.position.set(x, 0.015, z);
       touchMarkers.add(ring);
     }
-  }, [touches, overlay, overlay ? currentFrame : 0]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [touches, overlay, overlay ? currentFrame : 0, pathStart, pathEnd]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return <div ref={containerRef} style={{ width: "100%", height: "100%", minHeight: 400 }} />;
 }

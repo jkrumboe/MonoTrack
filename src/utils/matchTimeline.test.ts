@@ -79,6 +79,23 @@ describe("buildMatchTimeline", () => {
     expect(tl.rallies[0].winnerSource).toBeNull();
   });
 
+  it("leaves out the ball being returned to the server between points", () => {
+    const touches = [
+      ...rally(0, 10, [[2, "reception", -6], [3, "set", -1], [4, "attack", -3]]),
+      // Long after the point, the ball is knocked back to the far server.
+      t(14, "touch", -8), t(15, "touch", -11),
+      ...rally(20, -10, [[2, "reception", 6]]),
+    ];
+    const tl = buildMatchTimeline({ touches, positions: new Map(), fps: FPS, totalFrames: 30 * FPS });
+    expect(tl.rallies.map((r) => r.index)).toEqual([1, 2]);
+    expect(tl.rallies.map((r) => r.server)).toEqual(["near", "far"]);
+    // The serve after the returned ball still scores the rally before it.
+    expect(tl.rallies[0].winner).toBe("far");
+    expect(tl.rallies[0].winnerSource).toBe("next-serve");
+    // The rally is followed only up to the returned ball, not into it.
+    expect(tl.rallies[0].endFrame).toBeLessThan(14 * FPS);
+  });
+
   it("finds rallies by frame", () => {
     const touches = [...rally(10, 10), ...rally(40, -10)];
     const { rallies } = buildMatchTimeline({ touches, positions: new Map(), fps: FPS, totalFrames: 60 * FPS });

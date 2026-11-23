@@ -3,7 +3,9 @@
  * solver's touches: what a coach scrolls through instead of the raw video.
  *
  * A rally starts at a serve (or the toss before it) and holds every touch up
- * to the next one. Volleyball uses rally-point scoring - the team that wins a
+ * to the next one. Touches the rally rules could not type, on their own, are
+ * the ball going back to the server between points and are left out.
+ * Volleyball uses rally-point scoring - the team that wins a
  * rally serves the next - so the side that serves next is the most reliable
  * evidence of who won the point. Where there is no next serve (the last rally,
  * or one the camera missed) the point goes by where the ball came down: in
@@ -107,6 +109,15 @@ function opensRally(t: BallTouch, prev: BallTouch | undefined): boolean {
   return k === "serve" && (!prev || touchKind(prev.label) !== "toss");
 }
 
+/**
+ * True when a group of touches is play. Between points the ball is knocked
+ * or thrown back to the next server; the rally rules find no type for those
+ * touches ("touch"), so a group with nothing but those is not a rally.
+ */
+function isPlay(group: readonly BallTouch[]): boolean {
+  return group.some((t) => touchKind(t.label) !== "touch");
+}
+
 /** Where the ball ended up: the last solved position in [from, to]. */
 function lastPosition(
   positions: TimelineInput["positions"],
@@ -170,7 +181,8 @@ export function buildMatchTimeline(inp: TimelineInput): MatchTimeline {
     else cur.push(t);
   });
 
-  const rallies: Rally[] = groups.map((g, i) => {
+  const rallies: Rally[] = groups.map((g, i): Rally | null => {
+    if (!isPlay(g)) return null;
     const touches: TimelineTouch[] = g.map((t) => ({
       frame: t.frame,
       time: t.frame / fps,
@@ -198,7 +210,9 @@ export function buildMatchTimeline(inp: TimelineInput): MatchTimeline {
       lastBall: ball?.pos ?? null,
       score: { near: 0, far: 0 },
     };
-  });
+  })
+    .filter((r): r is Rally => r !== null)
+    .map((r, i) => ({ ...r, index: i + 1 }));
 
   // Point winners, then the running score.
   rallies.forEach((r, i) => {

@@ -1,4 +1,4 @@
-import { nextRallyAfter, rallyAt, type MatchTimeline } from "../utils/matchTimeline";
+import { nextRallyAfter, rallyAt, type MatchTimeline, type Rally } from "../utils/matchTimeline";
 import { IconNextRally, IconPause, IconPlay, IconPrevRally, IconStepBack, IconStepForward } from "./Icons";
 import { Scrubber } from "./MatchTimeline";
 
@@ -26,6 +26,25 @@ function formatTime(seconds: number): string {
   return `${m}:${(s - m * 60).toFixed(1).padStart(4, "0")}`;
 }
 
+/**
+ * Playing time: the frames inside rallies, all of them and those before
+ * `frame`. Rally clips can overlap at their lead-in and tail, so they are
+ * merged first.
+ */
+function rallyTime(rallies: readonly Rally[], frame: number): { elapsed: number; total: number } {
+  let elapsed = 0;
+  let total = 0;
+  let coveredTo = -1;
+  for (const r of rallies) {
+    const start = Math.max(r.clipStart, coveredTo + 1);
+    if (r.clipEnd < start) continue;
+    total += r.clipEnd - start + 1;
+    elapsed += Math.max(0, Math.min(r.clipEnd + 1, frame) - start);
+    coveredTo = r.clipEnd;
+  }
+  return { elapsed, total };
+}
+
 export default function PlaybackControls({
   currentFrame,
   totalFrames,
@@ -43,6 +62,7 @@ export default function PlaybackControls({
   const next = nextRallyAfter(rallies, currentFrame);
   const restartFrames = RESTART_RALLY_S * (fps ?? 30);
   const prev = [...rallies].reverse().find((r) => r.clipStart < currentFrame - restartFrames);
+  const playing = fps && ralliesOnly && rallies.length > 0 ? rallyTime(rallies, currentFrame) : null;
 
   return (
     <div className="playback-controls">
@@ -75,7 +95,14 @@ export default function PlaybackControls({
         </div>
 
         <span className="frame-counter">
-          {fps ? (
+          {fps && playing ? (
+            <span title="Playing time: the rallies only, without the breaks between them">
+              <b>{formatTime(playing.elapsed / fps)}</b> / {formatTime(playing.total / fps)}
+              <span className="frame-counter-sub">
+                Video {formatTime(currentFrame / fps)} · Frame {currentFrame + 1}
+              </span>
+            </span>
+          ) : fps ? (
             <>
               <b>{formatTime(currentFrame / fps)}</b> / {formatTime(totalFrames / fps)}
               <span className="frame-counter-sub">Frame {currentFrame + 1}</span>
