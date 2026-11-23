@@ -119,6 +119,11 @@ interface CourtCalibrationProps {
    */
   toReference?: (p: Pt) => Pt;
   fromReference?: (p: Pt) => Pt;
+  /**
+   * The court has not been confirmed for this video yet: `initialCalibration`
+   * (when given) is the auto-detected court, offered to be used as it is.
+   */
+  confirmAuto?: boolean;
 }
 
 export default function CourtCalibration({
@@ -132,6 +137,7 @@ export default function CourtCalibration({
   onCancel,
   toReference,
   fromReference,
+  confirmAuto = false,
 }: CourtCalibrationProps) {
   // Indexed like CALIBRATION_POINTS_3D: a point, null = skipped (not
   // visible), undefined = not reached yet. `step` walks CLICK_ORDER[view].
@@ -147,6 +153,8 @@ export default function CourtCalibration({
   const placedCount = points.filter(Boolean).length;
   const labelOf = (i: number) => (view === "side" ? SIDE_LABELS[i] : CALIBRATION_POINTS_3D[i].label);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
+  /** A projected point was dragged, so the points no longer show `initialCalibration` as it is. */
+  const [moved, setMoved] = useState(false);
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null);
   const [autoStatus, setAutoStatus] = useState<string>("");
   const [zoomedStep, setZoomedStep] = useState<number | null>(null);
@@ -308,7 +316,7 @@ export default function CourtCalibration({
     setIsPanning(true);
   }, [pan.x, pan.y]);
 
-  const handleWheel = useCallback((e: React.WheelEvent) => {
+  const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
     const container = containerRef.current;
     if (!container) return;
@@ -332,6 +340,16 @@ export default function CourtCalibration({
     });
   }, []);
 
+  // Attached natively, not as React's onWheel: React's wheel listener is
+  // passive, so preventDefault() there is ignored and the wheel would both
+  // zoom this view and scroll the page around it.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, [handleWheel]);
+
   useEffect(() => {
     if (dragIndex === null && !isPanning) return;
 
@@ -339,6 +357,7 @@ export default function CourtCalibration({
       if (dragIndex !== null) {
         const pos = clientToNormalized(e.clientX, e.clientY);
         if (!pos) return;
+        setMoved(true);
         setPoints((prev) => {
           const next = [...prev];
           next[dragIndex] = pos;
@@ -462,6 +481,12 @@ export default function CourtCalibration({
     onCalibrated(pipeline.pending);
   }, [pipeline, onCalibrated]);
 
+  /** Take the auto-detected court as it is. */
+  const handleUseAuto = useCallback(() => {
+    if (initialCalibration) onCalibrated(initialCalibration);
+  }, [initialCalibration, onCalibrated]);
+  const offerAuto = confirmAuto && adjusting && !!initialCalibration && !moved && !pipeline;
+
   const handleReset = useCallback(() => {
     setAdjusting(false);
     setPoints([]);
@@ -545,12 +570,20 @@ export default function CourtCalibration({
       className="calibration-overlay"
       onClick={handleClick}
       onMouseDown={handlePanStart}
-      onWheel={handleWheel}
       onContextMenu={(e) => e.preventDefault()}
       style={{ width: "100%", height: "100%", position: "absolute", top: 0, left: 0, cursor: adjusting ? "default" : activePoint >= 0 ? "crosshair" : "default", zIndex: 20 }}
     >
       <div className="calibration-instructions">
-        {adjusting ? (
+        {confirmAuto && (
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>
+            {initialCalibration
+              ? "Check the court before the rallies are worked out."
+              : "The court could not be found automatically: place it by hand, or try Auto Detect on another frame."}
+          </div>
+        )}
+        {offerAuto ? (
+          <span>These points are the auto-detected court. If they sit on the court lines, use it as it is. If not, drag them into place and Solve, or Re-place points to click them afresh.</span>
+        ) : adjusting ? (
           <span>Drag points to adjust intersections. Mouse wheel zooms, middle/right drag pans. Way off? Pick Behind/Side or Re-place points to click them afresh.</span>
         ) : activePoint >= 0 ? (
           <span>
@@ -645,6 +678,10 @@ export default function CourtCalibration({
         )}
         {!adjusting && activePoint >= 0 && (
           <button className="btn btn-secondary" onClick={handleSkip} title="This point is not in the picture">Skip point</button>
+        )}
+        {offerAuto && (
+          <button className="btn btn-primary" onClick={handleUseAuto} style={{ background: "#00cc66" }}
+            title="The detected court matches the lines: use it">✓ Use auto-detected court</button>
         )}
         {!adjusting && <button className="btn btn-primary" onClick={handleAutoDetect}>Auto Detect</button>}
         <button className="btn btn-secondary" onClick={() => setZoom((z) => Math.max(MIN_ZOOM, z / 1.2))}>−</button>

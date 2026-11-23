@@ -13,6 +13,7 @@ import { getBackend } from "../platform/backend";
 import type { Side } from "./matchTimeline";
 import type { FrameData } from "../hooks/useAnalysis";
 import type { BallReconstructionOptions, BallTouch } from "./ballReconstruction";
+import type { CalibrationResult } from "./cameraSolver";
 
 /**
  * Touch types that can be set by hand. The solver finds the first seven; a
@@ -20,6 +21,33 @@ import type { BallReconstructionOptions, BallTouch } from "./ballReconstruction"
  */
 export const TOUCH_KINDS = ["toss", "serve", "reception", "set", "attack", "block", "dig", "free ball", "net", "floor"] as const;
 export type TouchKind = (typeof TOUCH_KINDS)[number];
+
+/** What usually comes after each touch, most likely first. */
+const USUAL_NEXT: Record<string, readonly TouchKind[]> = {
+  start: ["serve", "toss"],
+  toss: ["serve"],
+  serve: ["reception", "net", "floor", "dig"],
+  reception: ["set", "attack", "free ball", "floor"],
+  set: ["attack", "set", "free ball", "net", "floor"],
+  attack: ["block", "dig", "floor", "net"],
+  block: ["dig", "set", "attack", "floor"],
+  dig: ["set", "attack", "free ball", "floor"],
+  "free ball": ["reception", "dig", "set", "floor"],
+  net: ["dig", "set", "floor", "block"],
+  floor: ["serve", "toss"],
+};
+
+/**
+ * Touch kinds ordered by how likely each is to follow `prev` (the label of the
+ * touch before, or undefined at the start of a rally): the usual ones first,
+ * then the rest in their normal order. A solver label like "block/dig" takes
+ * the successors of each of its kinds.
+ */
+export function touchKindsAfter(prev: string | undefined): TouchKind[] {
+  const parts = prev ? prev.split("/") : ["start"];
+  const usual = parts.flatMap((k) => USUAL_NEXT[k] ?? []);
+  return [...new Set([...usual, ...TOUCH_KINDS])];
+}
 
 /** Marker colour per touch type (a solver "block/dig" takes its first kind's). */
 export const TOUCH_COLORS: Record<string, string> = {
@@ -47,6 +75,12 @@ export interface RallyEdits {
   points?: Record<number, Side>;
   /** Team names by side of the court. */
   teams?: Partial<Record<Side, string>>;
+  /**
+   * The court alignment the user confirmed for this video (the auto-detected
+   * one accepted as is, or one placed by hand). Until there is one, the app
+   * asks for it and does not solve the ball path.
+   */
+  court?: CalibrationResult;
 }
 
 export const EMPTY_EDITS: RallyEdits = { version: 1, ball: {}, touches: {}, pins: {}, dismissed: [] };
@@ -243,7 +277,7 @@ export async function loadEdits(videoPath: string): Promise<RallyEdits> {
   const e = saved.edits ?? saved;
   return {
     version: 1, ball: e.ball ?? {}, touches: e.touches ?? {}, pins: e.pins ?? {}, arcs: e.arcs ?? {}, dismissed: e.dismissed ?? [],
-    points: e.points ?? {}, teams: e.teams ?? {},
+    points: e.points ?? {}, teams: e.teams ?? {}, court: e.court,
   };
 }
 

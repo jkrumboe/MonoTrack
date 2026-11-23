@@ -284,6 +284,10 @@ function App() {
   const edits = editHistory.present;
   /** Edits for the current video were loaded, so changes from here on are the user's and get saved. */
   const editsReadyRef = useRef(false);
+  /** The same, as state, for effects that wait on the saved edits (the confirmed court). */
+  const [editsLoaded, setEditsLoaded] = useState(false);
+  /** The video the court alignment was last opened for by itself, so Cancel does not reopen it. */
+  const courtPromptedForRef = useRef("");
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
   /** Ball-centre corrections as a map, for the Ball Debug tab's overlay. */
@@ -335,6 +339,9 @@ function App() {
 
   useEffect(() => {
     if (status !== "complete" || !calibration || !videoAspect || frames.length === 0) return;
+    // A real match waits for the user to confirm the court: a wrong court
+    // gives a wrong ball path, and solving with it is wasted work.
+    if (isRealVideo && !manualCalibrationLocked) return;
     // One worker per solve: when the inputs change mid-solve (a manual ball
     // correction, say) the stale solve is terminated rather than awaited.
     const worker = new Worker(new URL("./utils/solverWorker.ts", import.meta.url), { type: "module" });
@@ -392,7 +399,7 @@ function App() {
     worker.onerror = (e) => { setSolving(false); console.error("[ballSolver] worker error:", e.message); };
     worker.postMessage({ id: 0, args: [framesForSolver, calibration, videoAspect, solverOptions] } satisfies SolverRequest);
     return () => { worker.terminate(); setSolving(false); };
-  }, [status, calibration, videoAspect, framesForSolver, solverOptions]);
+  }, [status, calibration, videoAspect, framesForSolver, solverOptions, isRealVideo, manualCalibrationLocked]);
 
   /** The solver's touches with the hand touch corrections applied. */
   const displayTouches = useMemo(
@@ -659,14 +666,24 @@ function App() {
   // so an empty start cannot overwrite them.
   useEffect(() => {
     editsReadyRef.current = false;
+    setEditsLoaded(false);
+    courtPromptedForRef.current = "";
     setEditHistory(historyOf(EMPTY_EDITS));
     setSaveState("idle");
     if (!isRealVideo) return;
     let cancelled = false;
     loadEdits(videoPath)
-      .then((e) => { if (!cancelled) setEditHistory(historyOf(e)); })
+      .then((e) => {
+        if (cancelled) return;
+        setEditHistory(historyOf(e));
+        // A court confirmed before is used as it is.
+        if (e.court) {
+          setCalibration(e.court);
+          setManualCalibrationLocked(true);
+        }
+      })
       .catch((err) => console.warn("[edits] could not load:", err))
-      .finally(() => { if (!cancelled) editsReadyRef.current = true; });
+      .finally(() => { if (!cancelled) { editsReadyRef.current = true; setEditsLoaded(true); } });
     return () => { cancelled = true; };
   }, [videoPath, isRealVideo]);
 
@@ -676,6 +693,35 @@ function App() {
     setEditHistory((h) => historyPush(h, change(h.present)));
     if (isRealVideo) setSaveState("saving");
   }, [isRealVideo]);
+  /**
+   * Keep the court the user confirmed with the saved edits. It is not an
+   * undoable edit, so it is set in every state of the history.
+   */
+  const saveConfirmedCourt = useCallback((court: CalibrationResult) => {
+    if (!isRealVideo || !editsReadyRef.current) return;
+    setEditHistory((h) => ({
+      past: h.past.map((e) => ({ ...e, court })),
+      present: { ...h.present, court },
+      future: h.future.map((e) => ({ ...e, court })),
+    }));
+    // Written now, not after the usual delay: closing the match right after
+    // aligning would cancel a delayed save and lose the court.
+    setSaveState("saving");
+    saveEdits(videoPath, { ...edits, court })
+      .then(() => { setSaveState("saved"); setSaveError(null); })
+      .catch((err) => { setSaveState("error"); setSaveError(String(err)); });
+  }, [isRealVideo, videoPath, edits]);
+
+  // A newly imported match (no confirmed court yet) opens the court alignment
+  // by itself, showing the auto-detected court to use as it is or correct.
+  useEffect(() => {
+    if (status !== "complete" || !isRealVideo || !editsLoaded || manualCalibrationLocked) return;
+    if (courtPromptedForRef.current === videoPath) return;
+    courtPromptedForRef.current = videoPath;
+    setViewMode((m) => (m === "inspect" ? m : "side-by-side"));
+    setShowCalibration(true);
+  }, [status, isRealVideo, editsLoaded, manualCalibrationLocked, videoPath]);
+
   /** Step back or forward through the edits made in this session. */
   const stepEdits = useCallback((dir: -1 | 1) => {
     setEditHistory((h) => (dir < 0 ? historyUndo(h) : historyRedo(h)));
@@ -1039,6 +1085,9 @@ function App() {
   /** The court alignment editor, laid over a video pane of this size (side by side, or Inspect & edit). */
   const renderCalibration = (width: number, height: number) => (
     <CourtCalibration
+      // The auto-detected court can arrive after the editor opens: start
+      // again from it then, so it is shown to adjust or use as it is.
+      key={calibration ? "adjust" : "place"}
       width={width}
       height={height}
       videoPath={videoPath}
@@ -1049,8 +1098,10 @@ function App() {
         setCalibration(cal);
         setManualCalibrationLocked(true);
         setShowCalibration(false);
+        saveConfirmedCourt(cal);
         if (isRealVideo && videoAspect) saveCourtForMatch(videoPath, cal, videoAspect, courtData[0]?.frame ?? 0);
       }}
+      confirmAuto={isRealVideo && !manualCalibrationLocked}
       onCancel={() => setShowCalibration(false)}
       toReference={frameMapping?.toReference}
       fromReference={frameMapping?.fromReference}
@@ -1060,6 +1111,8 @@ function App() {
   const matchTitle = matchName
     || (videoPath === "demo.mp4" ? "Demo data" : videoPath && !videoPath.startsWith("job:") ? videoPath.split(/[\\/]/).pop() ?? "" : videoPath ? "Match" : "");
   const inMatch = screen === "analysis" && status === "complete" && !!result;
+  /** The court is set: confirmed by the user on a real match, any calibration on the demo. */
+  const courtConfirmed = isRealVideo ? manualCalibrationLocked : !!calibration;
   const diagnosticsTab = sidebarTab === "ball-debug" || sidebarTab === "depth";
 
   return (
@@ -1190,16 +1243,16 @@ function App() {
                   )}
                   {isRealVideo && (
                     <button
-                      className={`court-status ${showCalibration ? "open" : calibration ? "ok" : "warn"}`}
+                      className={`court-status ${showCalibration ? "open" : courtConfirmed ? "ok" : "warn"}`}
                       onClick={() => {
                         // Inspect & edit aligns the court over its own video; the other views in the side-by-side one.
                         if (viewMode !== "inspect") setViewMode("side-by-side");
                         setShowCalibration((v) => !v);
                       }}
-                      title={showCalibration ? "Close the court alignment" : calibration ? "Check or adjust the court alignment" : "The court is needed to find rallies and points"}
+                      title={showCalibration ? "Close the court alignment" : courtConfirmed ? "Check or adjust the court alignment" : "Confirm the court to find rallies and points"}
                     >
-                      {showCalibration ? <IconClose size={14} /> : calibration ? <IconCheck size={14} /> : <IconTarget size={14} />}
-                      {showCalibration ? "Close alignment" : calibration ? "Court aligned" : "Align court"}
+                      {showCalibration ? <IconClose size={14} /> : courtConfirmed ? <IconCheck size={14} /> : <IconTarget size={14} />}
+                      {showCalibration ? "Close alignment" : courtConfirmed ? "Court aligned" : "Align court"}
                     </button>
                   )}
                 </div>
@@ -1467,7 +1520,7 @@ function App() {
                   onSetWinner={setPointWinner}
                   pending={
                     !isRealVideo ? "Demo data has no rallies."
-                      : !calibration ? "Align the court to find rallies and points."
+                      : !courtConfirmed ? "Align the court to find rallies and points."
                       : solving ? "Solving the ball path…"
                       : null
                   }

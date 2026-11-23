@@ -10,7 +10,7 @@ import * as THREE from "three";
 import type { FrameData } from "../hooks/useAnalysis";
 import { aimCamera, type CalibrationResult } from "../utils/cameraSolver";
 import type { PhysicsReprojectionDebug, SolverTrace, TouchSplitDecision } from "../utils/ballReconstruction";
-import { TOUCH_KINDS, touchColor, touchMatchFrames, touchSnapPosition, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
+import { TOUCH_KINDS, touchColor, touchKindsAfter, touchMatchFrames, touchSnapPosition, type EditedTouch, type RallyEdits, type TouchKind } from "../utils/rallyEdits";
 import { resetSegmentEdits, type RefitSegment } from "../utils/rallyRefit";
 import { traceSpans } from "../utils/pathExplain";
 import PathExplain from "./PathExplain";
@@ -132,7 +132,7 @@ export default function RallyInspector(p: Readonly<Props>) {
   const { frames, fps, videoSize, edits, onEdit, currentFrame: cur, onSeek, touches } = p;
   const [tool, setTool] = useState<Tool>("none");
   const [advance, setAdvance] = useState(true);
-  const [addType, setAddType] = useState<TouchKind>("set");
+  const [pickedAdd, setPickedAdd] = useState<{ after: string; kind: TouchKind } | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   const [flash, setFlash] = useState<"ball" | "touch" | "3d" | null>(null);
   /** Developer view: colour the path by how each stretch was made, and say why. Remembered. */
@@ -182,6 +182,22 @@ export default function RallyInspector(p: Readonly<Props>) {
     for (const t of touches) if (Math.abs(t.frame - cur) <= tol && (!best || Math.abs(t.frame - cur) < Math.abs(best.frame - cur))) best = t;
     return best;
   }, [touches, cur, tol]);
+  /** The touch before a frame in this rally, which decides what usually comes next. */
+  const touchBefore = useCallback((frame: number) => {
+    let prev: EditedTouch | undefined;
+    for (const t of rallyTouches) if (t.frame < frame && (!prev || t.frame > prev.frame)) prev = t;
+    return prev;
+  }, [rallyTouches]);
+  const prevForAdd = touchBefore(cur);
+  const addKinds = useMemo(() => touchKindsAfter(prevForAdd?.label), [prevForAdd?.label]);
+  const hereKinds = useMemo(
+    () => touchKindsAfter(touchHere ? touchBefore(touchHere.frame)?.label : undefined),
+    [touchHere, touchBefore],
+  );
+  // The type to add follows the touch before, unless the user picked one after that same touch.
+  const addKey = prevForAdd ? `${prevForAdd.frame}:${prevForAdd.label}` : "start";
+  const addType: TouchKind = pickedAdd?.after === addKey ? pickedAdd.kind : addKinds[0];
+  const setAddType = (kind: TouchKind) => setPickedAdd({ after: addKey, kind });
   const removedHere = useMemo(
     () => Object.entries(edits.touches).find(([f, k]) => k === "none" && Math.abs(Number(f) - cur) <= tol)?.[0],
     [edits.touches, cur, tol],
@@ -629,7 +645,7 @@ export default function RallyInspector(p: Readonly<Props>) {
                     aria-label="Touch type"
                   >
                     {!(TOUCH_KINDS as readonly string[]).includes(touchHere.label) && <option value="">{touchHere.label}…</option>}
-                    {TOUCH_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+                    {hereKinds.map((k) => <option key={k} value={k}>{k}</option>)}
                   </select>
                   <button className="inspect-btn" onClick={() => setTouch(touchHere.frame, "none")}>Not a touch</button>
                   {touchHere.frame in edits.touches && <button className="inspect-btn" onClick={() => clearTouch(touchHere.frame)}>Undo type</button>}
@@ -639,7 +655,7 @@ export default function RallyInspector(p: Readonly<Props>) {
                 {touchHere.frame !== cur && (
                   <div className="inspect-buttons">
                     <select value={addType} onChange={(e) => setAddType(e.target.value as TouchKind)} aria-label="Type of touch to add">
-                      {TOUCH_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+                      {addKinds.map((k) => <option key={k} value={k}>{k}</option>)}
                     </select>
                     <button className="inspect-btn primary" onClick={() => setTouch(cur, addType)} title="T">Add another touch at f{cur} <kbd>T</kbd></button>
                   </div>
@@ -650,7 +666,7 @@ export default function RallyInspector(p: Readonly<Props>) {
                 <div className="inspect-kv"><span>Touch</span><b className="muted">{removedHere ? `removed by you (f${removedHere})` : "none here"}</b></div>
                 <div className="inspect-buttons">
                   <select value={addType} onChange={(e) => setAddType(e.target.value as TouchKind)} aria-label="Type of touch to add">
-                    {TOUCH_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+                    {addKinds.map((k) => <option key={k} value={k}>{k}</option>)}
                   </select>
                   <button className="inspect-btn primary" onClick={() => setTouch(cur, addType)} title="T">Add touch here <kbd>T</kbd></button>
                   {removedHere && <button className="inspect-btn" onClick={() => clearTouch(Number(removedHere))}>Undo removal</button>}
